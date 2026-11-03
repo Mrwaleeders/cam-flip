@@ -174,12 +174,15 @@ typedef struct {
 	uint32_t seed;
 	float refl_w, refl_h, refl_x, refl_y, refl_v; /* the screen's reflection on the cornea: half sizes and
 						       * centre from the iris centre (iris radii), grey; 0: none */
+	float clump;         /* lash band thickness varying along the lid by +-this fraction (clumps); 0: even */
+	float sclera, iris;  /* grey levels; 0: 200 and 80 */
+	float tex;           /* iris texture (radial furrows), +-grey levels; 0: none */
 } real_eye;
 
 static real_eye real_eye_at(float k, float cx, float cy)
 {
 	const real_eye r = {cx, cy, 43 * k, 14 * k, 13 * k, cx + 2 * k, cy - 0.5f * k, 17 * k, 3.5f * k, 1.2f * k, 6, 1,
-			    0, 0, 0, 0, 0};
+			    0, 0, 0, 0, 0, 0, 0, 0, 0};
 	return r;
 }
 
@@ -210,14 +213,22 @@ static void draw_real_eye(uint8_t *img, int w, int h, const real_eye *s, cf_pt e
 			const float px = (float)x + 0.5f, py = (float)y + 0.5f;
 			const float yu = real_up(s, px), yl = real_lo(s, px);
 			const float open = cov01((py - yu) / b + 0.5f) * cov01((yl - py) / b + 0.5f);
+			const float lu = (px - s->cx) * (43 / s->hw);
+			const float lash = s->lash * (1 + s->clump * sinf(0.9f * lu) * sinf(0.23f * lu));
 			float v = 150; /* skin */
 			if (open > 0) {
 				const float shade = 25 * expf(-fmaxf(py - yu, 0) / (0.07f * s->hw)); /* lid shadow */
-				float vo = 200 - shade;                                             /* sclera */
+				float vo = (s->sclera > 0 ? s->sclera : 200) - shade;               /* sclera */
 				const float d = hypotf(px - s->ix, py - s->iy);
 				const float ci = cov01((s->ir - d) / b + 0.5f);
 				if (ci > 0) {
-					float iv = 80 - 15 * cov01((d - 0.75f * s->ir) / (0.25f * s->ir)); /* limbal ring */
+					float iv = (s->iris > 0 ? s->iris : 80) -
+						   15 * cov01((d - 0.75f * s->ir) / (0.25f * s->ir)); /* limbal ring */
+					if (s->tex > 0) {
+						const float an = atan2f(py - s->iy, px - s->ix), rr = d / s->ir;
+						iv += s->tex * (0.6f * sinf(17 * an + 3 * rr) * sinf(5 * an - 2.1f) +
+								0.4f * sinf(9 * an + 11 * rr + 1.3f));
+					}
 					iv += cov01((0.4f * s->ir - d) / b + 0.5f) * (35 - iv);            /* pupil */
 					const float dc = hypotf(px - (s->ix + 0.25f * s->ir), py - (s->iy - 0.3f * s->ir));
 					iv += cov01((0.12f * s->ir - dc) / b + 0.5f) * (235 - iv);         /* catchlight */
@@ -228,11 +239,11 @@ static void draw_real_eye(uint8_t *img, int w, int h, const real_eye *s, cf_pt e
 					}
 					vo += ci * (iv - 0.5f * shade - vo);
 				}
-				vo += cov01((yu + s->lash - py) / b + 0.5f) * (45 - vo); /* lashes */
+				vo += cov01((yu + lash - py) / b + 0.5f) * (45 - vo); /* lashes */
 				v += open * (vo - v);
 			}
 			if (fabsf((px - s->cx) / s->hw) < 0.95f) /* lashes above the lid line too */
-				v += cov01((py - (yu - 0.5f * s->lash)) / b + 0.5f) * cov01((yu - py) / b + 0.5f) * (45 - v);
+				v += cov01((py - (yu - 0.5f * lash)) / b + 0.5f) * cov01((yu - py) / b + 0.5f) * (45 - v);
 			rng = rng * 1664525u + 1013904223u;
 			v += s->noise * ((float)(rng >> 8) / 8388608.0f - 1.0f);
 			img[y * w + x] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : lrintf(v)));
@@ -245,6 +256,76 @@ static void draw_real_eye(uint8_t *img, int w, int h, const real_eye *s, cf_pt e
 	eye[3] = (cf_pt){s->cx + s->hw, s->cy};
 	eye[4] = (cf_pt){xs[1], real_lo(s, xs[1])};
 	eye[5] = (cf_pt){xs[0], real_lo(s, xs[0])};
+}
+
+/* JPEG-like compression of a grey image in place: 8x8 DCT blocks quantised with the standard luma
+ * table at quality q (1..100), like the camera's or the encoder's. Blocks at the right and bottom
+ * edges that don't fill 8x8 are left alone. */
+static void jpeg_like(uint8_t *img, int w, int h, int q)
+{
+	static const int QT[64] = {16, 11, 10, 16, 24,  40,  51,  61,  12, 12, 14, 19, 26,  58,  60,  55,
+				   14, 13, 16, 24, 40,  57,  69,  56,  14, 17, 22, 29, 51,  87,  80,  62,
+				   18, 22, 37, 56, 68,  109, 103, 77,  24, 35, 55, 64, 81,  104, 113, 92,
+				   49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99};
+	const float scale = q < 50 ? 5000.0f / (float)q : 200.0f - 2.0f * (float)q;
+	float Q[64], C[8][8];
+	for (int i = 0; i < 64; i++)
+		Q[i] = fmaxf(floorf(((float)QT[i] * scale + 50) / 100), 1);
+	for (int u = 0; u < 8; u++)
+		for (int x = 0; x < 8; x++)
+			C[u][x] = (u ? sqrtf(2.0f / 8) : sqrtf(1.0f / 8)) * cosf((float)((2 * x + 1) * u) * 3.14159265f / 16);
+	for (int by = 0; by + 8 <= h; by += 8)
+		for (int bx = 0; bx + 8 <= w; bx += 8) {
+			float B[8][8], T[8][8], D[8][8];
+			for (int y = 0; y < 8; y++)
+				for (int x = 0; x < 8; x++)
+					B[y][x] = (float)img[(by + y) * w + bx + x] - 128;
+			for (int u = 0; u < 8; u++)
+				for (int x = 0; x < 8; x++) {
+					float a = 0;
+					for (int y = 0; y < 8; y++)
+						a += C[u][y] * B[y][x];
+					T[u][x] = a;
+				}
+			for (int u = 0; u < 8; u++)
+				for (int v = 0; v < 8; v++) {
+					float a = 0;
+					for (int x = 0; x < 8; x++)
+						a += T[u][x] * C[v][x];
+					D[u][v] = roundf(a / Q[u * 8 + v]) * Q[u * 8 + v];
+				}
+			for (int y = 0; y < 8; y++)
+				for (int v = 0; v < 8; v++) {
+					float a = 0;
+					for (int u = 0; u < 8; u++)
+						a += C[u][y] * D[u][v];
+					T[y][v] = a;
+				}
+			for (int y = 0; y < 8; y++)
+				for (int x = 0; x < 8; x++) {
+					float a = 128;
+					for (int v = 0; v < 8; v++)
+						a += T[y][v] * C[v][x];
+					img[(by + y) * w + bx + x] = (uint8_t)(a < 0 ? 0 : (a > 255 ? 255 : lrintf(a)));
+				}
+		}
+}
+
+/* The realistic eye glancing down by dy px (check 13c): the upper lid follows fup of the move, the
+ * lower lid drops a tenth of it; clumped lashes. */
+static real_eye reading_eye(float k, float cx, float cy, float dy, float fup, float sclera, float iris, float tex,
+			    uint32_t seed)
+{
+	real_eye s = real_eye_at(k, cx, cy);
+	s.iy += dy;
+	s.up_h -= fup * dy;
+	s.lo_h += 0.1f * dy;
+	s.clump = 0.35f;
+	s.sclera = sclera;
+	s.iris = iris;
+	s.tex = tex;
+	s.seed = seed;
+	return s;
 }
 
 /* Direction of the warp's push, in degrees (0 = straight up, positive = towards the right). */
@@ -2293,6 +2374,84 @@ int main(void)
 			       "sideways %.2f px, with a corneal reflection steps %.2f..%.2f px, %.3f ms\n",
 			       name, sdev, hi - lo, 0.25f * (float)steps, 100 * gain, min_step, max_step, lid_move, 8 * k, step2,
 			       true2, side_range, refl_lo, refl_hi, ms);
+		}
+	}
+
+	/* 13c. Reading the notes: glances 0..15 degrees down on the realistic eye, 86 and 75 px wide.
+	 * The iris moves down 0.41 sin(angle) eye widths, the upper lid follows 60-80% of it and covers
+	 * more and more of the iris, the lower lid stays nearly put; clumped lashes, camera noise and
+	 * JPEG-like compression; also a low-contrast eye (dull sclera, light textured iris). On real
+	 * clips the refined point read reading glances far short (lens to notes 1-1.5 px instead of 3-5):
+	 * with the opening narrowing it leaned on the darkness centroid, which stays near the opening's
+	 * middle, and an iris body lighter than the dark threshold shrank the edge widths row by row. The
+	 * refined move (means over 16 noise seeds, 64 for the lens frame, 3x that for the low-contrast eye,
+	 * which is noisier) must be 85-115% of the true one
+	 * at every angle, or within 0.1 px of it at 1 degree (a 0.6 px move, where 15% is finer than the
+	 * frame's own sub-pixel error); rise with every degree; and stay steady under noise. */
+	{
+		enum { MW = 200, MH = 120 };
+		static uint8_t img[MW * MH];
+		static const struct {
+			float wpx, fup, sclera, iris, tex;
+		} cs[] = {{86, 0.6f, 0, 0, 0},       {86, 0.7f, 0, 0, 0},       {86, 0.8f, 0, 0, 0},
+			  {75, 0.6f, 0, 0, 0},       {75, 0.7f, 0, 0, 0},       {75, 0.8f, 0, 0, 0},
+			  {86, 0.7f, 150, 100, 12}, {75, 0.7f, 150, 100, 12}};
+		for (size_t c = 0; c < sizeof(cs) / sizeof(cs[0]); c++) {
+			const float wpx = cs[c].wpx, k = wpx / 86, fup = cs[c].fup;
+			const int W = (int)(200 * k), H = (int)(120 * k);
+			const float cx = 0.5f * (float)W + 0.3f, cy = 0.5f * (float)H + 0.4f;
+			const float iy0 = real_eye_at(k, cx, cy).iy;
+			cf_pt eye[6];
+			float y[16], gain[16], gmin = 1e9f, gmax = -1e9f, smin = 1e9f, worst = 0;
+			for (int a = 0; a <= 15; a++) {
+				const float dy = 0.41f * sinf((float)a * 3.14159265f / 180) * wpx;
+				/* every gain is measured from the lens frame; the low-contrast eye is noisier */
+				const int seeds = (a ? 16 : 64) * (cs[c].sclera > 0 ? 3 : 1);
+				double ym = 0;
+				for (int sd = 0; sd < seeds; sd++) {
+					const real_eye s = reading_eye(k, cx, cy, dy, fup, cs[c].sclera, cs[c].iris, cs[c].tex,
+								       300 + (uint32_t)sd);
+					draw_real_eye(img, W, H, &s, eye);
+					jpeg_like(img, W, H, 75);
+					/* Vision's point under-reads the glance: 30% of it */
+					const cf_pt g = {s.ix - 1 * k, iy0 + 0.3f * dy - 1 * k};
+					ym += cf_refine_pupil(img, W, W, H, eye, 6, g).y / seeds;
+				}
+				y[a] = (float)ym;
+				gain[a] = a ? (y[a] - y[0]) / dy : 1;
+				if (a) {
+					gmin = fminf(gmin, gain[a]);
+					gmax = fmaxf(gmax, gain[a]);
+					smin = fminf(smin, y[a] - y[a - 1]);
+					worst = fmaxf(worst, fabsf(y[a] - y[0] - dy) / fmaxf(0.15f * dy, 0.1f));
+				}
+			}
+			/* Noise: one frame at 10 degrees under 16 noise seeds. */
+			double n1 = 0, n2 = 0;
+			for (int sd = 0; sd < 16; sd++) {
+				const float dy = 0.41f * sinf(10 * 3.14159265f / 180) * wpx;
+				const real_eye s =
+				    reading_eye(k, cx, cy, dy, fup, cs[c].sclera, cs[c].iris, cs[c].tex, 500 + (uint32_t)sd);
+				draw_real_eye(img, W, H, &s, eye);
+				jpeg_like(img, W, H, 75);
+				const float v = cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix - 1 * k, iy0 + 0.3f * dy - 1 * k}).y;
+				n1 += v;
+				n2 += (double)v * v;
+			}
+			const double nsd = sqrt(fmax(n2 / 16 - (n1 / 16) * (n1 / 16), 0));
+			char name[64], gl[160];
+			snprintf(name, sizeof(name), "%.0f px eye, upper lid %.0f%%%s", wpx, 100 * fup,
+				 cs[c].sclera > 0 ? ", low contrast" : "");
+			int n = 0;
+			for (int a = 1; a <= 15 && n < (int)sizeof(gl) - 6; a++)
+				n += snprintf(gl + n, sizeof(gl) - (size_t)n, " %.2f", gain[a]);
+			CHECK(worst <= 1, "reading sweep, %s: gain 1..15 deg%s", name, gl);
+			CHECK(smin > 0, "reading sweep, %s: refined height steps down by %.3f px between degrees", name, -smin);
+			CHECK(nsd < (cs[c].sclera > 0 ? 0.18 : 0.1),
+			      "reading sweep, %s: refined height sd %.3f px over 16 noise seeds at 10 deg", name, nsd);
+			printf("ok: reading sweep, %s: gain 1..15 deg%s (%.2f..%.2f), lens to 15 deg %.2f of %.2f px, steps "
+			       ">= %.2f px a degree, noise sd %.3f px\n",
+			       name, gl, gmin, gmax, y[15] - y[0], 0.41f * sinf(15 * 3.14159265f / 180) * wpx, smin, nsd);
 		}
 	}
 
