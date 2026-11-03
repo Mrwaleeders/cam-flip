@@ -266,6 +266,9 @@ int main(int argc, char **argv)
 		camflip_defaults(settings);
 		struct camflip *f = camflip_create(settings, NULL);
 		struct camflip *f_out = measure ? camflip_create(settings, NULL) : NULL;
+		f->test_clock = true;
+		if (f_out)
+			f_out->test_clock = true;
 
 		/* Pass 1 (only if calibrating from time ranges): run the calibration like the buttons do. */
 		for (int step = 0; step < 2; step++) {

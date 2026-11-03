@@ -48,6 +48,8 @@ int main(int argc, char **argv)
 		obs_data_t *settings = obs_data_create();
 		camflip_defaults(settings);
 		struct camflip *f = camflip_create(settings, NULL);
+		if (f)
+			f->test_clock = true;
 		FILE *csv = fopen(argv[2], "w");
 		if (!f || !csv) {
 			fprintf(stderr, "setup failed\n");

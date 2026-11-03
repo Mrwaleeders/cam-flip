@@ -162,6 +162,7 @@ struct camflip {
 	cf_pt dbg_raw_pupil[2];
 	float dbg_conf;
 	cf_face seen_face; /* what Vision saw on the last analysed frame (full-resolution pixels) */
+	bool test_clock;   /* detect_face times re-detection by frame timestamps, not the wall clock */
 #endif
 
 	obs_hotkey_id hotkey;
@@ -587,7 +588,11 @@ static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, b
 	if (!pb)
 		return;
 
-	const uint64_t now = now_ns();
+	uint64_t now = now_ns();
+#ifdef CAMFLIP_TEST
+	if (f->test_clock)
+		now = (uint64_t)(g->t * 1e9) + 1; /* offline tools: frame time, so runs are repeatable */
+#endif
 	if (w != f->last_w || h != f->last_h) {
 		set_last_face(f, nil);
 		f->last_w = w;
