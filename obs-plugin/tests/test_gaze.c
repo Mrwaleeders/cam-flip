@@ -156,10 +156,10 @@ int main(void)
 	for (int i = 0; i < 120; i++, t += dt) {
 		cf_face f = face_at(960, 500, 0.25f, 16, 0);
 		for (int k = 0; k < 8; k++) {
-			f.left_eye[k].x += ((float)rand() / RAND_MAX - 0.5f) * 3;
-			f.left_eye[k].y += ((float)rand() / RAND_MAX - 0.5f) * 3;
+			f.left_eye[k].x += ((float)rand() / (float)RAND_MAX - 0.5f) * 3;
+			f.left_eye[k].y += ((float)rand() / (float)RAND_MAX - 0.5f) * 3;
 		}
-		f.left_pupil.y += ((float)rand() / RAND_MAX - 0.5f) * 3;
+		f.left_pupil.y += ((float)rand() / (float)RAND_MAX - 0.5f) * 3;
 		n = cf_gaze_update(&g, &f, &p, t, out);
 		if (i >= 60 && n) {
 			sum += out[0].cx;
