@@ -1464,7 +1464,10 @@ static void head_lids(cf_gaze *g, const cf_gaze_params *p, const eye_measure m[2
 	float yaw, pitch;
 	head_angles(g, p, t, &yaw, &pitch);
 	const float hv = EYE_K * sinf(clampf(pitch, 0.0f, HEAD_PITCH_MAX) * deg);
-	const float hh = HEAD_YAW_K * EYE_K * sinf(clampf(yaw, -HEAD_YAW_MAX, HEAD_YAW_MAX) * deg);
+	/* (yaw is in image terms, the sideways shift along the eye axis, whose direction depends on which eye is
+	 * labelled left) */
+	const float hh = HEAD_YAW_K * EYE_K * sinf(clampf(yaw, -HEAD_YAW_MAX, HEAD_YAW_MAX) * deg) *
+			 (g->axis.x >= 0 ? 1.0f : -1.0f);
 	const float sh = HEAD_SLEW_PX * k30 / w;
 	g->head_v += clampf(hv - g->head_v, -sh, sh);
 	g->head_h += clampf(hh - g->head_h, -sh, sh);
@@ -1573,7 +1576,9 @@ static void emit(const cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 		const float cap = fminf(AMOUNT_MAX_RY * e->ry, 0.5f * (e->ry - ext_y));
 		amount = fminf(amount, cap);
 		amount = fmaxf(amount, 0.0f);
-		float hs = g->hshift_unit[i] * strength;
+		/* Sideways no more than 100%: it already takes out READ_DAMP of the eyes' scanning, and more would show
+		 * them sweeping the wrong way. */
+		float hs = g->hshift_unit[i] * fminf(strength, 1.0f);
 		hs = clampf(hs, -HSHIFT_MAX_RX * e->rx, HSHIFT_MAX_RX * e->rx);
 
 		e->sx = g->up.x * amount + g->axis.x * hs;
@@ -1645,8 +1650,10 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		/* Where Vision's point was stays known through a short loss: the first frame back is checked
 		 * against it like any other, so a glance made meanwhile is taken at once. After a long one it is
 		 * stale (the person may have moved): everything starts afresh then. */
-		if (!g->cx[0].ready || t - g->cx[0].t > FACE_GONE)
+		if (!g->cx[0].ready || t - g->cx[0].t > FACE_GONE) {
 			g->rb_down.have_v = g->rb_side.have_v = 0;
+			g->have_lids = 0; /* the lids' smoothing starts afresh from the face coming back */
+		}
 		g->rb_down.have_lid = 0;
 		/* The detector often misses a frame or two: hold the correction exactly as it was through
 		 * that instead of letting the eyes dip and climb back. Lost for longer, the person may well

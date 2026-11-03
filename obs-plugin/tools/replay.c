@@ -77,7 +77,7 @@ static int parse(const char *path, row_t **rows_out)
 		f->right_pupil = (cf_pt){(float)v[17], (float)v[18]};
 		int i = 19;
 		int nl = (int)v[i++];
-		if (nl < 0)
+		if (nl < 0 || nl > (k - i) / 2)
 			nl = 0;
 		for (int j = 0; j < nl && j < CF_MAX_EYE_POINTS && i + 2 * j + 1 < k; j++)
 			f->left_eye[j] = (cf_pt){(float)v[i + 2 * j], (float)v[i + 2 * j + 1]};
@@ -85,7 +85,7 @@ static int parse(const char *path, row_t **rows_out)
 		i += 2 * nl;
 		if (i < k) {
 			int nr = (int)v[i++];
-			if (nr < 0)
+			if (nr < 0 || nr > (k - i) / 2)
 				nr = 0;
 			for (int j = 0; j < nr && j < CF_MAX_EYE_POINTS && i + 2 * j + 1 < k; j++)
 				f->right_eye[j] = (cf_pt){(float)v[i + 2 * j], (float)v[i + 2 * j + 1]};
@@ -149,6 +149,8 @@ int main(int argc, char **argv)
 	float strength = 1.0f;
 	const char *outp = NULL;
 	float cal[5] = {0, 0, 0, 0, 0}; /* baseline, baseline_open, notes_offset, notes_side, notes_open */
+	float lids[2] = {0, 0}, vis[2] = {0, 0}; /* baseline_upper/lower; vis_baseline/notes */
+	int vis_opt = 0;
 	int have_cal = 0;
 	cf_head_ref head = {0, 0, 0, 0, 0};
 	for (int i = 2; i < argc; i++) {
@@ -180,6 +182,14 @@ int main(int argc, char **argv)
 			head.eyes = (float)atof(argv[++i]), head.ok = 1;
 		else if (!strcmp(argv[i], "--head-tilt") && i + 1 < argc)
 			head.tilt = (float)atof(argv[++i]), head.ok = 1;
+		else if (!strcmp(argv[i], "--baseline-upper") && i + 1 < argc)
+			lids[0] = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--baseline-lower") && i + 1 < argc)
+			lids[1] = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--vis-baseline") && i + 1 < argc)
+			vis[0] = (float)atof(argv[++i]), vis_opt |= 1;
+		else if (!strcmp(argv[i], "--vis-notes") && i + 1 < argc)
+			vis[1] = (float)atof(argv[++i]), vis_opt |= 2;
 	}
 	row_t *rows;
 	const int n = parse(argv[1], &rows);
@@ -201,6 +211,11 @@ int main(int argc, char **argv)
 		p.notes_side = cal[3];
 		p.notes_open = cal[4];
 	}
+	p.baseline_upper = lids[0];
+	p.baseline_lower = lids[1];
+	p.vis_baseline = vis[0];
+	p.vis_notes = vis[1];
+	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
 	int vis_cal = 0; /* Vision's point given at step 1 (bit 1) and step 2 (bit 2), as in plugin.m */
 	for (int step = 0; step < 2; step++) {
 		const double *r = step == 0 ? lens : notes;

@@ -46,6 +46,10 @@ for p in glob.glob(os.path.expanduser("~/Library/Application Support/obs-studio/
                 if st.get("head_ref"):  # the head looking into the camera (step 1); else a typical face
                     out += ["--head-side", st.get("head_side", 0), "--head-vert", st.get("head_vert", 0),
                             "--head-eyes", st.get("head_eyes", 0), "--head-tilt", st.get("head_tilt", 0)]
+                if st.get("baseline_upper", 0) > 0 and st.get("baseline_lower", 0) > 0:  # lids at the lens (step 1)
+                    out += ["--baseline-upper", st["baseline_upper"], "--baseline-lower", st["baseline_lower"]]
+                if st.get("has_notes") and (int(st.get("vis_cal", 0)) & 3) == 3:  # Vision's point at both steps
+                    out += ["--vis-baseline", st.get("vis_baseline", 0), "--vis-notes", st.get("vis_notes", 0)]
                 print(" ".join(str(x) for x in out))
                 raise SystemExit
 PY

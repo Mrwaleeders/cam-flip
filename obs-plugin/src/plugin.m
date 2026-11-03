@@ -1446,6 +1446,8 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 	const bool eye_contact = f->eye_contact, face = f->st_face, lens = f->lens_done;
 	const bool notes = f->has_notes && !f->notes_stale, notes_stale = f->notes_stale;
 	const bool head = f->head_ref.ok != 0;
+	const bool lids = f->baseline_upper > 0 && f->baseline_lower > 0;
+	const bool vis_notes = (f->vis_cal & 2) != 0;
 	const bool recalib = f->needs_recalib;
 	const int running = f->calib_running, failed = f->calib_failed;
 	const bool notes_bad = f->calib_notes_bad, no_frames = f->calib_no_frames, flipped = f->frames_flipped;
@@ -1488,12 +1490,17 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 		snprintf(calib, sizeof(calib), "%s%sNotes calibration no longer matches: please redo step 2.",
 			 done ? done : "", done ? " " : "");
 	} else {
-		/* Step 1 done by an older version (or without the nose in view): head turns are judged
-		 * against a typical face, which only measures turns, and less precisely. */
+		/* A step done by an older version (or step 1 without the nose in view): head tilt and lids
+		 * aren't measured for this face, or the notes step lacks Vision's point, so the correction is
+		 * weaker or less sure than it could be. */
+		const bool redo1 = lens && (!head || !lids), redo2 = notes && !vis_notes;
+		const char *redo = redo1 && notes ? " Redo steps 1 and 2 once so your head tilt and eyelids are measured."
+				   : redo1	    ? " Redo step 1 so your head tilt and eyelids are measured."
+				   : redo2	    ? " Redo step 2 once so it measures how far your eyes move."
+						    : "";
 		*warn = hint && done;
 		snprintf(calib, sizeof(calib), "%s%sCalibration: camera %s, notes %s.%s", done ? done : "",
-			 done ? " " : "", lens ? "done" : "not done", notes ? "done" : "not done",
-			 lens && !head ? " Redo step 1 so head turns and tilts are measured for your face." : "");
+			 done ? " " : "", lens ? "done" : "not done", notes ? "done" : "not done", redo);
 	}
 
 	if (!eye_contact)

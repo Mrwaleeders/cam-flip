@@ -323,13 +323,15 @@ int main(int argc, char **argv)
 	if (argc < 3) {
 		fprintf(stderr, "usage: render_video <in> <out-dir> [--lag N] [--dedupe X] [--baseline B] "
 				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--head-side S] "
-				"[--head-vert V] [--head-eyes E] [--head-tilt K] [--lens a-b] [--notes a-b] [--strength S] "
+				"[--head-vert V] [--head-eyes E] [--head-tilt K] [--baseline-upper U] [--baseline-lower L] "
+				"[--vis-baseline A] [--vis-notes B] [--lens a-b] [--notes a-b] [--strength S] "
 				"[--measure] [--zoom Z]\n");
 		return 2;
 	}
 	int lag = 1, measure = 0, zoom = 3;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
+	int vis_opt = 0; /* --vis-baseline (1) and --vis-notes (2) given */
 	for (int i = 3; i < argc; i++) {
 		const char *a = argv[i];
 		const char *v = i + 1 < argc ? argv[i + 1] : "0";
@@ -344,6 +346,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--head-vert")) { p.head_ref.vert = (float)atof(v); p.head_ref.ok = 1; i++; }
 		else if (!strcmp(a, "--head-eyes")) { p.head_ref.eyes = (float)atof(v); p.head_ref.ok = 1; i++; }
 		else if (!strcmp(a, "--head-tilt")) { p.head_ref.tilt = (float)atof(v); p.head_ref.ok = 1; i++; }
+		else if (!strcmp(a, "--baseline-upper")) { p.baseline_upper = (float)atof(v); i++; }
+		else if (!strcmp(a, "--baseline-lower")) { p.baseline_lower = (float)atof(v); i++; }
+		else if (!strcmp(a, "--vis-baseline")) { p.vis_baseline = (float)atof(v); vis_opt |= 1; i++; }
+		else if (!strcmp(a, "--vis-notes")) { p.vis_notes = (float)atof(v); vis_opt |= 2; i++; }
 		else if (!strcmp(a, "--lens")) { parse_range(v, lens); i++; }
 		else if (!strcmp(a, "--notes")) { parse_range(v, notes_r); i++; }
 		else if (!strcmp(a, "--strength")) { p.strength = (float)atof(v); i++; }
@@ -351,6 +357,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--measure")) measure = 1;
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
 	}
+	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
 	if (lag < 0)
 		lag = 0;
 
