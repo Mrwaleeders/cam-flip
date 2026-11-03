@@ -48,7 +48,16 @@ typedef struct {
 	int has_notes;       /* 1 when the "look at your notes" calibration has been done */
 	float notes_offset;  /* gaze offset when looking at the notes (notes calibration) */
 	float notes_side;    /* sideways gaze offset (eye widths) at the middle of the notes (notes calibration) */
+	float notes_open;    /* eye openness when looking at the notes (notes calibration); 0 = unknown */
 } cf_gaze_params;
+
+/* A notes calibration is only usable when the notes are clearly below the lens: at least this many
+ * eye widths of downward gaze (baseline - notes_offset). Smaller or reversed means the user wasn't
+ * looking at notes under the camera (or the lens calibration is off). */
+#define CF_NOTES_MIN_GLANCE 0.02f
+
+/* 1 when a notes calibration at notes_offset is meaningfully below the lens baseline. */
+int cf_gaze_notes_valid(float baseline, float notes_offset);
 
 enum cf_calib_target { CF_CALIB_LENS = 0, CF_CALIB_NOTES = 1 };
 
@@ -104,6 +113,10 @@ typedef struct {
 	int tracking;           /* last update saw the face (prediction may extrapolate) */
 	cf_pt vel[2];           /* eye centre velocity (px/s) for prediction: quick to follow starts and stops */
 	int was_holding;        /* a real blink happened during the current hold: resync the glance after it */
+	float far_fade;         /* 0..1, "looking far past the notes" fade, applied directly (not eased) */
+	float down_noise;       /* typical frame-to-frame change of the raw glance (eye widths): landmark noise */
+	float last_down_raw;
+	int have_down_raw;
 	enum cf_calib_target calib_target;
 	float calib_open[64];
 	float calib_side[64];

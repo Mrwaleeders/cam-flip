@@ -546,6 +546,194 @@ int main(void)
 		printf("ok: dropout held (min %.2f of %.2f px), NaN inputs ignored\n", lo, steady2);
 	}
 
+	/* 14. Step glances lens -> notes -> lens (calibrated notes 0.08 eye widths = 3.2 px under the lens,
+	 * the upper lid following the eye down). What the other person sees is the measured pupil plus the
+	 * shift: it must stay at the lens on the way down (no dip) and on the way back (no overshoot above
+	 * the camera), from the first frame on. Also with the glance spread over two frames. */
+	{
+		const float gl = 0.08f, gpx = gl * 40.0f;
+		const cf_gaze_params pg = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = 0.4f,
+					   .has_notes = 1, .notes_offset = -gl, .notes_open = 0.35f};
+		for (int ramp = 0; ramp < 2; ramp++)
+			for (int lid = 0; lid < 2; lid++) {
+				cf_gaze_init(&g);
+				const float drop = lid ? 3.0f : 0.0f; /* 3 px: fast enough to look like a closing blink */
+				settle(&g, face_px(960, 500, 0, 0, 16, 0, 0), &pg, &t, 45, out);
+				float first_dn = 0, first_up = 0, worst_dn = 0, worst_up = 0;
+				for (int cyc = 0; cyc < 3; cyc++) {
+					for (int i = 0; i < 20; i++, t += dt) {
+						const float k = (ramp && i == 0) ? 0.5f : 1.0f;
+						n = update(&g, face_px(960, 500, 0, k * gpx, 16, 0, k * drop), &pg, t, out);
+						const float vis = k * gpx + (n ? out[0].sy : 0); /* below the lens, px */
+						if (i == 0)
+							first_dn = fmaxf(first_dn, fabsf(vis));
+						else
+							worst_dn = fmaxf(worst_dn, fabsf(vis));
+					}
+					for (int i = 0; i < 20; i++, t += dt) {
+						const float k = (ramp && i == 0) ? 0.5f : 0.0f;
+						n = update(&g, face_px(960, 500, 0, k * gpx, 16, 0, k * drop), &pg, t, out);
+						const float vis = k * gpx + (n ? out[0].sy : 0);
+						if (i == 0)
+							first_up = fmaxf(first_up, fabsf(vis));
+						else
+							worst_up = fmaxf(worst_up, fabsf(vis));
+					}
+				}
+				CHECK(worst_dn < 0.5f && worst_up < 0.5f,
+				      "step glance (lid %d, ramp %d): eyes off the lens by %.2f px going down, %.2f px coming back",
+				      lid, ramp, worst_dn, worst_up);
+				CHECK(first_dn < 0.5f && first_up < 0.5f,
+				      "step glance (lid %d, ramp %d): first frame off by %.2f px down, %.2f px back", lid, ramp,
+				      first_dn, first_up);
+				printf("ok: step glance (lid drop %d, 2-frame %d): first frame %.2f / %.2f px, then within %.2f / "
+				       "%.2f px of the lens\n",
+				       lid, ramp, first_dn, first_up, worst_dn, worst_up);
+			}
+		/* A real blink right after landing on the notes still holds the correction. */
+		cf_gaze_init(&g);
+		const float steady3 = settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pg, &t, 45, out);
+		const float lids[] = {9, 2, 2, 9, 14};
+		float lo = 1e9f, hi = 0;
+		for (int i = 0; i < 5; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, lids[i] < 14 ? 0.0f : gpx, lids[i], 0, 0), &pg, t, out);
+			lo = fminf(lo, n ? shift_px(&out[0]) : 0);
+			hi = fmaxf(hi, n ? shift_px(&out[0]) : 0);
+		}
+		CHECK(lo > 0.95f * steady3 && hi < 1.05f * steady3, "blink at the notes moved the correction %.2f..%.2f (%.2f)",
+		      lo, hi, steady3);
+		printf("ok: blink at the notes still holds (%.2f..%.2f px, steady %.2f)\n", lo, hi, steady3);
+	}
+
+	/* 15. Smiling or squinting while reading lowers the lids a lot: with the notes openness known
+	 * (and also without it) the correction stays on. A far glance whose pupil under-reads but whose lids
+	 * drop well past the notes is still released. */
+	{
+		const float gl = 0.08f, gpx = gl * 40.0f;
+		for (int known = 0; known < 2; known++) {
+			const cf_gaze_params pq = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+						   .notes_offset = -gl, .notes_open = known ? 0.35f : 0.0f};
+			cf_gaze_init(&g);
+			settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pq, &t, 45, out);
+			float lo = 1e9f;
+			for (int i = 0; i <= 15; i++, t += dt) { /* lids from 14 px to 9 px over half a second */
+				n = update(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f + 5.0f * (float)i / 15.0f), &pq, t, out);
+				lo = fminf(lo, n ? shift_px(&out[0]) : 0);
+			}
+			for (int i = 0; i < 30; i++, t += dt) {
+				n = update(&g, face_px(960, 500, 0, gpx, 16, 0, 7.0f), &pq, t, out);
+				lo = fminf(lo, n ? shift_px(&out[0]) : 0);
+			}
+			CHECK(lo > 0.95f * gpx, "squint while reading (notes openness %s) dropped the correction to %.2f px",
+			      known ? "known" : "unknown", lo);
+			printf("ok: squint while reading keeps the correction (notes openness %s, min %.2f of %.2f px)\n",
+			       known ? "known" : "unknown", lo, gpx);
+		}
+		const cf_gaze_params pq = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		cf_gaze_init(&g);
+		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pq, &t, 45, out);
+		/* Pupil reads 0.1 eye widths (under the 0.112 limit) but the lids are down to 8 px. */
+		const float s = settle(&g, face_px(960, 500, 0, 4.0f, 16, 0, 8.0f), &pq, &t, 30, out);
+		CHECK(s < 0.2f, "far glance with the lids well down should be left alone (%.2f px)", s);
+		printf("ok: far glance read from the lids is released (%.2f px)\n", s);
+	}
+
+	/* 16. Keyboard and back: the far fade follows the gaze directly. Landing on the keyboard, the eye
+	 * stays where it lands (no slide down afterwards); back on the notes, it is at the lens at once
+	 * (no slide up over the next ~0.7 s). The visible position never moves against the gaze. */
+	{
+		const float gl = 0.08f, gpx = gl * 40.0f, kpx = 0.3f * 40.0f;
+		const cf_gaze_params pk = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		cf_gaze_init(&g);
+		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pk, &t, 45, out);
+		float k_lo = 1e9f, k_hi = -1e9f, back = 0;
+		for (int i = 0; i < 30; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, kpx, 16, 0, 6.0f), &pk, t, out);
+			const float vis = kpx + (n ? out[0].sy : 0);
+			if (i >= 1) {
+				k_lo = fminf(k_lo, vis);
+				k_hi = fmaxf(k_hi, vis);
+			}
+		}
+		for (int i = 0; i < 30; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pk, t, out);
+			back = fmaxf(back, fabsf(gpx + (n ? out[0].sy : 0)));
+		}
+		CHECK(k_hi - k_lo < 0.3f, "eye slid %.2f px after landing on the keyboard", k_hi - k_lo);
+		CHECK(back < 0.5f, "back on the notes, eye off the lens by up to %.2f px", back);
+		printf("ok: keyboard and back: %.2f px slide at the keyboard, back on the notes within %.2f px\n",
+		       k_hi - k_lo, back);
+
+		/* Sweeping slowly from the notes past the limit: visible position only moves down. */
+		cf_gaze_init(&g);
+		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pk, &t, 45, out);
+		float prev_vis = -1e9f, against = 0;
+		for (int i = 0; i <= 60; i++, t += dt) {
+			const float pd = gpx + (kpx - gpx) * (float)i / 60.0f;
+			n = update(&g, face_px(960, 500, 0, pd, 16, 0, 2.0f), &pk, t, out);
+			const float vis = pd + (n ? out[0].sy : 0);
+			if (i > 0)
+				against = fmaxf(against, prev_vis - vis);
+			prev_vis = vis;
+		}
+		CHECK(against < 0.05f, "visible eye moved up %.2f px while the gaze moved down", against);
+		printf("ok: fading out past the notes is monotonic (%.3f px against the gaze)\n", against);
+	}
+
+	/* 17. Broken settings (NaN/inf) never poison the state, and a notes calibration that isn't below
+	 * the lens is ignored (falls back to the manual limit) and reported as invalid. */
+	{
+		cf_gaze_init(&g);
+		const float good = settle(&g, face_at(960, 500, 0.25f, 16, 0), &p, &t, 45, out);
+		const float bad_vals[] = {NAN, INFINITY, -INFINITY};
+		for (int k = 0; k < 3; k++) {
+			cf_gaze_params pb = p;
+			pb.baseline = bad_vals[k];
+			pb.strength = bad_vals[k];
+			pb.baseline_open = bad_vals[k];
+			pb.max_glance = bad_vals[k];
+			pb.has_notes = 1;
+			pb.notes_offset = bad_vals[k];
+			pb.notes_side = bad_vals[k];
+			pb.notes_open = bad_vals[k];
+			for (int i = 0; i < 3; i++, t += dt) {
+				n = update(&g, face_at(960, 500, 0.25f, 16, 0), &pb, t, out);
+				cf_eye pr[2];
+				const int np = cf_gaze_predict(&g, &pb, t + dt, pr);
+				CHECK(!n || (isfinite(out[0].sx) && isfinite(out[0].sy)), "NaN setting gave a NaN shift");
+				CHECK(!np || (isfinite(pr[0].sy) && isfinite(pr[0].cx)), "NaN setting gave a NaN prediction");
+			}
+		}
+		const float after = settle(&g, face_at(960, 500, 0.25f, 16, 0), &p, &t, 30, out);
+		CHECK(isfinite((float)g.down.value) && isfinite(g.factor) && fabsf(after - good) < 0.2f,
+		      "NaN settings poisoned the state (shift %.2f, was %.2f)", after, good);
+		printf("ok: NaN/inf settings ignored (shift %.2f px after, %.2f before)\n", after, good);
+
+		CHECK(cf_gaze_notes_valid(0.0f, -0.08f) && !cf_gaze_notes_valid(0.0f, 0.02f) &&
+			      !cf_gaze_notes_valid(0.0f, -0.005f) && !cf_gaze_notes_valid(NAN, -0.08f),
+		      "notes validity check");
+		/* Reversed notes (above the lens) behave exactly like no notes. */
+		cf_gaze g2;
+		cf_gaze_params prv = p;
+		prv.has_notes = 1;
+		prv.notes_offset = 0.03f;
+		prv.notes_side = 0.2f;
+		cf_gaze_init(&g);
+		cf_gaze_init(&g2);
+		float diff = 0;
+		cf_eye out2[2];
+		for (int i = 0; i < 40; i++, t += dt) {
+			const float pd = i < 20 ? 0.25f : 0.9f;
+			const int n1 = update(&g, face_at(960, 500, pd, 16, 0), &prv, t, out);
+			const int n2 = update(&g2, face_at(960, 500, pd, 16, 0), &p, t, out2);
+			diff = fmaxf(diff, fabsf((n1 ? out[0].sy : 0) - (n2 ? out2[0].sy : 0)));
+		}
+		CHECK(diff < 1e-4f, "reversed notes calibration changed the output by %.3f px", diff);
+		printf("ok: reversed notes calibration is ignored and reported invalid\n");
+	}
+
 	/* 13. Iris refinement: finds a dark iris offset from Vision's guess, partly under the lower lid. */
 	{
 		enum { W = 200, H = 160 };

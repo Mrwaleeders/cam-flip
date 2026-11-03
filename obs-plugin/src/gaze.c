@@ -35,6 +35,19 @@
 #define VEL_TAU 0.05         /* s: smoothing of the velocity used for prediction */
 #define LOST_HOLD 0.20        /* s: a face missing for less than this (detector dropout) is held, not faded */
 #define RESYNC_JUMP 0.03f     /* eye widths: after a blink, a gaze change bigger than this is taken at once */
+/* Vertical saccade detection. Changes of the raw glance below `lo` are landmark noise (smoothed),
+ * changes above `hi` are a saccade (a glance to or from the notes) and are taken at once. Both
+ * follow the measured landmark noise: as tight as clean tracking allows, wider when it is noisy. */
+#define DOWN_NOISE_INIT 0.008f /* eye widths: mean frame-to-frame change assumed before measuring */
+#define DOWN_NOISE_TAU 1.5     /* s: how fast the noise estimate adapts */
+#define DOWN_LO_K 2.0f         /* lo = this x mean noise change ... */
+#define DOWN_LO_MIN 0.01f      /* ... clamped to these */
+#define DOWN_LO_MAX 0.03f
+#define DOWN_HI_MIN 0.025f     /* hi = 2 lo, clamped to these */
+#define DOWN_HI_MAX 0.05f
+#define DOWN_CUTOFF 1.2       /* Hz: low-pass for noise-sized vertical changes */
+#define GLANCE_PUPIL 0.02f    /* eye widths: lids dropping with the pupil moving down this much = a glance */
+#define LID_GATE 0.8f         /* lid cue only once the pupil already reads this fraction of the limit */
 
 /* ---- One Euro filter (Casiez et al.): adaptive low-pass, little jitter and little lag. */
 
@@ -79,9 +92,10 @@ static float smoothstepf(float e0, float e1, float x)
 	return t * t * (3 - 2 * t);
 }
 
-/* Low-pass for eye positions that jump (saccades): noise-sized changes are smoothed with a
- * 3 Hz low-pass, changes over ~0.06 eye widths are taken immediately. No lag on jumps. */
-static double saccade_filter(cf_one_euro *f, double x, double t, double dt)
+/* Low-pass for eye positions that jump (saccades): noise-sized changes (below lo) are smoothed
+ * with a `cutoff` Hz low-pass, changes over hi are taken immediately. No lag on jumps, so a glance
+ * neither shows on its way down nor overshoots on its way back. */
+static double saccade_filter(cf_one_euro *f, double x, double t, double dt, double cutoff, float lo, float hi)
 {
 	if (!f->ready || t - f->t > 0.5) {
 		f->value = x;
@@ -91,8 +105,8 @@ static double saccade_filter(cf_one_euro *f, double x, double t, double dt)
 		return x;
 	}
 	const double e = x - f->value;
-	const double a_min = oe_alpha(3.0, dt);
-	const double a = a_min + (1.0 - a_min) * smoothstepf(0.02f, 0.06f, (float)fabs(e));
+	const double a_min = oe_alpha(cutoff, dt);
+	const double a = a_min + (1.0 - a_min) * smoothstepf(lo, hi, (float)fabs(e));
 	f->value += a * e;
 	f->t = t;
 	return f->value;
@@ -212,6 +226,35 @@ void cf_gaze_init(cf_gaze *g)
 	g->axis.x = 1;
 	g->axis.y = 0;
 	g->open_ref = DEFAULT_OPEN;
+	g->far_fade = 1.0f;
+	g->down_noise = DOWN_NOISE_INIT;
+}
+
+int cf_gaze_notes_valid(float baseline, float notes_offset)
+{
+	const float glance = baseline - notes_offset;
+	return isfinite(glance) && glance > CF_NOTES_MIN_GLANCE;
+}
+
+static float finite_or(float v, float fallback)
+{
+	return isfinite(v) ? v : fallback;
+}
+
+/* A NaN/inf setting would poison the filters for good (g->down never recovers): replace it. */
+static cf_gaze_params sanitize(const cf_gaze_params *in)
+{
+	cf_gaze_params p = *in;
+	p.strength = clampf(finite_or(p.strength, 0.0f), 0.0f, 1.0f);
+	p.max_glance = finite_or(p.max_glance, 0.15f);
+	p.baseline = finite_or(p.baseline, 0.0f);
+	p.baseline_open = finite_or(p.baseline_open, 0.0f);
+	p.notes_open = finite_or(p.notes_open, 0.0f);
+	if (!isfinite(p.notes_offset) || !isfinite(p.notes_side) || !cf_gaze_notes_valid(p.baseline, p.notes_offset)) {
+		p.has_notes = 0;
+		p.notes_offset = p.notes_side = p.notes_open = 0.0f;
+	}
+	return p;
 }
 
 /* ---- Calibration */
@@ -387,8 +430,10 @@ static int finish_output(cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 	return n;
 }
 
-int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, double t, cf_eye out[2])
+int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, double t, cf_eye out[2])
 {
+	const cf_gaze_params ps = sanitize(p_in);
+	const cf_gaze_params *p = &ps;
 	double dt = g->last_t > 0 ? t - g->last_t : 1.0 / 30.0;
 	if (dt <= 0 || dt > 0.5)
 		dt = 1.0 / 30.0;
@@ -407,6 +452,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 		/* Face lost: fade out where the eyes last were. */
 		g->tracking = 0;
 		g->have_rel_open = 0;
+		g->have_down_raw = 0;
 		g->blink = g->closing = 0;
 		/* The detector often misses a frame or two: hold the correction through that instead of
 		 * letting the eyes dip and climb back. Lost for longer: fade out. */
@@ -442,10 +488,22 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 	const float rate = g->have_rel_open ? (g->last_rel_open - r) / (float)dt : 0.0f;
 	g->last_rel_open = r;
 	g->have_rel_open = 1;
-	update_blink(g, r, rate, t);
-	const int hold = holding(g, t);
-
 	const float down_raw = p->baseline - offset;
+	update_blink(g, r, rate, t);
+	/* Lids dropping fast while the pupil drops with them is a glance down (the upper lid follows the
+	 * eye), not a blink: a blink leaves the pupil where it was or loses it upwards. Holding the glance
+	 * at its old value here showed the whole glance for a frame and then slid the correction in. */
+	if (g->closing && !g->blink && g->down.ready && down_raw - (float)g->down.value > GLANCE_PUPIL)
+		g->closing = 0;
+	const int hold = holding(g, t);
+	/* Landmark noise: mean frame-to-frame change of the raw glance while the lids are steady. Clipped
+	 * so the occasional real saccade barely moves it. */
+	if (!hold && g->have_down_raw) {
+		const float ch = fminf(fabsf(down_raw - g->last_down_raw), 0.05f);
+		g->down_noise += (float)(1.0 - exp(-dt / DOWN_NOISE_TAU)) * (ch - g->down_noise);
+	}
+	g->last_down_raw = down_raw;
+	g->have_down_raw = !hold;
 
 	/* Learn the open-eye openness when uncalibrated: follows wide-open quickly, closing slowly. */
 	if (p->baseline_open <= 0 && !hold && fabsf(down_raw) < 0.08f && r > 0.6f) {
@@ -523,7 +581,11 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 		if (g->was_holding && g->down.ready && fabs(down_raw - g->down.value) > RESYNC_JUMP)
 			g->down.ready = 0;
 		g->was_holding = 0;
-		down = oe_filter(&g->down, down_raw, t, 1.2, 4.0);
+		/* Saccade-aware: glances jump between the lens and the notes in a frame or two, and any lag
+		 * there shows as a dip on the way down and an overshoot above the lens on the way back. */
+		const float lo = clampf(DOWN_LO_K * g->down_noise, DOWN_LO_MIN, DOWN_LO_MAX);
+		const float hi = clampf(2.0f * lo, DOWN_HI_MIN, DOWN_HI_MAX);
+		down = saccade_filter(&g->down, down_raw, t, dt, DOWN_CUTOFF, lo, hi);
 	} else {
 		down = g->down.ready ? g->down.value : 0;
 		/* Only a real blink (lids shut), not a noise-triggered "closing" hold, may resync. */
@@ -537,33 +599,48 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 	const float side_c = p->has_notes ? p->notes_side : 0.0f;
 	double side_f;
 	if (!hold)
-		side_f = saccade_filter(&g->side, side, t, dt);
+		side_f = saccade_filter(&g->side, side, t, dt, 3.0, 0.02f, 0.06f);
 	else
 		side_f = g->side.ready ? g->side.value : side_c;
 	const float side_dev = (float)side_f - side_c;
 
 	/* Glance limit: just past the notes when calibrated, else the manual setting. */
+	const int notes = p->has_notes; /* sanitize() cleared it if the notes aren't below the lens */
 	const float notes_glance = p->baseline - p->notes_offset;
-	const float limit = (p->has_notes && notes_glance > 0.01f) ? 1.4f * notes_glance : p->max_glance;
+	const float limit = notes ? 1.4f * notes_glance : p->max_glance;
 	const float band = fmaxf(0.5f * limit, 0.04f);
-	/* Second cue: lids drop when looking down. When the pupil also says "down", a big lid drop
-	 * means a far glance (keyboard) even if the pupil landmark under-reads it. It can only
-	 * switch the effect off, never add correction. */
+	/* Second cue: lids drop when looking down. When the pupil already reads close to the limit, a big
+	 * lid drop means a far glance (keyboard) even if the pupil landmark under-reads it. It can only
+	 * switch the effect off, never add correction. Measured against the lids at the notes when that is
+	 * known, so lids lowered by a smile or a squint while reading don't count, and gated well above
+	 * the notes, so reading itself never triggers it. */
 	float far = (float)down;
-	if (!hold && far > 0.25f * limit)
-		far = fmaxf(far, LID_GLANCE_K * (1.0f - r));
+	if (!hold && far > LID_GATE * limit) {
+		float lid_glance;
+		if (notes && p->notes_open > 0)
+			lid_glance = notes_glance + LID_GLANCE_K * (p->notes_open - openness) / fmaxf(ref, 0.05f);
+		else
+			lid_glance = LID_GLANCE_K * (1.0f - r);
+		far = fmaxf(far, lid_glance);
+	}
 
 	/* Everything that should gently switch the effect off. Each term is 1 when it's fine. */
 	const float f_yaw = 1.0f - smoothstepf(15.0f, 28.0f, abs_yaw);
 	const float f_pitch = 1.0f - smoothstepf(20.0f, 35.0f, abs_pitch);
 	const float f_side = 1.0f - smoothstepf(SIDE_FADE_LO, SIDE_FADE_HI, fabsf(side_dev));
-	const float f_far = 1.0f - smoothstepf(limit, limit + band, far);
+	/* Far fade is applied directly, like the sideways fade: easing it made the eyes slide up for
+	 * ~0.7 s after landing back on the notes from the keyboard, and slide down on the way out. Held
+	 * through blinks (the lid cue is meaningless with the lids shut). The visible position
+	 * (glance x (1 - f_far)) only ever moves the same way as the real gaze. */
+	if (!hold)
+		g->far_fade = 1.0f - smoothstepf(limit, limit + band, far);
+	const float f_far = g->far_fade;
 	float f_size = smoothstepf(0.05f, 0.09f, face->face_width / fmaxf((float)face->image_width, 1.0f));
 	f_size = isfinite(f_size) ? f_size : 0;
 	/* No "down <= 0 -> off" here: the shift is already 0 at the lens (it is proportional to the
 	 * glance), and switching the factor off there made every glance at the notes start from 0 and
 	 * ease in over half a second, so the eyes visibly dipped and climbed back each time. */
-	float target = f_yaw * f_pitch * f_far * f_size;
+	float target = f_yaw * f_pitch * f_size;
 
 	if (hold) {
 		/* Blink: hold the correction steady. Only head-based fades (reliable while the eyes are
@@ -586,16 +663,18 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 	const float engage = smoothstepf(0.0f, fmaxf(0.35f * limit, 0.01f), d);
 	for (int i = 0; i < 2; i++) {
 		const float w = (float)g->rx[i].value;
-		g->amount_unit[i] = d * w * g->factor * f_side;
-		g->hshift_unit[i] = -READ_DAMP * side_dev * w * g->factor * f_side * engage;
+		g->amount_unit[i] = d * w * g->factor * f_side * f_far;
+		g->hshift_unit[i] = -READ_DAMP * side_dev * w * g->factor * f_side * f_far * engage;
 	}
 	return finish_output(g, p, out);
 }
 
-int cf_gaze_predict(const cf_gaze *g, const cf_gaze_params *p, double t_now, cf_eye out[2])
+int cf_gaze_predict(const cf_gaze *g, const cf_gaze_params *p_in, double t_now, cf_eye out[2])
 {
 	if (!g->last_n || !g->have_geometry)
 		return 0;
+	const cf_gaze_params ps = sanitize(p_in);
+	const cf_gaze_params *p = &ps;
 	/* Re-emit so a strength change shows immediately, then move to t_now. */
 	emit(g, p, out);
 	if (!g->tracking)
@@ -630,7 +709,7 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 	out->blinking = g->blink;
 	out->glance = g->down.ready ? (float)g->down.value : 0.0f;
 	/* What is actually being corrected: nothing while looking into the lens. */
-	out->factor = (g->down.ready && g->down.value > 0) ? g->factor : 0.0f;
+	out->factor = (g->down.ready && g->down.value > 0) ? g->factor * g->far_fade : 0.0f;
 }
 
 /* ---- Iris centre refinement */
