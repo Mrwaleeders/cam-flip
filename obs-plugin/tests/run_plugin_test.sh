@@ -6,7 +6,7 @@ OBS_APP="${OBS_APP:-/Applications/OBS.app}"
 OBS_VERSION="${OBS_VERSION:-31.0.0}"  # oldest OBS supported; newer OBS loads it too
 OBS_SRC="build/obs-studio-$OBS_VERSION"
 FW="$OBS_APP/Contents/Frameworks"
-clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -fobjc-arc \
+clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -Wall -fobjc-arc \
   -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
   tests/test_plugin.m src/gaze.c src/warp.c \
   -F"$FW" -framework libobs -Wl,-rpath,"$FW" \

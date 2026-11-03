@@ -5,11 +5,22 @@
  * Checks: the filter creates (Apple Vision objects and tracking thread included), its settings
  * panel builds, Apple Vision accepts our grey frames on the tracking thread, every camera format
  * comes out exactly mirrored when no face is present, the eye warp never touches pixels outside
- * the eye ellipses, calibration requests reach the tracking thread, old calibrations are reset,
- * and destroying the filter stops the tracking thread promptly.
+ * the eye ellipses, calibration requests reach the tracking thread, a calibration without camera
+ * frames gives up, a newer camera calibration that invalidates the notes is reported, a real face
+ * photo is found and then tracked (also at 2560x1440, where Vision sees a shrunk copy), each
+ * filter gets its own hotkey name, old calibrations are reset, and destroying the filter stops
+ * the tracking thread promptly.
+ *
+ * tests/face.jpg: the astronaut Eileen Collins, an official NASA portrait (a NASA photograph, so
+ * public domain), cropped to 384x216. Taken from scikit-image's sample data (skimage/data/
+ * astronaut.png), whose documentation says: "This image was downloaded from the NASA Great Images
+ * database <https://flic.kr/p/r9qvLn>. No known copyright restrictions, released into the public
+ * domain."
  */
 #define CAMFLIP_TEST 1
 #include "../src/plugin.m"
+
+#import <CoreGraphics/CoreGraphics.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -278,6 +289,283 @@ static void run_calibration_request(struct camflip *f)
 	free_frame(&tf);
 }
 
+/* A calibration that gets no camera frames gives up after CALIB_STALL_NS instead of showing
+ * "Calibrating…" forever, both on the tracking thread (which wakes up for it) and in the panel. */
+static void run_calibration_stall(struct camflip *f)
+{
+	camflip_calib_notes_clicked(NULL, NULL, f);
+	pthread_mutex_lock(&f->lock);
+	f->calib_progress_ns = now_ns() - CALIB_STALL_NS - 1000000ull; /* pretend 12 s passed without frames */
+	pthread_mutex_unlock(&f->lock);
+	bool gave_up = false;
+	const uint64_t t0 = now_ns();
+	while (!gave_up && ms_since(t0) < 3000) {
+		pthread_mutex_lock(&f->lock);
+		gave_up = f->calib_request == 0 && f->calib_running == CALIB_IDLE && f->calib_no_frames;
+		pthread_mutex_unlock(&f->lock);
+		if (!gave_up)
+			usleep(10000);
+	}
+	check(gave_up, "calibration without camera frames gives up (tracking thread)");
+
+	char text[700];
+	bool warn = false;
+	status_text(f, text, sizeof(text), &warn);
+	printf("info: status panel says:\n%s\n", text);
+	check(warn && strstr(text, "no camera frames") != NULL && strstr(text, "Calibrating") == NULL,
+	      "status says calibration didn't finish for lack of camera frames");
+
+	/* The panel finds it on its own too (whichever thread gets there first). */
+	camflip_calib_lens_clicked(NULL, NULL, f);
+	pthread_mutex_lock(&f->lock);
+	f->calib_progress_ns = now_ns() - CALIB_STALL_NS - 1000000ull;
+	pthread_mutex_unlock(&f->lock);
+	status_text(f, text, sizeof(text), &warn);
+	check(warn && strstr(text, "no camera frames") != NULL, "settings panel gives up a calibration without frames");
+
+	/* A frame arriving later doesn't bring the abandoned calibration back. */
+	test_frame tf;
+	make_frame(&tf, VIDEO_FORMAT_NV12, 640, 360);
+	tf.frame.timestamp = 25000000000ull;
+	camflip_filter_video(f, &tf.frame);
+	wait_idle(f, 5000);
+	pthread_mutex_lock(&f->lock);
+	const bool still_idle = f->calib_running == CALIB_IDLE && f->calib_request == 0 && !f->calib_cancel;
+	pthread_mutex_unlock(&f->lock);
+	check(still_idle, "an abandoned calibration stays abandoned when frames come back");
+	free_frame(&tf);
+}
+
+/* Redoing the camera calibration so the saved notes are no longer below it: the panel says so and
+ * the notes are not used until step 2 is redone. */
+static void run_notes_stale(struct camflip *f, obs_data_t *restore)
+{
+	pthread_mutex_lock(&f->lock);
+	f->baseline = 0.0f;
+	f->baseline_open = 0.3f;
+	f->lens_done = true;
+	f->has_notes = true;
+	f->notes_offset = -0.10f; /* 0.10 eye widths below the lens */
+	f->notes_side = 0.0f;
+	f->notes_open = 0.25f;
+	f->needs_recalib = false;
+	f->calib_running = CALIB_IDLE;
+	f->calib_failed = CALIB_IDLE;
+	f->calib_notes_bad = false;
+	f->calib_no_frames = false;
+	f->calib_done_msg = NULL;
+	check_notes_locked(f);
+	const bool used_before = !f->notes_stale && params_locked(f).has_notes == 1;
+	const cf_calib_result lens = {.target = CF_CALIB_LENS, .offset = -0.09f, .openness = 0.3f, .side = 0.0f};
+	bool bad = false;
+	obs_data_t *changes = apply_calibration_locked(f, &lens, &bad);
+	const bool stale = changes && !bad && f->notes_stale && f->has_notes && params_locked(f).has_notes == 0;
+	pthread_mutex_unlock(&f->lock);
+	obs_data_release(changes);
+	check(used_before && stale, "a camera calibration level with the notes stops using the notes");
+
+	char text[700];
+	bool warn = false;
+	status_text(f, text, sizeof(text), &warn);
+	printf("info: status panel says:\n%s\n", text);
+	check(warn && strstr(text, "no longer matches") != NULL && strstr(text, "redo step 2") != NULL &&
+		      strstr(text, "notes done") == NULL,
+	      "status asks to redo the notes calibration");
+
+	obs_properties_t *props = camflip_properties(f);
+	obs_property_t *slider = props ? obs_properties_get(props, S_MAX_GLANCE) : NULL;
+	check(slider && obs_property_enabled(slider) && obs_properties_get(props, "forget_notes"),
+	      "glance slider is back in use while the notes are invalid");
+	obs_properties_destroy(props);
+
+	/* Same after a restart: worked out from the saved settings. */
+	obs_data_t *saved = obs_data_create();
+	camflip_defaults(saved);
+	obs_data_set_double(saved, S_BASELINE, -0.09);
+	obs_data_set_double(saved, S_BASELINE_OPEN, 0.3);
+	obs_data_set_double(saved, S_NOTES_OFFSET, -0.10);
+	obs_data_set_bool(saved, S_HAS_NOTES, true);
+	obs_data_set_int(saved, S_CALIB_VERSION, CALIB_VERSION);
+	camflip_update(f, saved);
+	pthread_mutex_lock(&f->lock);
+	const bool stale_loaded = f->notes_stale;
+	pthread_mutex_unlock(&f->lock);
+	obs_data_set_double(saved, S_BASELINE, 0.0);
+	camflip_update(f, saved);
+	pthread_mutex_lock(&f->lock);
+	const bool valid_again = !f->notes_stale && params_locked(f).has_notes == 1;
+	pthread_mutex_unlock(&f->lock);
+	check(stale_loaded && valid_again, "saved notes are checked against the saved camera calibration");
+	obs_data_release(saved);
+
+	camflip_update(f, restore);
+	pthread_mutex_lock(&f->lock);
+	f->calib_done_msg = NULL;
+	pthread_mutex_unlock(&f->lock);
+}
+
+static void run_hotkey_names(void)
+{
+	char n[4][512], d[4][512], again[512], again_d[512];
+	hotkey_names(FILTER_NAME, n[0], sizeof(n[0]), d[0], sizeof(d[0]));
+	hotkey_names(FILTER_NAME " 2", n[1], sizeof(n[1]), d[1], sizeof(d[1]));
+	hotkey_names(NULL, n[2], sizeof(n[2]), d[2], sizeof(d[2]));
+	hotkey_names("", n[3], sizeof(n[3]), d[3], sizeof(d[3]));
+	hotkey_names(FILTER_NAME " 2", again, sizeof(again), again_d, sizeof(again_d));
+	bool distinct = true;
+	for (int i = 0; i < 4; i++)
+		for (int j = i + 1; j < 4; j++)
+			if (strcmp(n[i], n[j]) == 0)
+				distinct = false;
+	printf("info: hotkey names: \"%s\", \"%s\", \"%s\", \"%s\"\n", n[0], n[1], n[2], n[3]);
+	check(strcmp(n[0], HOTKEY_NAME) == 0 && strcmp(d[0], HOTKEY_DESC) == 0,
+	      "a filter with the default name keeps the hotkey name earlier versions saved bindings under");
+	check(distinct, "each filter on a camera gets its own hotkey name");
+	check(strcmp(again, n[1]) == 0 && strstr(d[1], FILTER_NAME " 2") != NULL,
+	      "hotkey name is stable and the description names the filter");
+}
+
+/* tests/face.jpg drawn to fill a w x h BGRA frame (grey bars if the shapes differ), moved right
+ * by shift_x pixels. NULL if it can't be loaded. */
+static uint8_t *face_bgra(int w, int h, double shift_x)
+{
+	const char *path = getenv("CAMFLIP_FACE");
+	if (!path)
+		path = "tests/face.jpg"; /* run_plugin_test.sh runs from obs-plugin/ */
+	CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)path,
+							       (CFIndex)strlen(path), false);
+	if (!url)
+		return NULL;
+	CGImageSourceRef src = CGImageSourceCreateWithURL(url, NULL);
+	CFRelease(url);
+	if (!src)
+		return NULL;
+	CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+	CFRelease(src);
+	if (!img)
+		return NULL;
+	uint8_t *buf = calloc((size_t)w * h * 4, 1);
+	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	/* Premultiplied-first alpha in little-endian 32-bit words: bytes B, G, R, A in memory. */
+	CGContextRef ctx = buf ? CGBitmapContextCreate(buf, (size_t)w, (size_t)h, 8, (size_t)w * 4, cs,
+						       (CGBitmapInfo)kCGImageAlphaPremultipliedFirst |
+							       kCGBitmapByteOrder32Little)
+			       : NULL;
+	CGColorSpaceRelease(cs);
+	if (ctx) {
+		CGContextSetRGBFillColor(ctx, 0.5, 0.5, 0.5, 1.0);
+		CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
+		CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+		const double dh = h, dw = (double)CGImageGetWidth(img) * h / (double)CGImageGetHeight(img);
+		CGContextDrawImage(ctx, CGRectMake((w - dw) / 2 + shift_x, 0, dw, dh), img);
+		CGContextRelease(ctx);
+	} else {
+		free(buf);
+		buf = NULL;
+	}
+	CGImageRelease(img);
+	return buf;
+}
+
+/* Feeds `n` copies of a BGRA picture through the filter like a 30 fps camera, letting the tracking
+ * thread analyse each one. */
+static void feed_picture(struct camflip *f, const uint8_t *bgra, int w, int h, int n, double t0)
+{
+	test_frame tf;
+	memset(&tf, 0, sizeof(tf));
+	tf.frame.width = w;
+	tf.frame.height = h;
+	tf.frame.format = VIDEO_FORMAT_BGRA;
+	tf.frame.linesize[0] = w * 4;
+	const size_t size = (size_t)w * h * 4;
+	tf.frame.data[0] = malloc(size);
+	for (int k = 0; k < n; k++) {
+		memcpy(tf.frame.data[0], bgra, size); /* the filter mirrors (and may warp) in place */
+		tf.frame.timestamp = (uint64_t)((t0 + k / 30.0) * 1e9);
+		camflip_filter_video(f, &tf.frame);
+		wait_idle(f, 5000);
+	}
+	free(tf.frame.data[0]);
+}
+
+static cf_pt eye_centre(const cf_face *face, int e)
+{
+	const cf_pt *p = e ? face->right_eye : face->left_eye;
+	const int n = e ? face->right_count : face->left_count;
+	cf_pt c = {0, 0};
+	for (int i = 0; i < n; i++) {
+		c.x += p[i].x / (float)n;
+		c.y += p[i].y / (float)n;
+	}
+	return c;
+}
+
+/* A real face photo: found by full detection, then followed by fast tracking (also when it moves),
+ * and the gaze model sees it. At 2560x1440 Vision gets a half-size copy; the landmarks must still
+ * come back in full-resolution pixels. */
+static void run_face_tracking(struct camflip *f)
+{
+	const int w = 1280, h = 720;
+	uint8_t *pic = face_bgra(w, h, 0), *moved = face_bgra(w, h, 8), *big = face_bgra(2 * w, 2 * h, 0);
+	check(pic && moved && big, "tests/face.jpg loads");
+	if (!pic || !moved || !big) {
+		free(pic);
+		free(moved);
+		free(big);
+		return;
+	}
+	pthread_mutex_lock(&f->lock);
+	f->eye_contact = true;
+	const unsigned long full0 = f->full_detections, tracked0 = f->tracked_runs;
+	pthread_mutex_unlock(&f->lock);
+
+	feed_picture(f, pic, w, h, 20, 40.0);
+	pthread_mutex_lock(&f->lock);
+	const cf_face seen = f->seen_face;
+	const bool face_still = f->st_face;
+	pthread_mutex_unlock(&f->lock);
+
+	feed_picture(f, moved, w, h, 10, 40.0 + 20 / 30.0);
+	pthread_mutex_lock(&f->lock);
+	const cf_face seen_moved = f->seen_face;
+	const bool face_moved = f->st_face;
+	const unsigned long full = f->full_detections - full0, tracked = f->tracked_runs - tracked0;
+	pthread_mutex_unlock(&f->lock);
+
+	const cf_pt l = eye_centre(&seen, 0), r = eye_centre(&seen, 1);
+	const cf_pt lm = eye_centre(&seen_moved, 0);
+	printf("info: face photo: %lu full detections, %lu tracked; eyes at (%.1f, %.1f) and (%.1f, %.1f), "
+	       "left eye moved %.1f px for an 8 px shift\n",
+	       full, tracked, l.x, l.y, r.x, r.y, lm.x - l.x);
+	check(full >= 1, "a real face is found by full face detection");
+	check(tracked >= 1, "the face is then followed by fast tracking");
+	check(seen.found && seen_moved.found && face_still && face_moved, "the gaze model sees the face, still and moving");
+
+	char text[700];
+	bool warn = false;
+	status_text(f, text, sizeof(text), &warn);
+	check(strstr(text, "Face found.") != NULL, "status says the face is found");
+
+	feed_picture(f, big, 2 * w, 2 * h, 8, 50.0);
+	pthread_mutex_lock(&f->lock);
+	const cf_face seen_big = f->seen_face;
+	pthread_mutex_unlock(&f->lock);
+	const cf_pt bl = eye_centre(&seen_big, 0), br = eye_centre(&seen_big, 1);
+	const float iod = hypotf(br.x - bl.x, br.y - bl.y);
+	const float el = hypotf(bl.x - 2 * l.x, bl.y - 2 * l.y), er = hypotf(br.x - 2 * r.x, br.y - 2 * r.y);
+	const float pl = hypotf(seen_big.left_pupil.x - 2 * seen.left_pupil.x, seen_big.left_pupil.y - 2 * seen.left_pupil.y);
+	printf("info: 2560x1440: eyes at (%.1f, %.1f) and (%.1f, %.1f), %.1f and %.1f px from twice the 1280x720 "
+	       "positions, left pupil %.1f px (eye distance %.1f px)\n",
+	       bl.x, bl.y, br.x, br.y, el, er, pl, iod);
+	check(seen_big.found && seen_big.image_width == 2 * w && iod > 0 && el < 0.1f * iod && er < 0.1f * iod &&
+		      pl < 0.15f * iod,
+	      "frames wider than 1920 px are tracked at reduced size with full-resolution coordinates");
+
+	free(pic);
+	free(moved);
+	free(big);
+}
+
 static void run_migration(void)
 {
 	obs_data_t *old = obs_data_create();
@@ -360,6 +648,10 @@ int main(void)
 	check(off && on, "hotkey toggles eye contact");
 
 	run_calibration_request(f);
+	run_calibration_stall(f);
+	run_face_tracking(f);
+	run_notes_stale(f, settings);
+	run_hotkey_names();
 
 	/* Destroy while a frame is waiting: must stop the tracking thread promptly. */
 	test_frame tf;

@@ -36,7 +36,8 @@ OUT="build/cam-flip.plugin"
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
 
-clang -bundle -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -O2 -Wall \
+# Warnings are reported but not fatal (no -Werror) until a real macOS build has been checked clean.
+clang -bundle -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -O2 -Wall -Wextra \
   -fobjc-arc -fvisibility=hidden \
   -I"$OBS_SRC/libobs" -I"$SIMDE_SRC" -Ibuild/include -Isrc \
   -DCAMFLIP_VERSION="\"$VERSION\"" \

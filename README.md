@@ -15,11 +15,12 @@ Teams, Zoom and Meet mirror only your **own preview**. They always send the unfl
 * **Mirror:** an exact pixel flip with no resampling, so there's no softening.
 * **Eye contact:** Apple's Vision framework finds your eyes and pupils. When you glance down at notes placed just under the camera, Cam Flip moves your irises back up toward the lens, so the other person shouldn't be able to tell you're reading.
 * **Looks natural when you move:**
-  * The correction tracks your eyes frame by frame and follows your head as it moves, so it never lags or slips.
-  * When you turn your head, look far down (for example at the keyboard) or to the side, or blink, the correction fades out smoothly instead of forcing a stare. When you look back, it fades in again over about a third of a second. It never switches suddenly.
+  * Eye tracking runs in the background, a little behind the video, and Cam Flip predicts where your eyes are in each frame it corrects. So the correction stays on your eyes during normal head movement. Very fast, sudden movements can briefly show it a few pixels off before tracking catches up.
+  * When you turn your head, look far down (for example at the keyboard) or to the side, the correction fades out smoothly instead of forcing a stare. When you look back, it fades in again over about a third of a second. It never switches suddenly.
+  * When you blink, the correction is held steady through the blink, so your eyes don't flicker. If your eyes stay closed for longer, it fades out.
   * Automated tests check these behaviours on every build. See `obs-plugin/tests/test_gaze.c`.
 * **Image quality:**
-  * Cam Flip works on the camera's frames in their native format (NV12, UYVY, BGRA and others). It never converts, scales or compresses them.
+  * Cam Flip works on the camera's frames in their native format (NV12, UYVY, BGRA and others). It never converts, scales or compresses them. (For cameras wider than 1920 pixels, face tracking looks at a reduced-size copy to stay fast. The pupils are still located on the full-size frame, and the video itself is never scaled.)
   * Pixels outside your eyes are not touched at all. The tests check this byte for byte.
 * **Delay:** Cam Flip adds no frame of delay. Eye tracking runs in the background on its own thread, always on the newest frame. Each frame is corrected as it passes through, using where your eyes are predicted to be at that moment, which takes well under a millisecond. So OBS never waits for face tracking. OBS's virtual camera adds roughly 15–20 ms with the settings below.
   * OBS's log (Help › Log Files) shows the real numbers every 10 seconds, for example `[cam-flip] tracking 6.1 ms avg (30 fps analysed, 10 full face detections), warp 0.20 ms`.
@@ -55,13 +56,13 @@ In **OBS › Settings › Video**:
 2. Right-click the camera source, choose **Filters**, click **+** under *Audio/Video Filters*, and pick **Cam Flip (mirror + eye contact)**.
 3. In the filter's settings:
    * **Mirror video**: on.
-   * **Eye contact**: on. Strength starts at 70%.
+   * **Eye contact**: on. Strength starts at 100%.
 4. Calibrate, in two steps. Sit as you will in calls, with your notes where you'll read them (just under the camera works best).
    1. Click **1. Click, then look into the camera**. Then look straight into the camera lens until the status says it's done (a second or two).
    2. Click **2. Click, then look at your notes**. Then look at the **middle of the line you usually read** in your notes, with your head still, until the status says it's done.
 
-   The status text in the filter's settings shows when each step is done. With both steps done, Cam Flip knows exactly where your notes are, so it fully cancels that glance, and fades out for anything further away (like your keyboard).
-   Redo both steps if you move your screen, notes or chair.
+   The status text in the filter's settings shows when each step is done. With both steps done, Cam Flip knows exactly where your notes are, and how open your eyes are while you read them, so it fully cancels that glance, tells reading apart from blinking, and fades out for anything further away (like your keyboard).
+   Redo both steps if you move your screen, notes or chair. If you redo only step 1 and your notes no longer sit below the new camera position, the status says **Notes calibration no longer matches: please redo step 2**. Until you do, Cam Flip uses the "Correct glances up to" slider instead.
 
 ### 5. Use it in calls
 * Click **Start Virtual Camera** in OBS. It's in the Controls panel at the bottom right.
@@ -76,22 +77,26 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 | --- | --- |
 | Mirror video | Flips the video that is actually sent, so everyone sees it mirrored. |
 | Eye contact | Turns gaze correction on or off. |
-| Eye contact strength | 100% fully cancels a small glance down. Lower values keep a little of the natural movement. |
+| Eye contact strength | Starts at 100%, which fully cancels the glance at your notes. Lower values keep a little of the natural movement. |
 | Correct glances up to | How far down you can look and still be corrected. Beyond this, your real eyes show again, gradually. Not used once step 2 is calibrated, because Cam Flip then knows where your notes are. |
 | 1. Click, then look into the camera | Learns where your pupils sit, and how open your eyes are, when you look into the lens. |
-| 2. Click, then look at your notes | Learns exactly how far down (and sideways) your notes are, so that glance is fully cancelled. |
+| 2. Click, then look at your notes | Learns exactly how far down (and sideways) your notes are, and how open your eyes are while you read, so that glance is fully cancelled. Your notes must be below the camera. If they aren't, or you looked elsewhere, the status says **Notes calibration failed** and nothing is changed. |
 | Forget notes calibration | Goes back to using the "Correct glances up to" slider. |
-| Status | Shows calibration progress, whether your face is found, and how long tracking takes. |
-| Show tracked eyes (for tuning) | Draws thin outlines in the video: black for the eye outline Vision found, white crosses for the pupils, white for the area being corrected. Turn it off before a call. |
+| Status | Shows calibration progress and problems, whether your face is found, and how long tracking takes. |
+| Show tracked eyes (for tuning) | While a glance is being corrected, draws thin outlines exactly where the correction is applied in that frame: a white ellipse for the area that may change, and black for the eye opening your iris is moved inside. Nothing is drawn while you look into the camera. Turn it off before a call. |
 | Defaults | Resets everything, including calibration. |
 
-**Hotkey:** to switch eye contact on and off during a call, set a key in **OBS › Settings › Hotkeys**. Look for **Cam Flip: toggle eye contact** under your camera's name.
+**Hotkey:** to switch eye contact on and off during a call, set a key in **OBS › Settings › Hotkeys**. Look for **Cam Flip: toggle eye contact** under your camera's name. If a camera has more than one Cam Flip filter, each one has its own hotkey, named after the filter, for example **Cam Flip: toggle eye contact (Cam Flip 2)**. Renaming a filter keeps its key.
 
 ## Troubleshooting
 
 * **The filter isn't in the list:** reopen OBS after installing, and check the plugin is in `~/Library/Application Support/obs-studio/plugins/cam-flip.plugin`. OBS's log (Help › Log Files) shows `[cam-flip] loaded`.
 * **Eye contact does nothing:** check the status text in the filter's settings. If it says no face is found, light your face so it fills a fair part of the frame, then calibrate. Turn on **Show tracked eyes** to see what Cam Flip sees. The log shows `[cam-flip]` messages if your camera's pixel format isn't supported. If so, set the camera's **Video Format** to NV12 or UYVY in its properties.
 * **Status says "Please calibrate again":** this version measures your eyes differently, so calibrations from older versions were reset. Do both calibration steps again.
+* **Status says "Calibration didn't finish: no camera frames":** the camera sent no video for 12 seconds after you clicked. Check that the camera is on and not used by another app, and that you can see it in OBS, then click the step again.
+* **Status says "Calibration gave up":** Cam Flip didn't see a steady, front-facing face for about 10 seconds. Light your face, face the camera, keep your head still and try again.
+* **Status says "Notes calibration failed":** step 2 measured a gaze that wasn't below the camera. Look at the middle of your notes under the camera (not at the screen or the camera) and try again. If it keeps failing, redo step 1 first.
+* **Status says "Notes calibration no longer matches: please redo step 2":** a newer step 1 put the camera level with or below your saved notes position. Do step 2 again.
 * **Others see you un-mirrored:** check the filter is on the camera source, and the call app uses **OBS Virtual Camera**.
 
 ## Repo layout
