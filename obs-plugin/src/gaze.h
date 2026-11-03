@@ -21,6 +21,7 @@ extern "C" {
 #define CF_CALIB_SAMPLES 30
 #define CF_CALIB_MIN_SAMPLES 10
 #define CF_CALIB_TIMEOUT_FRAMES 300 /* about 10 s at 30 fps */
+#define CF_CALIB_WARMUP_S 0.6        /* s: samples ignored after starting (eyes still on the button) */
 
 typedef struct {
 	float x, y; /* image pixels, origin top left */
@@ -46,6 +47,7 @@ typedef struct {
 	float baseline_open; /* eye openness when looking into the lens; 0 = unknown, use a default */
 	int has_notes;       /* 1 when the "look at your notes" calibration has been done */
 	float notes_offset;  /* gaze offset when looking at the notes (notes calibration) */
+	float notes_side;    /* sideways gaze offset (eye widths) at the middle of the notes (notes calibration) */
 } cf_gaze_params;
 
 enum cf_calib_target { CF_CALIB_LENS = 0, CF_CALIB_NOTES = 1 };
@@ -54,6 +56,7 @@ typedef struct {
 	enum cf_calib_target target;
 	float offset;   /* median gaze offset while calibrating (same units as baseline) */
 	float openness; /* median eye openness while calibrating */
+	float side;     /* median sideways gaze offset while calibrating (eye widths, along the eye axis) */
 } cf_calib_result;
 
 /* What the filter panel shows. */
@@ -81,10 +84,37 @@ typedef struct {
 	int calibrating;
 	int calib_count;
 	int calib_frames; /* frames seen since calibration started, for the timeout */
+	int calib_have_start;
+	double calib_start; /* timestamp of the first frame after starting, for the warm-up */
 	int calib_failed;
 	float calib_samples[64];
 	int calib_done;
 	float calib_result;
+
+	/* Blink hold, two-point calibration, reading damping and background prediction. */
+	cf_one_euro side;       /* filtered sideways gaze offset (eye widths), for reading damping */
+	float open_ref;         /* learned open-eye openness, used when params->baseline_open is 0 */
+	float last_rel_open;    /* previous relative openness, to see lids closing fast */
+	int have_rel_open;
+	int blink;              /* lids closed: correction and geometry are held */
+	int closing;            /* lids dropping fast: held until it is clear whether it is a blink */
+	double hold_start;      /* when the current blink/closing hold began */
+	double settle_until;    /* glance stays frozen until then, after a blink */
+	int face_found;
+	int tracking;           /* last update saw the face (prediction may extrapolate) */
+	cf_pt vel[2];           /* eye centre velocity (px/s) for prediction: quick to follow starts and stops */
+	int was_holding;        /* a real blink happened during the current hold: resync the glance after it */
+	enum cf_calib_target calib_target;
+	float calib_open[64];
+	float calib_side[64];
+	float calib_open_result, calib_side_result;
+	float ap[2][CF_MAX_APERTURE][2]; /* smoothed eye outline, relative to the eye centre */
+	int ap_count[2];
+	float amount_unit[2];   /* vertical iris shift before strength (px) */
+	float hshift_unit[2];   /* sideways iris shift before strength (px, along the eye axis) */
+	cf_pt axis;             /* eye axis (unit, from the left eye towards the right eye) */
+	cf_eye last_out[2];
+	int last_n;
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);
