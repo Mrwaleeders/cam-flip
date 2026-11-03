@@ -157,6 +157,10 @@ struct camflip {
 	unsigned long full_detections;
 	unsigned long tracked_runs;
 #ifdef CAMFLIP_TEST
+	/* Diagnostics for tests and tools/diag_video.m: Vision's own pupil points before refinement,
+	 * its landmark confidence, and whether the last pass was a full detection. */
+	cf_pt dbg_raw_pupil[2];
+	float dbg_conf;
 	cf_face seen_face; /* what Vision saw on the last analysed frame (full-resolution pixels) */
 #endif
 
@@ -669,6 +673,11 @@ static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, b
 	const CGPoint *rp = [lm.rightPupil pointsInImageOfSize:size];
 	face->left_pupil = (cf_pt){(float)lp[0].x, (float)(vh - lp[0].y)};
 	face->right_pupil = (cf_pt){(float)rp[0].x, (float)(vh - rp[0].y)};
+#ifdef CAMFLIP_TEST
+	f->dbg_raw_pupil[0] = face->left_pupil;
+	f->dbg_raw_pupil[1] = face->right_pupil;
+	f->dbg_conf = lm.confidence;
+#endif
 
 	/* Vision's pupil point is coarse; move it onto the real iris centre, using the full-resolution
 	 * frame even when Vision saw a shrunk copy (all coordinates here are full-resolution). */
