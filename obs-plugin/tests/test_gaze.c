@@ -284,11 +284,22 @@ static float gauss(float sd)
  * 16 outline points, corners on y = 500. The person looks `glance` eye widths below the lens and `side`
  * eye widths to the side (eyes only), with the head turned `yaw` degrees; the upper lid follows the eye
  * down by R_LID of the glance. The refined pupils are at the true position plus d[e] = {dx, dy} px;
- * Vision's own pupil points (if `vision`) are coarse: they move R_VIS of the true movement, plus vd[e]. */
+ * Vision's own pupil points (if `vision`) are coarse: they move R_VIS of the true movement, plus vd[e].
+ * R_VIS is 0.6 unless a check sets r_vis; rx adds what a check needs on top (lids closing, the points
+ * dragged by them, Vision's point off on its own), and is back at its defaults after each check. */
 #define RW 86.0f
 #define RH 26.0f
 #define R_LID 0.5f
-#define R_VIS 0.6f
+static float r_vis = 0.6f;
+#define R_VIS r_vis
+typedef struct {
+	float open;     /* the lids' openness, as a fraction of where the glance puts them (1: open; under 0.5 both
+			 * lids close on the corner line, and at 0 they meet: shut) */
+	float drag[2];  /* each eye's refined point dragged down by this (eye widths; a lid, a refiner slip) */
+	float vdrag;    /* Vision's points moved down by this (eye widths) */
+} real_extra;
+static const real_extra rx_none = {1.0f, {0.0f, 0.0f}, 0.0f};
+static real_extra rx = {1.0f, {0.0f, 0.0f}, 0.0f};
 typedef struct {
 	float glance, side, yaw;
 } real_gaze;
@@ -302,7 +313,8 @@ static cf_face face_real(real_gaze gz, const float d[2][2], int vision, const fl
 	f.face_width = 420;
 	f.has_pose = 1;
 	f.yaw_deg = gz.yaw;
-	const float gpx = gz.glance * RW, spx = gz.side * RW, drop = R_LID * gpx;
+	const float gpx = gz.glance * RW, spx = gz.side * RW;
+	const float drop = R_LID * gpx + (1.0f - rx.open) * (RH - R_LID * gpx);
 	const float cx[2] = {960 - 1.5f * RW, 960 + 1.5f * RW};
 	for (int e = 0; e < 2; e++) {
 		cf_pt *pts = e == 0 ? f.left_eye : f.right_eye;
@@ -311,11 +323,13 @@ static cf_face face_real(real_gaze gz, const float d[2][2], int vision, const fl
 			const float s = sinf(a);
 			pts[i].x = cx[e] + 0.5f * RW * cosf(a);
 			pts[i].y = 500 + 0.5f * RH * s;
-			if (s < -1e-3f)
+			if (rx.open < 0.5f)
+				pts[i].y = 500 + 0.5f * RH * s * fmaxf(rx.open, 0.0f);
+			else if (s < -1e-3f)
 				pts[i].y += drop * -s;
 		}
-		const cf_pt pupil = {cx[e] + spx + d[e][0], 500 + gpx + d[e][1]};
-		const cf_pt vp = {cx[e] + R_VIS * spx + vd[e][0], 500 + R_VIS * gpx + vd[e][1]};
+		const cf_pt pupil = {cx[e] + spx + d[e][0], 500 + gpx + d[e][1] + rx.drag[e] * RW};
+		const cf_pt vp = {cx[e] + R_VIS * spx + vd[e][0], 500 + R_VIS * gpx + vd[e][1] + rx.vdrag * RW};
 		if (e == 0) {
 			f.left_count = 16;
 			f.left_pupil = pupil;
@@ -330,12 +344,19 @@ static cf_face face_real(real_gaze gz, const float d[2][2], int vision, const fl
 	return f;
 }
 
-/* Calibrated like the user: notes 0.10 eye widths (8.6 px) under the lens. */
+/* Calibrated like the user: notes 0.10 eye widths (8.6 px) under the lens; with real_vis_cal, Vision's
+ * points are known from the same two calibrations (as the plugin keeps them), which sets their gain. */
+static int real_vis_cal = 0;
 static cf_gaze_params real_params(void)
 {
-	const cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = RH / RW,
-				  .has_notes = 1, .notes_offset = -0.10f, .notes_side = 0.0f,
-				  .notes_open = (RH - R_LID * 0.10f * RW) / RW};
+	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = RH / RW,
+			    .has_notes = 1, .notes_offset = -0.10f, .notes_side = 0.0f,
+			    .notes_open = (RH - R_LID * 0.10f * RW) / RW};
+	if (real_vis_cal) {
+		p.has_vis_calib = 1;
+		p.vis_baseline = 0.0f;
+		p.vis_notes = -0.10f * R_VIS;
+	}
 	return p;
 }
 
@@ -454,9 +475,10 @@ static int real_lock_on(const real_noise *rn, unsigned seed)
  * reaches 90% of the notes correction going down, or falls to 10% of it coming back; over: how far the
  * mean goes past the target (a filter overshooting). For single glances, which carry their own frames'
  * measurement noise: quick, the share that reached 90% (or 10%) on the first or second frame, and late,
- * the latest frame on which one did. */
+ * the latest frame on which one did; near, the latest frame on which one got within 25% of the target
+ * (2.2 px: twice the refined noise, so a glance that landed but carries its frames' noise counts). */
 static void real_glances(const real_noise *rn, unsigned seed, int *mean_dn, int *mean_up, float *over, float *quick,
-			 int *late)
+			 int *late, int *near)
 {
 	enum { CYC = 32, K = 10 };
 	const cf_gaze_params p = real_params();
@@ -469,7 +491,7 @@ static void real_glances(const real_noise *rn, unsigned seed, int *mean_dn, int 
 	const int hold = (int)(1.5 * rn->fps);
 	double t = 200.0;
 	double mean[2][K] = {{0}};
-	*late = 0;
+	*late = *near = 0;
 	int n_quick = 0;
 	const real_gaze lens = {0, 0, 0};
 	for (int i = 0; i < (int)(3.0 * rn->fps); i++, t += dt) {
@@ -478,17 +500,20 @@ static void real_glances(const real_noise *rn, unsigned seed, int *mean_dn, int 
 	}
 	for (int cyc = 0; cyc < CYC; cyc++)
 		for (int dir = 0; dir < 2; dir++) {
-			int land = 99;
+			int land = 99, land25 = 99;
 			for (int i = 0; i < hold; i++, t += dt) {
 				cf_face f = noisy_real(rn, dir == 0 ? at_notes() : lens);
 				const int n = cf_gaze_update(&g, &f, &p, t, out);
 				const float c = n ? -out[0].sy : 0.0f;
 				if (land == 99 && (dir == 0 ? c >= 0.9f * target : c <= 0.1f * target))
 					land = i;
+				if (land25 == 99 && (dir == 0 ? c >= 0.75f * target : c <= 0.25f * target))
+					land25 = i;
 				if (i < K)
 					mean[dir][i] += c / CYC;
 			}
 			*late = *late > land ? *late : land;
+			*near = *near > land25 ? *near : land25;
 			n_quick += land <= 1;
 		}
 	*quick = (float)n_quick / (2.0f * CYC);
@@ -551,13 +576,18 @@ static void real_outlier(const real_noise *rn, int which, float px, unsigned see
 }
 
 /* Looks away from the notes and back, with the noise of `rn`: 3 s at the notes, 1.5 s at `away`, 1.5 s
- * back at the notes. Over the hand-off both ways (the frame the gaze moves and everything after): the
- * largest frame-to-frame change of the applied shift (vertical or sideways, px). Over the fades (the
- * first 0.8 s of each): the largest step against the way the fade goes (the shift growing while
- * letting go, shrinking while taking over). And the shift left at the end of the look-away, and the
+ * back at the notes. For each hand-off: land[], the frame (0 = the first with the new gaze) from which on
+ * the applied shift stays where it ends up (letting go: under 0.5 px; taking over: within 1 px of the
+ * correction at the end, the readings' own noise); the largest frame-to-frame change of the applied shift
+ * (vertical or sideways, px) over both hand-offs, all of it (step) and after the landing frames
+ * (step_after); over the first 0.8 s of each, the largest step against the way it goes (the shift growing
+ * while letting go, shrinking while taking over); and the shift left at the end of the look-away, and the
  * correction at the end of the look back (px). */
-static void real_look_away(const real_noise *rn, real_gaze away, unsigned seed, float *step, float *against_out,
-			   float *against_in, float *left, float *back)
+typedef struct {
+	int land[2];
+	float step, step_after, against_out, against_in, left, back;
+} look_away_result;
+static void real_look_away(const real_noise *rn, real_gaze away, unsigned seed, look_away_result *r)
 {
 	const cf_gaze_params p = real_params();
 	cf_gaze g;
@@ -566,25 +596,47 @@ static void real_look_away(const real_noise *rn, real_gaze away, unsigned seed, 
 	rng_seed(seed);
 	const double dt = 1.0 / rn->fps;
 	const int n0 = (int)(3.0 * rn->fps), n1 = (int)(1.5 * rn->fps), nf = (int)(0.8 * rn->fps);
+	float sys[2][128], sxs[2][128], mags[2][128];
 	float py = 0, px = 0, pm = 0;
-	*step = *against_out = *against_in = 0;
+	memset(r, 0, sizeof(*r));
 	for (int i = 0; i < n0 + 2 * n1; i++) {
 		const int phase = i < n0 ? 0 : (i < n0 + n1 ? 1 : 2);
 		cf_face f = noisy_real(rn, phase == 1 ? away : at_notes());
 		const int n = cf_gaze_update(&g, &f, &p, 100.0 + i * dt, out);
 		const float sy = n ? out[0].sy : 0, sx = n ? out[0].sx : 0, mag = sqrtf(sy * sy + sx * sx);
-		if (phase > 0)
-			*step = fmaxf(*step, fmaxf(fabsf(sy - py), fabsf(sx - px)));
-		if (phase == 1 && i < n0 + nf)
-			*against_out = fmaxf(*against_out, mag - pm);
-		if (phase == 2 && i < n0 + n1 + nf)
-			*against_in = fmaxf(*against_in, pm - mag);
+		if (phase > 0) {
+			const int k = i - (phase == 1 ? n0 : n0 + n1);
+			if (k < 128) {
+				sys[phase - 1][k] = sy;
+				sxs[phase - 1][k] = sx;
+				mags[phase - 1][k] = mag;
+			}
+			r->step = fmaxf(r->step, fmaxf(fabsf(sy - py), fabsf(sx - px)));
+		}
 		if (i == n0 + n1 - 1)
-			*left = mag;
-		*back = -sy;
+			r->left = mag;
+		r->back = -sy;
 		py = sy;
 		px = sx;
 		pm = mag;
+	}
+	(void)pm;
+	const int len = n1 < 128 ? n1 : 128;
+	for (int ph = 0; ph < 2; ph++) {
+		int land = 0;
+		for (int k = 0; k < len; k++)
+			if (ph == 0 ? mags[0][k] >= 0.5f : fabsf(sys[1][k] + r->back) >= 1.0f)
+				land = k + 1;
+		r->land[ph] = land;
+		for (int k = 1; k < len; k++) {
+			if (k > land)
+				r->step_after = fmaxf(r->step_after, fmaxf(fabsf(sys[ph][k] - sys[ph][k - 1]),
+									   fabsf(sxs[ph][k] - sxs[ph][k - 1])));
+			if (k < nf && ph == 0)
+				r->against_out = fmaxf(r->against_out, mags[0][k] - mags[0][k - 1]);
+			if (k < nf && ph == 1)
+				r->against_in = fmaxf(r->against_in, mags[1][k - 1] - mags[1][k]);
+		}
 	}
 }
 
@@ -691,6 +743,9 @@ static cf_gaze_params hl_params(cf_calib_result *lens_out)
 	p.notes_offset = notes.offset;
 	p.notes_side = notes.side;
 	p.notes_open = notes.openness;
+	p.has_vis_calib = lens.has_vis && notes.has_vis; /* as the plugin saves them */
+	p.vis_baseline = lens.vis_offset;
+	p.vis_notes = notes.vis_offset;
 	if (lens_out)
 		*lens_out = lens;
 	return p;
@@ -807,23 +862,33 @@ static void test_head_lids(void)
 		printf("ok: a head tilted down with the eyes on the lens is left alone\n");
 	}
 
+	/* The same faces through a twin without head and lid calibration: what is left is the glance's own path
+	 * (tested above), and the difference is what the head and lid terms add. */
+	cf_gaze_params pu = p;
+	pu.head_ref.ok = 0;
+	pu.baseline_upper = pu.baseline_lower = 0;
+	cf_gaze g2;
+	cf_eye out2[2];
+
 	/* 35. Smooth: lens -> notes (saccade) with the head following down to 8 deg and the lids narrowing over
 	 * 0.3 s; reading lines (the eyes sweep sideways, then a return saccade) with the head nodding; back to
 	 * the lens, the head following up while the eyes hold the lens (turning down in the head as it comes up,
-	 * which the gate takes in steps: glide_catch_up()). With the head moving as while reading (down over
-	 * 1 s, nodding 1.5 deg) no vertical shift (iris, either lid) changes by more than 0.3 px a frame outside
-	 * the saccades. With a quick head (down in 0.5 s, 0.8 deg a frame) the shifts follow it as fast as it
-	 * moves (up to HEAD_SLEW_PX), but never jump: no frame's change differs from the last one's by 0.3 px.
-	 * Back at the lens, the head still coming up, the eyes are lifted less than 1 px past it. (With no
-	 * head turn the sideways shift here is the side gate's alone, unchanged by the head and lid terms:
-	 * only printed.) */
+	 * which the gate takes in steps: glide_catch_up()). What the head and lid terms add (against the twin)
+	 * to any vertical shift (iris, either lid): with the head moving as while reading (down over 1 s,
+	 * nodding 1.5 deg) it changes by no more than 0.3 px a frame outside the saccades; with a quick head
+	 * (down in 0.5 s, 0.8 deg a frame) it follows the head as fast as it moves (up to HEAD_SLEW_PX), but
+	 * never jumps: no frame's change differs from the last one's by 0.3 px. Back at the lens, the head still
+	 * coming up, the eyes are lifted less than 1 px past it. (The whole output is printed too: the glance's
+	 * own landing adds to it. With no head turn the sideways shift is the side gate's alone: only printed.) */
 	for (int quick = 0; quick < 2; quick++) {
 		const int down_n = quick ? 15 : 30, up_n = quick ? 12 : 24;
 		const float nod = quick ? 2.0f : 1.5f;
 		cf_gaze_init(&g);
+		cf_gaze_init(&g2);
 		double t = 400.0;
-		hl_out prev = {0, 0, 0, 0};
-		float prev_d = 0, worst = 0, worst_jerk = 0, worst_sacc = 0, peak = 0, worst_side = 0, over = 0;
+		hl_out prev = {0, 0, 0, 0}, prev_c = {0, 0, 0, 0};
+		float prev_d = 0, worst = 0, worst_all = 0, worst_jerk = 0, worst_sacc = 0, peak = 0, worst_side = 0,
+		      over = 0;
 		int sacc_left = 0, have_d = 0;
 		const int N = 300;
 		for (int i = 0; i < N; i++, t += dt) {
@@ -849,14 +914,20 @@ static void test_head_lids(void)
 			}
 			if (sacc)
 				sacc_left = 5;
-			const hl_out o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
-			const float di = o.iris - prev.iris, dl = o.lid - prev.lid, db = o.low - prev.low;
+			const cf_face f = face_hl(s, 0);
+			const hl_out o = hl_read(update(&g, f, &p, t, out), &out[0]);
+			const hl_out o2 = hl_read(update(&g2, f, &pu, t, out2), &out2[0]);
+			const hl_out c = {o.iris - o2.iris, o.lid - o2.lid, o.low - o2.low, o.side - o2.side};
+			const float di = c.iris - prev_c.iris, dl = c.lid - prev_c.lid, db = c.low - prev_c.low;
 			const float d = fmaxf(fmaxf(fabsf(di), fabsf(dl)), fabsf(db));
+			const float d_all =
+				fmaxf(fmaxf(fabsf(o.iris - prev.iris), fabsf(o.lid - prev.lid)), fabsf(o.low - prev.low));
 			if (sacc_left > 0) {
-				worst_sacc = fmaxf(worst_sacc, d);
+				worst_sacc = fmaxf(worst_sacc, d_all);
 				have_d = 0;
 			} else {
 				worst = fmaxf(worst, d);
+				worst_all = fmaxf(worst_all, d_all);
 				worst_side = fmaxf(worst_side, fabsf(o.side - prev.side));
 				if (have_d)
 					worst_jerk = fmaxf(worst_jerk, fabsf(di - prev_d));
@@ -868,14 +939,17 @@ static void test_head_lids(void)
 			sacc_left--;
 			peak = fmaxf(peak, o.iris);
 			prev = o;
+			prev_c = c;
 		}
-		printf("    lens -> reading (head to 8 deg in %.1f s, nodding %.1f deg, scanning lines) -> lens: largest "
-		       "vertical change %.3f px a frame (%.2f in the saccades), change of change %.3f, iris lifted up to "
-		       "%.2f px, %.2f px past the lens on the way back, %.2f left; sideways (side gate) %.2f\n",
-		       (float)down_n / 30.0f, nod, worst, worst_sacc, worst_jerk, peak, over, prev.iris, worst_side);
+		printf("    lens -> reading (head to 8 deg in %.1f s, nodding %.1f deg, scanning lines) -> lens: the head and "
+		       "lid terms change by %.3f px a frame at most (change of change %.3f), the whole output by %.3f (%.2f "
+		       "in the saccades); iris lifted up to %.2f px, %.2f px past the lens on the way back, %.2f left; "
+		       "sideways (side gate) %.2f\n",
+		       (float)down_n / 30.0f, nod, worst, worst_jerk, worst_all, worst_sacc, peak, over, prev.iris,
+		       worst_side);
 		if (quick)
 			CHECK(worst < HL_HEAD_SLEW_PX + 0.05f && worst_jerk < 0.3f,
-			      "quick head: shifts changed by %.3f px a frame, jumped %.3f px", worst, worst_jerk);
+			      "quick head: head and lid terms changed by %.3f px a frame, jumped %.3f px", worst, worst_jerk);
 		else
 			CHECK(worst < 0.3f, "head and lids made a step of %.3f px outside the saccades", worst);
 		CHECK(over < 1.0f && prev.iris < 0.3f && fabsf(prev.lid) < 0.3f && fabsf(prev.low) < 0.3f,
@@ -885,9 +959,10 @@ static void test_head_lids(void)
 
 	/* 36. Letting go still works. To the keyboard with the head (eyes far down, head 25 deg, lids
 	 * dropping): the correction fades out. The head alone tilted far down (35 deg): the pitch fade lets go.
-	 * Either way the eyes as the viewer sees them (the glance plus the head's tilt, less the lift) only
-	 * ever move down with the real gaze, never back up against it. Reading with the head tilted down 15
-	 * deg (well inside the measured range): kept. */
+	 * Either way the head's share of the eyes as the viewer sees them (its tilt, less what the head and lid
+	 * terms add to the lift, against the twin) only ever moves down with the head, never back up against it.
+	 * (The whole of it, glance included, is printed: the glance's own path is tested above.) Reading with
+	 * the head tilted down 15 deg (well inside the measured range): kept. */
 	{
 		const struct {
 			const char *name;
@@ -900,64 +975,84 @@ static void test_head_lids(void)
 		};
 		for (int c = 0; c < 3; c++) {
 			cf_gaze_init(&g);
+			cf_gaze_init(&g2);
 			double t = 500.0;
 			hl_out o = {0, 0, 0, 0};
 			for (int i = 0; i < 60; i++, t += dt) {
 				const hl_state s = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
-				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+				const cf_face f = face_hl(s, 0);
+				o = hl_read(update(&g, f, &p, t, out), &out[0]);
+				update(&g2, f, &pu, t, out2);
 			}
 			const hl_out before = o;
-			float against = 0, prev_seen = 0;
+			float against = 0, against_all = 0, prev_seen = 0, prev_all = 0;
 			for (int i = 0; i < 45; i++, t += dt) {
 				const float k = fminf((float)i / 8.0f, 1.0f);
 				const hl_state a = cases[c].away;
 				const hl_state s = {hl_lerp(0.02f, a.glance, k), 0, hl_lerp(6, a.pitch, k), 0,
 						    hl_lerp(0.01f, a.up_drop, k), hl_lerp(0.01f, a.lo_rise, k), 0};
-				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
-				/* how far down the eyes look as the viewer sees them, px of iris */
-				const float seen = (s.glance + HL_EYE_K * sinf(s.pitch * 0.017453293f)) * HW - o.iris;
-				if (i > 0)
+				const cf_face f = face_hl(s, 0);
+				o = hl_read(update(&g, f, &p, t, out), &out[0]);
+				const hl_out o2 = hl_read(update(&g2, f, &pu, t, out2), &out2[0]);
+				/* how far down the eyes look as the viewer sees them, px of iris: the head's share, and all */
+				const float head_px = HL_EYE_K * sinf(s.pitch * 0.017453293f) * HW;
+				const float seen = head_px - (o.iris - o2.iris), all = s.glance * HW + head_px - o.iris;
+				if (i > 0) {
 					against = fmaxf(against, prev_seen - seen);
+					against_all = fmaxf(against_all, prev_all - all);
+				}
 				prev_seen = seen;
+				prev_all = all;
 			}
-			printf("    %s: %.2f px -> %.2f px after 1.5 s (lids %.2f / %.2f), seen moving up against the gaze "
-			       "%.3f px\n",
-			       cases[c].name, before.iris, o.iris, o.lid, o.low, against);
+			printf("    %s: %.2f px -> %.2f px after 1.5 s (lids %.2f / %.2f); the head's share seen moving up "
+			       "against it %.3f px (all of it %.3f)\n",
+			       cases[c].name, before.iris, o.iris, o.lid, o.low, against, against_all);
 			if (cases[c].keep)
 				CHECK(o.iris > 0.9f * (HL_EYE_K * sinf(16.5f * 0.017453293f) + 0.02f) * HW,
 				      "%s: correction dropped to %.2f px", cases[c].name, o.iris);
 			else
 				CHECK(o.iris < 0.2f && fabsf(o.lid) < 0.2f && fabsf(o.low) < 0.2f && against < 0.12f,
-				      "%s: %.2f px left (lids %.2f / %.2f), %.3f px against the gaze", cases[c].name, o.iris, o.lid,
-				      o.low, against);
+				      "%s: %.2f px left (lids %.2f / %.2f), %.3f px against the head", cases[c].name, o.iris,
+				      o.lid, o.low, against);
 		}
 		printf("ok: keyboard and far head tilts still let go, reading with the head down is kept\n");
 	}
 
-	/* 37. A blink while reading with the head down holds everything: iris, upper and lower lid. */
+	/* 37. A blink while reading with the head down holds the head and lid terms: what they add to the iris and
+	 * to either lid (against the twin) stays within 0.15 px through the blink and after it. (The whole
+	 * output, the glance's own hold included, is printed.) */
 	{
 		cf_gaze_init(&g);
+		cf_gaze_init(&g2);
 		double t = 600.0;
-		hl_out o = {0, 0, 0, 0};
+		hl_out o = {0, 0, 0, 0}, o2 = {0, 0, 0, 0};
 		const hl_state rd = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
-		for (int i = 0; i < 75; i++, t += dt)
-			o = hl_read(update(&g, face_hl(rd, 0), &p, t, out), &out[0]);
-		const hl_out before = o;
+		for (int i = 0; i < 75; i++, t += dt) {
+			const cf_face f = face_hl(rd, 0);
+			o = hl_read(update(&g, f, &p, t, out), &out[0]);
+			o2 = hl_read(update(&g2, f, &pu, t, out2), &out2[0]);
+		}
+		const hl_out before = o, before_c = {o.iris - o2.iris, o.lid - o2.lid, o.low - o2.low, 0};
 		const float shut[7] = {0.5f, 0.95f, 0.95f, 0.95f, 0.5f, 0.0f, 0.0f};
-		float dev = 0;
+		float dev = 0, dev_all = 0;
 		for (int i = 0; i < 7 + 15; i++, t += dt) {
 			hl_state s = rd;
 			if (i < 7) {
 				s.shut = shut[i];
 				s.glance = 0.0f; /* the pupil point is unreliable while the lids close */
 			}
-			o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
-			dev = fmaxf(dev, fmaxf(fmaxf(fabsf(o.iris - before.iris), fabsf(o.lid - before.lid)),
-					       fabsf(o.low - before.low)));
+			const cf_face f = face_hl(s, 0);
+			o = hl_read(update(&g, f, &p, t, out), &out[0]);
+			o2 = hl_read(update(&g2, f, &pu, t, out2), &out2[0]);
+			dev = fmaxf(dev, fmaxf(fmaxf(fabsf(o.iris - o2.iris - before_c.iris), fabsf(o.lid - o2.lid - before_c.lid)),
+					       fabsf(o.low - o2.low - before_c.low)));
+			dev_all = fmaxf(dev_all, fmaxf(fmaxf(fabsf(o.iris - before.iris), fabsf(o.lid - before.lid)),
+						       fabsf(o.low - before.low)));
 		}
-		printf("    blink while reading: iris %.2f, lids %.2f / %.2f px; through it and after, %.3f px off at most\n",
-		       before.iris, before.lid, before.low, dev);
-		CHECK(dev < 0.15f, "a blink moved the held correction by %.2f px", dev);
+		printf("    blink while reading: iris %.2f, lids %.2f / %.2f px; through it and after, the head and lid terms "
+		       "%.3f px off at most (all of it %.3f)\n",
+		       before.iris, before.lid, before.low, dev, dev_all);
+		CHECK(dev < 0.15f, "a blink moved the held head and lid terms by %.2f px", dev);
 		printf("ok: a blink holds the head and lid terms too\n");
 	}
 
@@ -1325,10 +1420,8 @@ int main(void)
 		CHECK(fabsf(-out[0].sy - glance_px) < 0.25f && fabsf(corrected_y - (500 - 1.0f)) < 0.25f,
 		      "notes glance %.2f px, corrected by %.2f px (pupil at %.2f, lens %.2f)", glance_px, -out[0].sy,
 		      corrected_y, 500 - 1.0f);
-		/* (Changed from 2.2x: the reading area now reaches 1.8x the notes glance plus the noise band, and the
-		 * fade past it is 0.7x the notes glance wide: well past the notes is from ~2.6x on.) */
-		const float far = settle(&g, face_px(960, 500, 1.2f, 1.0f + 2.8f * glance_px, 16, 0, 4), &pc, &t, 45, out);
-		CHECK(far < 0.2f, "glance at 2.8x the notes should be left alone (%.2f px)", far);
+		const float far = settle(&g, face_px(960, 500, 1.2f, 1.0f + 2.2f * glance_px, 16, 0, 4), &pc, &t, 45, out);
+		CHECK(far < 0.2f, "glance at 2.2x the notes should be left alone (%.2f px)", far);
 		printf("ok: two-point calibration cancels the notes glance (%.2f px of %.2f), ignores far glances\n",
 		       notes_shift, glance_px);
 	}
@@ -1483,31 +1576,30 @@ int main(void)
 		printf("ok: large side glance fades out\n");
 	}
 
-	/* 12b. Looking sideways out of the notes band lets go of the correction (changed on purpose: it used
-	 * to let go within the saccade itself, so the eye landed where it really is at once; now letting go
-	 * is a fade like every other hand-off, so it never shows as a snap). The applied shift (sideways
-	 * damping and vertical correction together) changes by under 0.6 px a frame, only ever shrinks (it
-	 * fades from its size before the look, not from the far-away gaze), and is gone within 0.6 s. */
+	/* 12b. Looking sideways out of the notes band lets go of the correction within the saccade (changed
+	 * back on purpose: letting go as a fade after landing showed as the iris rolling on for half a second
+	 * after the eye had landed, which the user saw; the eye's own jump hides the hand-off). The applied
+	 * shift (sideways damping and vertical correction together) is gone on the frame of the saccade, and
+	 * stays gone. */
 	{
 		cf_gaze_params pr = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
 				     .notes_offset = -0.08f};
 		cf_gaze_init(&g);
 		const float before = settle(&g, face_px(960, 500, 4, 3.2f, 16, 0, 1.0f), &pr, &t, 60, out);
-		float px = out[0].sx, py = out[0].sy, pm = before, step = 0, grow = 0, last = before;
+		float first = 0, after = 0;
 		for (int i = 0; i < 18; i++, t += dt) {
 			n = update(&g, face_px(960, 500, 20, 3.2f, 16, 0, 1.0f), &pr, t, out);
 			const float sx = n ? out[0].sx : 0, sy = n ? out[0].sy : 0, m = sqrtf(sx * sx + sy * sy);
-			step = fmaxf(step, sqrtf((sx - px) * (sx - px) + (sy - py) * (sy - py)));
-			grow = fmaxf(grow, m - pm);
-			px = sx;
-			py = sy;
-			pm = last = m;
+			if (i == 0)
+				first = m;
+			else
+				after = fmaxf(after, m);
 		}
-		CHECK(step < 0.6f && grow < 0.02f && last < 0.1f,
-		      "sideways look out of the notes band: step %.2f px, grew %.2f px, %.2f px left after 0.6 s", step, grow,
-		      last);
-		printf("ok: sideways look out of the notes band fades out (%.2f px, largest step %.2f px, %.2f left)\n", before,
-		       step, last);
+		CHECK(first < 0.1f && after < 0.1f,
+		      "sideways look out of the notes band: %.2f px left on the saccade's frame, up to %.2f px after", first,
+		      after);
+		printf("ok: sideways look out of the notes band lets go within the saccade (%.2f px, %.2f left)\n", before,
+		       first);
 	}
 
 	/* 12c. Robustness while reading: a 2-frame detector dropout holds the correction (no dip), and a
@@ -1622,19 +1714,15 @@ int main(void)
 			printf("ok: squint while reading keeps the correction (notes openness %s, min %.2f of %.2f px)\n",
 			       known ? "known" : "unknown", lo, gpx);
 		}
-		/* (Notes 0.06 eye widths under the lens here, was 0.08 like above: the reading area now reaches 1.8x
-		 * the notes glance plus the noise band and the fade is 0.7x it wide, so the lids at 8 px, which
-		 * read as 0.06 + 0.11 eye widths, must be clearly past 2.5x the notes glance, as they were past
-		 * the old 2.1x with 0.08.) */
-		const float glf = 0.06f;
 		const cf_gaze_params pq = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
-					   .notes_offset = -glf, .notes_open = 0.35f};
+					   .notes_offset = -gl, .notes_open = 0.35f};
 		cf_gaze_init(&g);
-		settle(&g, face_px(960, 500, 0, glf * 40.0f, 16, 0, 2.0f), &pq, &t, 45, out);
-		/* Pupil reads 0.13 eye widths, just past the 0.118 limit (alone that would keep ~80% of the
+		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pq, &t, 45, out);
+		/* Pupil reads 0.13 eye widths, just past the 0.12 limit (alone that would keep ~99% of the
 		 * correction), but the lids are down to 8 px: a keyboard glance the pupil under-reads.
-		 * (Changed from 0.10: the lid cue now only starts past 1.05 x the limit, see 15b.)
-		 * (Changed from 0.12 past the old 1.4x limit, see above.)
+		 * (Changed from 0.10: the lid cue now only starts past 1.05 x the limit, see 15b. Then from 0.12:
+		 * the limit is now at least FAR_MARGIN past the notes, 0.12 here, so reading lower down the notes,
+		 * or a notes calibration that came out small, keeps the correction.)
 		 * (Settles over 2 s instead of 1 s: lids dropping fast to r 0.5 with the pupil barely moving
 		 * look exactly like a half blink, so they are held for 0.5 s and then eased off, see 19/20.) */
 		const float s = settle(&g, face_px(960, 500, 0, 5.2f, 16, 0, 8.0f), &pq, &t, 60, out);
@@ -1642,8 +1730,8 @@ int main(void)
 		printf("ok: far glance read from the lids is released (%.2f px)\n", s);
 	}
 
-	/* 15b. Smiling while reading a line a quarter below the notes point (1.25 x the notes glance, inside
-	 * the reading area): the lids drop a lot, the correction must stay. */
+	/* 15b. Smiling while reading a line a quarter below the notes point (1.25 x the notes glance,
+	 * 0.9 x the limit): the lids drop a lot, the correction must stay. */
 	{
 		const float gl = 0.08f, lpx = 1.25f * gl * 40.0f;
 		for (int known = 0; known < 2; known++) {
@@ -1667,39 +1755,42 @@ int main(void)
 		}
 	}
 
-	/* 16. Keyboard and back (changed on purpose: the far fade used to follow the gaze directly, so the
-	 * correction switched off within the saccade to the keyboard and back on within the saccade back;
-	 * now both hand-offs are a fade, so neither shows as a snap). Going to the keyboard, the correction
-	 * lets go gradually: the applied shift changes by under 0.5 px a frame, the visible eye only moves
-	 * down, and nothing is left after 1 s. Back on the notes it takes over the same way, the visible eye
-	 * only moving up, and it is at the lens (within 0.5 px) after 1 s. */
+	/* 16. Keyboard and back (changed back on purpose: the correction lets go within the saccade to the
+	 * keyboard and takes over again within the saccade back, hidden by the eye's own jump; as a fade after
+	 * landing, the iris was seen rolling on for half a second after the eye had landed). On the frame of
+	 * each saccade the visible eye lands where it then stays: at the keyboard with nothing left of the
+	 * correction, back on the notes at the lens (within 0.5 px); after that the applied shift moves under
+	 * 0.1 px a frame. */
 	{
 		const float gl = 0.08f, gpx = gl * 40.0f, kpx = 0.3f * 40.0f;
 		const cf_gaze_params pk = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
 					   .notes_offset = -gl, .notes_open = 0.35f};
 		cf_gaze_init(&g);
 		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pk, &t, 45, out);
-		float ps = out[0].sy, pv = gpx + ps, step = 0, against = 0, left = 0, back = 0;
+		float ps = out[0].sy, step = 0, left = 0, back = 0, first_kb = 0, first_back = 0;
 		for (int i = 0; i < 60; i++, t += dt) {
 			const int away = i < 30;
 			const float pd = away ? kpx : gpx;
 			n = update(&g, face_px(960, 500, 0, pd, 16, 0, away ? 6.0f : 2.0f), &pk, t, out);
 			const float sy = n ? out[0].sy : 0, vis = pd + sy; /* visible eye below the lens */
-			step = fmaxf(step, fabsf(sy - ps));
-			against = fmaxf(against, away ? pv - vis : vis - pv);
+			if (i == 0)
+				first_kb = fabsf(sy);
+			else if (i == 30)
+				first_back = fabsf(vis);
+			else
+				step = fmaxf(step, fabsf(sy - ps));
 			if (i == 29)
 				left = fabsf(sy);
 			back = fabsf(vis);
 			ps = sy;
-			pv = vis;
 		}
-		CHECK(step < 0.5f && against < 0.05f && left < 0.1f && back < 0.5f,
-		      "keyboard and back: shift step %.2f px, visible eye moved against the gaze %.2f px, %.2f px left at "
-		      "the keyboard, back on the notes off the lens by %.2f px",
-		      step, against, left, back);
-		printf("ok: keyboard and back fade (largest step %.2f px, %.2f px against the gaze, %.2f px left at the "
-		       "keyboard, %.2f px off the lens back on the notes)\n",
-		       step, against, left, back);
+		CHECK(first_kb < 0.1f && first_back < 0.5f && step < 0.1f && left < 0.1f && back < 0.5f,
+		      "keyboard and back: on the saccade's frame %.2f px of correction left at the keyboard, %.2f px off the "
+		      "lens back on the notes; then steps of %.2f px, %.2f px left at the keyboard, %.2f px off the lens",
+		      first_kb, first_back, step, left, back);
+		printf("ok: keyboard and back within the saccades (%.2f px left at the keyboard, %.2f px off the lens on the "
+		       "first frame back, steps %.2f px after)\n",
+		       first_kb, first_back, step);
 
 		/* Sweeping slowly from the notes past the limit: visible position only moves down. */
 		cf_gaze_init(&g);
@@ -1869,28 +1960,24 @@ int main(void)
 		       hi, st);
 
 		/* A keyboard glance that drops the lids deep (to r 0.44, like a half blink) is not held: the
-		 * pupil moves far more than a lid could drag it, so the correction starts letting go at once
-		 * (changed on purpose: it used to be gone on the first frame; letting go is a fade now). It
-		 * shrinks every frame from the first, is below 80% after 0.1 s and gone after 0.5 s. */
+		 * pupil moves far more than a lid could drag it, so the correction lets go within the saccade
+		 * (changed back on purpose, see 16): gone on the first frame, and it stays gone. */
 		cf_gaze_init(&g);
 		const float kb0 = settle(&g, face_px(960, 500, 0, gpx, 14, 0, 0), &ph, &t, 60, out);
-		float kb_prev = kb0, kb3 = 0, kb = 0;
-		int kb_held = 0;
+		float kb1 = 0, kb = 0;
 		for (int i = 0; i < 15; i++, t += dt) {
 			n = update(&g, face_px(960, 500, 0, 12.0f, 7.0f, 0, 0), &ph, t, out);
-			kb = n ? shift_px(&out[0]) : 0;
-			/* the first frames must already shrink it (a hold would keep it); later it may not grow */
-			kb_held += i < 3 ? kb > kb_prev - 0.01f : kb > kb_prev + 1e-4f;
-			kb_prev = kb;
-			if (i == 2)
-				kb3 = kb;
+			const float s = n ? shift_px(&out[0]) : 0;
+			if (i == 0)
+				kb1 = s;
+			else
+				kb = fmaxf(kb, s);
 		}
-		CHECK(!kb_held && kb3 < 0.8f * kb0 && kb < 0.2f,
-		      "keyboard glance with deep lids: held on %d frames, %.2f of %.2f px after 0.1 s, %.2f px after 0.5 s",
-		      kb_held, kb3, kb0, kb);
-		printf("ok: keyboard glance with the lids at r 0.44 is not held (%.2f -> %.2f px after 0.1 s, %.2f after "
-		       "0.5 s)\n",
-		       kb0, kb3, kb);
+		CHECK(kb1 < 0.1f && kb < 0.1f,
+		      "keyboard glance with deep lids: %.2f of %.2f px left on the first frame, up to %.2f px after", kb1,
+		      kb0, kb);
+		printf("ok: keyboard glance with the lids at r 0.44 is not held (%.2f -> %.2f px on the first frame)\n", kb0,
+		       kb1);
 	}
 
 	/* 20. A half-blink hold that times out (lids stay at r 0.5, the pupil under-reads a glance by
@@ -2480,12 +2567,11 @@ int main(void)
 	/* 29. Real glances stay crisp in the same noise: lens -> notes and back, both sensors moving (Vision
 	 * by only 60% of the glance), 32 glances each way. Averaged over the glances (the measurement noise
 	 * averaged out), the correction reaches 90% (or lets go to 10% coming back) on the first or second
-	 * frame of the new gaze and never overshoots (5%). Single glances carry their own frames' measurement
-	 * noise: at least 90% of them reach 90% on the first or second frame, every one within 4 frames on
-	 * 1 px noise with Vision. With the old bimodal refiner a glance can only show once at least one eye
-	 * reads it, which with 40% flips per eye can take a frame more (the average lands by the third frame,
-	 * 85% of single glances by the second). Without Vision's points nothing better than the refined reading
-	 * says where the gaze landed (85% by the second frame). 30 and 15 fps. */
+	 * frame of the new gaze and never overshoots (5%). Every single glance lands within 2 frames: within
+	 * 25% of the target (2.2 px, twice the refined noise: a glance that landed still carries its frames'
+	 * noise) on the first or second frame, with or without Vision's points, also with the old bimodal
+	 * refiner. Reaching 90% on a single glance is up to that noise: with Vision's points 95% of them do on
+	 * the first or second frame (every one on 1 px noise), without them 90%. 30 and 15 fps. */
 	{
 		const char *names[5] = {"1 px noise", "1 px noise", "realistic noise", "realistic noise", "bimodal refiner"};
 		for (int fr = 0; fr < 2; fr++)
@@ -2494,19 +2580,22 @@ int main(void)
 				const int vis = c != 1 && c != 3, flips = c == 4, rnoise = c == 2 || c == 3;
 				const real_noise rn = {fps, vis, flips ? 0.4f : 0.0f, 0, rnoise ? 1.2f : 1.0f, vis ? 0.3f : 0.0f,
 						       rnoise ? 0.05f : 0.0f};
-				int dn, up, late;
+				int dn, up, late, near;
 				float over, quick;
-				real_glances(&rn, 11 + c, &dn, &up, &over, &quick, &late);
-				const int mlate = flips ? 2 : 1;
-				const float qmin = (flips || !vis) ? 0.85f : 0.9f;
-				const int slate = c == 0 ? 4 : 12;
-				CHECK(dn <= mlate && up <= mlate && over < 0.05f * 0.10f * RW && quick >= qmin && late <= slate,
+				real_glances(&rn, 11 + c, &dn, &up, &over, &quick, &late, &near);
+				const int mlate = 1;
+				const float qmin = vis ? 0.95f : 0.9f;
+				const int slate = c == 0 ? 1 : 12, snear = 1;
+				CHECK(dn <= mlate && up <= mlate && over < 0.05f * 0.10f * RW && quick >= qmin && late <= slate &&
+					      near <= snear,
 				      "glances (%s, %s, %.0f fps): mean reaches on frame %d going down, %d coming back, mean "
-				      "overshoot %.2f px; %.0f%% of single glances by the second frame, slowest frame %d",
-				      vis ? "Vision" : "no Vision", names[c], fps, dn, up, over, 100.0f * quick, late);
+				      "overshoot %.2f px; %.0f%% of single glances by the second frame, slowest frame %d (within "
+				      "25%%: %d)",
+				      vis ? "Vision" : "no Vision", names[c], fps, dn, up, over, 100.0f * quick, late, near);
 				printf("ok: glances (%s, %s, %.0f fps): mean reaches 90%% on frame %d down / %d back, overshoot "
-				       "%.2f px; %.0f%% of single glances by the second frame, slowest frame %d\n",
-				       vis ? "Vision" : "no Vision", names[c], fps, dn, up, over, 100.0f * quick, late);
+				       "%.2f px; %.0f%% of single glances by the second frame, slowest frame %d (within 25%%: "
+				       "%d)\n",
+				       vis ? "Vision" : "no Vision", names[c], fps, dn, up, over, 100.0f * quick, late, near);
 			}
 	}
 
@@ -2558,10 +2647,13 @@ int main(void)
 	 * flipping 10 px on 40% of frames in each eye with 1 px noise): to the keyboard (0.3 eye widths down),
 	 * sideways out of the notes (eyes only, half an eye width), and turning the head (40 degrees). Reading
 	 * the notes the correction is locked on; looking away it lets go fully, and looking back it takes over
-	 * fully, both as a gradual fade: the applied shift never changes by more than 1.25 px in a frame at
-	 * 30 fps (2.5 px at 15: the same speed), so no snap; and it only ever shrinks while letting go (no
-	 * wobble; the held pre-look-away shift fades) and only grows while taking over (up to the reading's own
-	 * jitter, 0.3 px). */
+	 * fully. With the eyes (changed on purpose: it used to be a fade after the eye had landed, seen as
+	 * the iris rolling on for half a second) that happens within the saccade, hidden by the eye's own
+	 * jump: the shift is where it ends up from the first or second frame of the new gaze (with the old
+	 * refiner, whose flips can hide the move for a frame, the third), and moves no more than 1.25 px a frame
+	 * after that at 30 fps (2.5 px at 15: the same speed). Turning the head is a gradual fade: never more
+	 * than that a frame, only ever shrinking while letting go (no wobble) and only growing while taking over
+	 * (up to the reading's own jitter, 0.3 px). */
 	{
 		const real_gaze aways[3] = {{0.30f, 0.0f, 0.0f}, {0.10f, 0.5f, 0.0f}, {0.10f, 0.0f, 40.0f}};
 		const char *names[3] = {"keyboard", "sideways", "head turn"};
@@ -2571,29 +2663,631 @@ int main(void)
 					const double fps = fr ? 15.0 : 30.0;
 					const real_noise rn = {fps, 1, nz ? 0.4f : 0.0f, 0, nz ? 1.0f : 1.2f, 0.3f, nz ? 0.0f : 0.05f};
 					const float bound = fr ? 2.5f : 1.25f;
-					float w_step = 0, w_out = 0, w_in = 0, w_left = 0, w_back = 1e9f;
+					const int head = a == 2, land_max = nz ? 2 : 1;
+					look_away_result w = {{0, 0}, 0, 0, 0, 0, 0, 1e9f};
 					for (unsigned seed = 1; seed <= 4; seed++) {
-						float step, ag_out, ag_in, left, back;
-						real_look_away(&rn, aways[a], 40 + seed, &step, &ag_out, &ag_in, &left, &back);
-						w_step = fmaxf(w_step, step);
-						w_out = fmaxf(w_out, ag_out);
-						w_in = fmaxf(w_in, ag_in);
-						w_left = fmaxf(w_left, left);
-						w_back = fminf(w_back, back);
+						look_away_result r;
+						real_look_away(&rn, aways[a], 40 + seed, &r);
+						for (int k = 0; k < 2; k++)
+							w.land[k] = r.land[k] > w.land[k] ? r.land[k] : w.land[k];
+						w.step = fmaxf(w.step, r.step);
+						w.step_after = fmaxf(w.step_after, r.step_after);
+						w.against_out = fmaxf(w.against_out, r.against_out);
+						w.against_in = fmaxf(w.against_in, r.against_in);
+						w.left = fmaxf(w.left, r.left);
+						w.back = fminf(w.back, r.back);
 					}
-					CHECK(w_step <= bound && w_out < 0.05f && w_in < 0.3f && w_left < 0.2f &&
-						      w_back > 0.9f * 0.10f * RW,
-					      "look away (%s, %s, %.0f fps): largest step %.2f px, against the fade %.2f px out / %.2f "
-					      "px in, %.2f px left away, %.2f px corrected back",
-					      names[a], nz ? "bimodal refiner" : "realistic noise", fps, w_step, w_out, w_in, w_left,
-					      w_back);
-					printf("ok: look away and back (%s, %s, %.0f fps): largest step %.2f px, against the fade %.2f "
-					       "out / %.2f in, %.2f px left away, %.2f of %.2f px corrected back\n",
-					       names[a], nz ? "bimodal refiner" : "realistic noise", fps, w_step, w_out, w_in, w_left,
-					       w_back, 0.10f * RW);
+					const int ok = head ? w.step <= bound && w.against_out < 0.05f && w.against_in < 0.3f
+							    : w.land[0] <= land_max && w.land[1] <= land_max && w.step_after <= bound;
+					CHECK(ok && w.left < 0.2f && w.back > 0.9f * 0.10f * RW,
+					      "look away (%s, %s, %.0f fps): handed over on frame %d away / %d back, largest step %.2f px "
+					      "(%.2f after), against the hand-off %.2f px out / %.2f px in, %.2f px left away, %.2f px "
+					      "corrected back",
+					      names[a], nz ? "bimodal refiner" : "realistic noise", fps, w.land[0], w.land[1], w.step,
+					      w.step_after, w.against_out, w.against_in, w.left, w.back);
+					if (head)
+						printf("ok: look away and back (%s, %s, %.0f fps): a fade, largest step %.2f px, against it "
+						       "%.2f out / %.2f in, %.2f px left away, %.2f of %.2f px corrected back\n",
+						       names[a], nz ? "bimodal refiner" : "realistic noise", fps, w.step, w.against_out,
+						       w.against_in, w.left, w.back, 0.10f * RW);
+					else
+						printf("ok: look away and back (%s, %s, %.0f fps): handed over on frame %d away / %d back, "
+						       "then steps of %.2f px at most, %.2f px left away, %.2f of %.2f px corrected back\n",
+						       names[a], nz ? "bimodal refiner" : "realistic noise", fps, w.land[0], w.land[1],
+						       w.step_after, w.left, w.back, 0.10f * RW);
 				}
 	}
 
+	/* 32. A notes calibration that came out small (0.013 eye widths, 1.1 px: notes just under the lens, or the
+	 * lens step taken looking a little low) still corrects reading lower down (0.05 and 0.065 below the
+	 * lens): the far fade starts at least FAR_MARGIN (and 5x the landmark noise) past the notes, so neither
+	 * reading there nor the noise switches the correction off. At least 90% of the glance is corrected,
+	 * without shaking (under 0.05 px RMS frame to frame); a keyboard glance (0.3) still lets go. Realistic
+	 * noise with Vision, 30 and 15 fps. */
+	{
+		cf_gaze_params ps = real_params();
+		ps.notes_offset = -0.013f;
+		ps.notes_open = (RH - R_LID * 0.013f * RW) / RW;
+		const float depths[2] = {0.05f, 0.065f};
+		for (int fr = 0; fr < 2; fr++)
+			for (int k = 0; k < 2; k++) {
+				const double fps = fr ? 15.0 : 30.0, dt1 = 1.0 / fps;
+				const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+				const real_gaze lens = {0, 0, 0}, read = {depths[k], 0, 0}, kb = {0.30f, 0, 0};
+				float lo = 1e9f, worst_rms = 0, left = 0;
+				for (unsigned seed = 1; seed <= 3; seed++) {
+					cf_gaze_init(&g);
+					rng_seed(70 + seed + 10 * k);
+					double tt = 100.0, s2 = 0, sum = 0;
+					float prev = 0;
+					int c = 0;
+					const int n_lens = (int)(2 * fps), n_read = (int)(3 * fps), n_kb = (int)(1.5 * fps);
+					for (int i = 0; i < n_lens + n_read + n_kb; i++, tt += dt1) {
+						const int ph = i < n_lens ? 0 : (i < n_lens + n_read ? 1 : 2);
+						cf_face f = noisy_real(&rn, ph == 0 ? lens : (ph == 1 ? read : kb));
+						const int nn = cf_gaze_update(&g, &f, &ps, tt, out);
+						const float sy = nn ? out[0].sy : 0.0f;
+						if (ph == 1 && i >= n_lens + n_read / 2) {
+							s2 += (double)(sy - prev) * (sy - prev);
+							sum += -sy;
+							c++;
+						}
+						if (ph == 2)
+							left = nn ? shift_px(&out[0]) : 0.0f;
+						prev = sy;
+					}
+					lo = fminf(lo, (float)(sum / c));
+					worst_rms = fmaxf(worst_rms, (float)sqrt(s2 / c));
+				}
+				const float want = depths[k] * RW;
+				CHECK(lo > 0.9f * want && worst_rms < 0.05f && left < 0.2f,
+				      "small notes calibration (0.013), reading %.3f below the lens (%.0f fps): corrected %.2f of %.2f px, "
+				      "%.3f px RMS; keyboard leaves %.2f px",
+				      depths[k], fps, lo, want, worst_rms, left);
+				printf("ok: small notes calibration (0.013 eye widths), reading %.3f below the lens (%.0f fps): %.0f%% "
+				       "corrected, %.3f px RMS; the keyboard still lets go (%.2f px left)\n",
+				       depths[k], fps, 100.0f * lo / want, worst_rms, left);
+			}
+	}
+
+	/* 33. Calibrating with real noise: the result is the median of the steady frames. Frames whose lids are
+	 * well off their usual height (a squint too slight to be held as a half blink, dragging the pupil
+	 * points 2.6 px down) are left out, on one frame in five; the result then stays within 0.004 eye widths
+	 * (0.3 px) of the true offset and openness, and is steady (no hint). The spread reported is about the
+	 * landmark noise. A gaze that moves on halfway through (0.04 eye widths, 3.4 px), or lids that keep
+	 * moving on half the frames, is flagged unsteady (the plugin asks to redo the step). */
+	{
+		for (int sc = 0; sc < 3; sc++) {
+			cf_gaze_params pc = real_params();
+			pc.has_notes = 0;
+			pc.baseline_open = 0;
+			const real_noise rn = {30.0, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+			cf_calib_result res;
+			memset(&res, 0, sizeof(res));
+			float worst_off = 0, worst_open = 0, spread = 0;
+			int hints_or = 0, hints_and = ~0;
+			for (unsigned seed = 1; seed <= 6; seed++) {
+				cf_gaze_init(&g);
+				rng_seed(90 + seed + 10 * sc);
+				double tt = 100.0;
+				const real_gaze lens = {0, 0, 0};
+				for (int i = 0; i < 30; i++, tt += dt) {
+					cf_face f = noisy_real(&rn, lens);
+					cf_gaze_update(&g, &f, &pc, tt, out);
+				}
+				cf_gaze_start_calibration(&g, CF_CALIB_LENS);
+				int got = 0, i = 0;
+				for (; i < 200 && !got; i++, tt += dt) {
+					/* (sample k: the calibration skips its first CF_CALIB_WARMUP_S) */
+					const int k = i - (int)(CF_CALIB_WARMUP_S * 30.0) - 1;
+					const real_gaze gz = {sc == 1 && k >= CF_CALIB_SAMPLES / 2 ? 0.04f : 0.0f, 0, 0};
+					cf_face f = noisy_real(&rn, gz);
+					const int squint = sc == 2 ? (i % 2 == 0) : (i % 5 == 0);
+					if (squint) /* the upper lid 2.6 px lower, dragging both pupil points down as far */
+						for (int e = 0; e < 2; e++) {
+							cf_pt *pts = e == 0 ? f.left_eye : f.right_eye;
+							for (int q = 0; q < 16; q++) {
+								const float s = sinf((float)q / 16.0f * 6.2831853f);
+								if (s < -1e-3f)
+									pts[q].y += 2.6f * -s;
+							}
+							(e == 0 ? &f.left_pupil : &f.right_pupil)->y += 2.6f;
+							(e == 0 ? &f.left_pupil_vision : &f.right_pupil_vision)->y += 1.3f;
+						}
+					cf_gaze_update(&g, &f, &pc, tt, out);
+					got = cf_gaze_take_calibration(&g, &res);
+				}
+				CHECK(got == 1, "calibration (case %d) didn't finish", sc);
+				const int h = cf_gaze_calib_hints(&res, 0.0f);
+				hints_or |= h;
+				hints_and &= h;
+				const float true_off = sc == 1 ? -0.02f : 0.0f; /* (half the samples at each) */
+				worst_off = fmaxf(worst_off, fabsf(res.offset - true_off));
+				worst_open = fmaxf(worst_open, fabsf(res.openness - RH / RW));
+				spread = fmaxf(spread, res.spread);
+			}
+			if (sc == 0) {
+				CHECK(worst_off < 0.004f && worst_open < 0.004f && hints_or == 0 && spread > 0.004f && spread < 0.02f,
+				      "calibration with a squint on one frame in five: offset off by %.4f, openness by %.4f, spread "
+				      "%.4f, hints %d",
+				      worst_off, worst_open, spread, hints_or);
+				printf("ok: calibration leaves out frames with the lids off (one in five): offset within %.4f, "
+				       "openness within %.4f eye widths, spread %.4f (the noise), no hint\n",
+				       worst_off, worst_open, spread);
+			} else {
+				CHECK(hints_and & CF_CALIB_HINT_UNSTEADY, "calibration with %s should be flagged unsteady (hints %d)",
+				      sc == 1 ? "the gaze moving on" : "the lids moving on half the frames", hints_and);
+				printf("ok: calibration with %s is flagged unsteady\n",
+				       sc == 1 ? "the gaze moving on halfway (0.04 eye widths)" : "the lids moving on half the frames");
+			}
+		}
+	}
+
+	/* 34. A small notes calibration is taken (notes 2-3 cm under the lens at arm's length are a real glance of
+	 * about 0.02 eye widths), with a hint for the panel; only one under CF_NOTES_MIN_GLANCE (or above the
+	 * lens) is refused. Through the calibration itself: lens, then notes 0.015 below it, realistic noise. */
+	{
+		cf_calib_result r = {.target = CF_CALIB_NOTES, .offset = -0.013f, .spread = 0.01f, .drift = 0.002f};
+		CHECK(cf_gaze_notes_valid(0.0f, -0.013f) && (cf_gaze_calib_hints(&r, 0.0f) & CF_CALIB_HINT_SMALL_GLANCE),
+		      "a 0.013 notes glance should be taken, with the small-glance hint");
+		r.offset = -0.06f;
+		CHECK(cf_gaze_calib_hints(&r, 0.0f) == 0, "a 0.06 notes glance should need no hint (%d)",
+		      cf_gaze_calib_hints(&r, 0.0f));
+		CHECK(!cf_gaze_notes_valid(0.0f, -0.007f) && !cf_gaze_notes_valid(0.0f, 0.02f),
+		      "a notes glance of 0.007 (or above the lens) should be refused");
+		cf_gaze_params pc = real_params();
+		pc.has_notes = 0;
+		const real_noise rn = {30.0, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+		cf_calib_result lens, notes;
+		memset(&lens, 0, sizeof(lens));
+		memset(&notes, 0, sizeof(notes));
+		cf_gaze_init(&g);
+		rng_seed(123);
+		double tt = 100.0;
+		for (int step = 0; step < 2; step++) {
+			cf_gaze_start_calibration(&g, step ? CF_CALIB_NOTES : CF_CALIB_LENS);
+			int got = 0;
+			const real_gaze gz = {step ? 0.015f : 0.0f, 0, 0};
+			for (int i = 0; i < 200 && !got; i++, tt += dt) {
+				cf_face f = noisy_real(&rn, gz);
+				cf_gaze_update(&g, &f, &pc, tt, out);
+				got = cf_gaze_take_calibration(&g, step ? &notes : &lens);
+			}
+			if (!step) {
+				pc.baseline = lens.offset;
+				pc.baseline_open = lens.openness;
+			}
+		}
+		const int h = cf_gaze_calib_hints(&notes, lens.offset);
+		const float gl = lens.offset - notes.offset;
+		CHECK(cf_gaze_notes_valid(lens.offset, notes.offset) && h == CF_CALIB_HINT_SMALL_GLANCE &&
+			      fabsf(gl - 0.015f) < 0.01f, /* (a single calibration: 0.003 typical error in this noise) */
+		      "notes 0.015 under the lens: measured %.4f, valid %d, hints %d", gl,
+		      cf_gaze_notes_valid(lens.offset, notes.offset), h);
+		printf("ok: a small notes calibration (0.015, measured %.4f) is taken with a hint; 0.007 is refused\n", gl);
+	}
+
+	/* 35. A new lens calibration (the baseline moving 0.02 eye widths, 1.7 px) while reading: everything the
+	 * glance channel keeps moves along, so the correction takes the new calibration on the next frame and
+	 * then holds steady (it used to read as an unbacked jump of the gaze, voted on and glided in). Realistic
+	 * noise with Vision, 30 fps. */
+	{
+		const real_noise rn = {30.0, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+		cf_gaze_params pb = real_params();
+		pb.baseline = 0.02f; /* (the notes then read 0.12 below it) */
+		cf_gaze_init(&g);
+		rng_seed(321);
+		double tt = 100.0;
+		float before = 0, worst = 0, first = 0, prev = 0;
+		for (int i = 0; i < 150; i++, tt += dt) {
+			if (i == 90)
+				pb.baseline = 0.0f;
+			cf_face f = noisy_real(&rn, at_notes());
+			const int nn = cf_gaze_update(&g, &f, &pb, tt, out);
+			const float c = nn ? -out[0].sy : 0.0f;
+			if (i == 89)
+				before = c;
+			if (i == 90)
+				first = c;
+			if (i > 90)
+				worst = fmaxf(worst, fabsf(c - prev));
+			prev = c;
+		}
+		CHECK(fabsf(before - 0.12f * RW) < 0.5f && fabsf(first - 0.10f * RW) < 0.5f && worst < 0.15f,
+		      "new lens calibration while reading: %.2f px before, %.2f px on the next frame (expected %.2f), then "
+		      "steps up to %.2f px",
+		      before, first, 0.10f * RW, worst);
+		printf("ok: a new lens calibration is taken on the next frame (%.2f -> %.2f px), then steps of %.2f px at most\n",
+		       before, first, worst);
+	}
+
+	/* 36. Vision's points move 0.3, 0.6 or 1.0 of the glance (eyes and lighting differ), with their gain
+	 * known from the two calibrations (as the plugin keeps them) or learnt from the glances themselves:
+	 * every single glance still lands within 25% on the first or second frame, the mean reaches 90% by
+	 * the second frame without overshooting, and reading steadily at the notes stays as calm as check 28
+	 * asks. Realistic noise, 30 and 15 fps. */
+	{
+		const float ratios[3] = {0.3f, 0.6f, 1.0f};
+		float worst_rms = 0, worst_big = 0;
+		int worst_near = 0, worst_mean = 0;
+		for (int cal = 0; cal < 2; cal++)
+			for (int k = 0; k < 3; k++)
+				for (int fr = 0; fr < 2; fr++) {
+					const double fps = fr ? 15.0 : 30.0;
+					r_vis = ratios[k];
+					real_vis_cal = cal;
+					const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+					int dn, up, late, near;
+					float over, quick, rms, rms_x, big, wob, mean;
+					real_glances(&rn, 41 + k, &dn, &up, &over, &quick, &late, &near);
+					real_steady(&rn, 51 + k, &rms, &rms_x, &big, &wob, &mean);
+					CHECK(dn <= 1 && up <= 1 && over < 0.05f * 0.10f * RW && near <= 1 && rms < 0.06f && big < 0.25f &&
+						      fabsf(mean - 0.10f * RW) < 0.6f,
+					      "Vision ratio %.1f (%s, %.0f fps): mean glance reaches 90%% on frame %d / %d back, "
+					      "overshoot %.2f px, single glances within 25%% by frame %d; reading: %.3f px RMS, "
+					      "largest step %.2f, mean %.2f px",
+					      ratios[k], cal ? "calibrated" : "learnt", fps, dn, up, over, near, rms, big, mean);
+					worst_rms = fmaxf(worst_rms, rms);
+					worst_big = fmaxf(worst_big, big);
+					worst_near = near > worst_near ? near : worst_near;
+					worst_mean = dn > worst_mean ? dn : (up > worst_mean ? up : worst_mean);
+				}
+		r_vis = 0.6f;
+		real_vis_cal = 0;
+		printf("ok: Vision ratio 0.3/0.6/1.0, calibrated or learnt: glances land by frame %d (mean) / %d (each, "
+		       "within 25%%); reading %.3f px RMS, largest step %.2f px\n",
+		       worst_mean, worst_near, worst_rms, worst_big);
+	}
+
+	/* 37. Vision's points alone move while the eyes and the refined points stay (a refit, a lid or a smile
+	 * dragging them, head pitch): a step of 1.5 or 3 px, or a drift of 0.5 or 1 px/s for 4 s. The step is
+	 * not believed (the refined readings didn't follow it), the drift is taken into the offset between the
+	 * two as it shows: the correction stays within 0.8 px of where it was for a step and 1.6 / 2.5 px for
+	 * the drifts (it used to follow a 3 px step fully, and a 1 px/s drift by 4 px), and never steps faster
+	 * than the slew limit. Realistic noise at the notes, 30 and 15 fps. */
+	{
+		const float amount[4] = {1.5f, 3.0f, 0.5f, 1.0f}, limit[4] = {0.8f, 0.8f, 1.6f, 2.5f};
+		float worst[4] = {0, 0, 0, 0}, worst_step = 0;
+		for (int fr = 0; fr < 2; fr++)
+			for (int k = 0; k < 4; k++)
+				for (unsigned seed = 0; seed < 4; seed++) {
+					const double fps = fr ? 15.0 : 30.0, dts = 1.0 / fps;
+					const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+					const cf_gaze_params pr = real_params();
+					cf_gaze_init(&g);
+					rng_seed(61 + 7 * seed + k);
+					double tt = 100.0, ref = 0;
+					float prev = 0, dev = 0, stp = 0;
+					const int n0 = (int)(4.0 * fps), n1 = n0 + (int)(8.0 * fps);
+					for (int i = 0; i < n1; i++, tt += dts) {
+						const double ts = (i - n0) * dts;
+						rx.vdrag = i < n0 ? 0.0f
+							 : (k < 2 ? amount[k] : amount[k] * (float)fmin(ts, 4.0)) / RW;
+						cf_face f = noisy_real(&rn, at_notes());
+						const int nn = cf_gaze_update(&g, &f, &pr, tt, out);
+						const float c = nn ? -out[0].sy : 0.0f;
+						if (i >= n0 - (int)fps && i < n0)
+							ref += c / (int)fps;
+						if (i >= n0) {
+							dev = fmaxf(dev, fabsf(c - (float)ref));
+							stp = fmaxf(stp, fabsf(c - prev));
+						}
+						prev = c;
+					}
+					rx = rx_none;
+					const float slew = 0.3f * (float)(30.0 / fps) + 0.1f;
+					CHECK(dev < limit[k] && stp < slew,
+					      "Vision alone %s %.1f px%s (%.0f fps, seed %u): the correction moved %.2f px (largest step "
+					      "%.2f)",
+					      k < 2 ? "stepping" : "drifting", amount[k], k < 2 ? "" : "/s", fps, seed, dev, stp);
+					worst[k] = fmaxf(worst[k], dev);
+					worst_step = fmaxf(worst_step, stp * (float)(fps / 30.0));
+				}
+		printf("ok: Vision alone stepping 1.5 / 3 px moves the correction %.2f / %.2f px, drifting 0.5 / 1 px/s "
+		       "%.2f / %.2f px, no step past the slew limit (%.2f px per 1/30 s)\n",
+		       worst[0], worst[1], worst[2], worst[3], worst_step);
+	}
+
+	/* 38. The face lost for a moment (1-4 frames at 30 fps, 1-2 at 15: under LOST_HOLD) exactly while the
+	 * gaze moves between the lens and the notes: when it is back, the correction lands on the new gaze
+	 * within 2 frames (within 25%), both ways, as a glance would, and once that landing has settled (3
+	 * frames) it moves no faster than the slew limit (it used to glide for a second or push the wrong way).
+	 * Lost for longer (0.3 s), the correction fades out and comes back in within 0.5 s of the face, easing
+	 * (no step past 1 px per 1/30 s). Realistic noise with Vision, 30 and 15 fps. */
+	{
+		int worst_land = 0;
+		float worst_after = 0, worst_long = 0;
+		int worst_back = 0;
+		for (int fr = 0; fr < 2; fr++)
+			for (int lost = 1; lost <= 5; lost++)
+				for (int dir = 0; dir < 2; dir++)
+					for (unsigned seed = 0; seed < 6; seed++) {
+						const double fps = fr ? 15.0 : 30.0, dts = 1.0 / fps;
+						const int n_lost = lost == 5 ? (int)(0.3 * fps) : lost;
+						if (lost < 5 && n_lost * dts >= 0.19)
+							continue;
+						const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+						const cf_gaze_params pr = real_params();
+						const real_gaze lens = {0, 0, 0};
+						cf_gaze_init(&g);
+						rng_seed(71 + 5 * seed + lost + 13 * dir);
+						double tt = 100.0;
+						const int n0 = (int)(3.0 * fps);
+						const float target = dir == 0 ? 0.10f * RW : 0.0f;
+						int land = -1;
+						float prev = 0, after = 0, big = 0;
+						for (int i = 0; i < n0 + n_lost + (int)fps; i++, tt += dts) {
+							const int phase = i < n0 ? 0 : (i < n0 + n_lost ? 1 : 2);
+							cf_face f = noisy_real(&rn, (phase == 0) == (dir == 0) ? lens : at_notes());
+							if (phase == 1)
+								f.found = 0;
+							const int nn = cf_gaze_update(&g, &f, &pr, tt, out);
+							const float c = nn ? -out[0].sy : 0.0f;
+							if (phase == 2) {
+								const int k = i - n0 - n_lost;
+								if (land < 0 && fabsf(c - target) <= 0.25f * 0.10f * RW)
+									land = k;
+								if (land >= 0 && k > land + 3)
+									after = fmaxf(after, fabsf(c - prev));
+								big = fmaxf(big, fabsf(c - prev));
+							}
+							prev = c;
+						}
+						if (lost < 5) {
+							CHECK(land >= 0 && land <= 1 && after < 0.3f * (float)(30.0 / fps) + 0.15f,
+							      "face lost %d frames across a glance %s (%.0f fps, seed %u): landed on frame %d "
+							      "after it was back, steps after %.2f px",
+							      n_lost, dir == 0 ? "to the notes" : "to the lens", fps, seed, land, after);
+							worst_land = land > worst_land ? land : worst_land;
+							worst_after = fmaxf(worst_after, after * (float)(fps / 30.0));
+						} else {
+							CHECK(land >= 0 && land * dts <= 0.5 && big < 1.0f * (float)(30.0 / fps),
+							      "face lost 0.3 s across a glance %s (%.0f fps, seed %u): back on frame %d, "
+							      "largest step %.2f px",
+							      dir == 0 ? "to the notes" : "to the lens", fps, seed, land, big);
+							worst_back = land > worst_back ? land : worst_back;
+							worst_long = fmaxf(worst_long, big * (float)(fps / 30.0));
+						}
+					}
+		printf("ok: face lost 1-4 frames across a glance: lands by frame %d of it being back, then steps of %.2f "
+		       "px per 1/30 s at most; lost 0.3 s: back by frame %d, steps up to %.2f px per 1/30 s\n",
+		       worst_land, worst_after, worst_back, worst_long);
+	}
+
+	/* 39. Eyes closed for longer than a blink's hold (0.55, 0.8 and 1.0 s) while reading, the points
+	 * dragged by the lids: the correction holds, and past the hold eases out while they are shut. When they
+	 * open it is back on the notes correction within 0.25 s, easing in about as fast as the lids open
+	 * (never more than 70% of it in one frame; it used to restart from one noisy frame, 1.2-3.7 px steps
+	 * with the eyes open, and then fade in over half a second). Realistic noise with Vision, 30 and 15 fps. */
+	{
+		const double closed[3] = {0.55, 0.8, 1.0};
+		float worst_step = 0;
+		double worst_back = 0;
+		for (int fr = 0; fr < 2; fr++)
+			for (int k = 0; k < 3; k++)
+				for (unsigned seed = 0; seed < 4; seed++) {
+					const double fps = fr ? 15.0 : 30.0, dts = 1.0 / fps;
+					const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+					const cf_gaze_params pr = real_params();
+					cf_gaze_init(&g);
+					rng_seed(81 + 3 * seed + k);
+					double tt = 100.0, back = -1;
+					const int n0 = (int)(3.0 * fps), nc = (int)(closed[k] * fps + 0.5);
+					float prev = 0, big = 0;
+					for (int i = 0; i < n0 + nc + (int)(1.5 * fps); i++, tt += dts) {
+						const int shut = i >= n0 && i < n0 + nc;
+						rx.open = shut ? 0.05f : 1.0f;
+						rx.drag[0] = rx.drag[1] = shut ? 0.08f : 0.0f;
+						rx.vdrag = shut ? 0.04f : 0.0f;
+						cf_face f = noisy_real(&rn, at_notes());
+						const int nn = cf_gaze_update(&g, &f, &pr, tt, out);
+						const float c = nn ? -out[0].sy : 0.0f;
+						if (i >= n0 + nc)
+							big = fmaxf(big, fabsf(c - prev));
+						if (i >= n0 + nc && back < 0 && fabsf(c - 0.10f * RW) < 1.0f)
+							back = (i - n0 - nc) * dts;
+						prev = c;
+					}
+					rx = rx_none;
+					CHECK(back >= 0 && back <= 0.25 + 1e-6 && big < 0.7f * 0.10f * RW,
+					      "eyes closed %.2f s while reading (%.0f fps, seed %u): back on the notes correction "
+					      "%.2f s after they opened, largest step %.2f px",
+					      closed[k], fps, seed, back, big);
+					worst_step = fmaxf(worst_step, big);
+					worst_back = fmax(worst_back, back);
+				}
+		printf("ok: eyes closed 0.55-1 s while reading: back on the notes correction %.2f s after they open at "
+		       "most, easing in (largest step %.2f px)\n",
+		       worst_back, worst_step);
+	}
+
+	/* 40. A blink with the pupil points dragged by the lids (a generic profile: the lids close halfway over
+	 * 2 frames and reopen over 6; one eye's refined point pulled down 0.10 eye widths, the other first up
+	 * 0.04, then down 0.10, then up again as they open; Vision's 0.045 down), the output shown one frame
+	 * late (lag 1: what frame i computes shows on frame i+1). The drags never back a change: with the
+	 * gaze unchanged the correction stays within 0.5 px (the noise's own wander). A gaze change during the
+	 * blink (notes -> lens, or lens -> notes; blinks often come with glances) may show as the lids close,
+	 * its size read through the drags, but never the wrong way and never more than 35% past it; it is most
+	 * of the way there (within 45%) 0.15 s after the lids are 85% open (one frame more: the first such frame
+	 * may still carry the drag) and within 25% by 0.3 s. Looking at the notes with lowered lids and up to the
+	 * lens as they rise is a saccade: it lands within 2 frames. Realistic noise with Vision, 30 and 15 fps. */
+	{
+		float worst_still = 0, worst_early = 0;
+		double worst_land = 0, worst_near = 0;
+		int worst_rise = 0;
+		for (int fr = 0; fr < 2; fr++)
+			for (int sc = 0; sc < 4; sc++)
+				for (unsigned seed = 0; seed < 4; seed++) {
+					const double fps = fr ? 15.0 : 30.0, dts = 1.0 / fps;
+					const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+					const cf_gaze_params pr = real_params();
+					const real_gaze lens = {0, 0, 0};
+					cf_gaze_init(&g);
+					rng_seed(91 + 5 * seed + sc);
+					double tt = 100.0;
+					const int n0 = (int)(3.0 * fps), n1 = n0 + (int)(1.0 * fps);
+					const real_gaze from = sc == 2 ? lens : at_notes();
+					const real_gaze to = sc == 1 || sc == 3 ? lens : at_notes();
+					const float target = sc == 1 || sc == 3 ? 0.0f : 0.10f * RW;
+					float steady = 0, prev = 0, still = 0, early = 0, k_next = 1;
+					double open_t = -1, land_t = -1, near_t = -1;
+					int rise = -1;
+					float outs[64], ks[64];
+					int no = 0;
+					for (int i = 0; i < n1; i++, tt += dts) {
+						const double ts = (i - n0) * dts; /* time into the blink */
+						float c01 = 0;                  /* how far closed (0..1) */
+						if (sc < 3 && ts >= 0) {
+							if (ts < 0.067)
+								c01 = (float)(ts / 0.067);
+							else if (ts < 0.1)
+								c01 = 1;
+							else if (ts < 0.3)
+								c01 = 1 - (float)((ts - 0.1) / 0.2);
+						}
+						rx.open = sc == 3 ? (ts < 0 ? 0.9f : 1.0f) : 1.0f - 0.5f * c01;
+						rx.drag[0] = 0.10f * c01;
+						rx.drag[1] = c01 > 0 ? (ts < 0.04 ? -0.04f : (ts > 0.2 ? -0.08f * c01 : 0.10f * c01)) : 0.0f;
+						rx.vdrag = 0.045f * c01;
+						const real_gaze gz = sc == 3 ? (ts < 0 ? from : to) : (ts < 0.05 ? from : to);
+						cf_face f = noisy_real(&rn, gz);
+						const int nn = cf_gaze_update(&g, &f, &pr, tt, out);
+						const float c = nn ? -out[0].sy : 0.0f;
+						if (i == n0 - 1)
+							steady = c;
+						if (i >= n0 && no < 64) {
+							outs[no] = c;
+							ks[no] = rx.open;
+							no++;
+						}
+						prev = c;
+					}
+					rx = rx_none;
+					(void)prev;
+					(void)k_next;
+					/* lag 1: outs[j] shows on frame j + 1, whose lids are ks[j + 1] */
+					for (int j = 0; j + 1 < no; j++) {
+						const float shown = outs[j], lids = ks[j + 1];
+						const double ts = (j + 1) * dts;
+						if (sc == 0)
+							still = fmaxf(still, fabsf(shown - steady));
+						if ((sc == 1 || sc == 2) && lids < 0.85f && open_t < 0)
+							early = fmaxf(early, fmaxf(fminf(steady, target) - shown, shown - fmaxf(steady, target)));
+						if ((sc == 1 || sc == 2) && lids >= 0.85f && open_t < 0 && ts > 0.1)
+							open_t = ts;
+						if ((sc == 1 || sc == 2) && land_t < 0 && fabsf(shown - target) <= 0.25f * 0.10f * RW)
+							land_t = ts;
+						if ((sc == 1 || sc == 2) && near_t < 0 && fabsf(shown - target) <= 0.45f * 0.10f * RW)
+							near_t = ts;
+						if (sc == 3 && rise < 0 && fabsf(shown - target) <= 0.25f * 0.10f * RW)
+							rise = j;
+					}
+					if (sc == 0) {
+						CHECK(still < 0.5f, "blink with dragged points, gaze still (%.0f fps, seed %u): the "
+						      "correction moved %.2f px", fps, seed, still);
+						worst_still = fmaxf(worst_still, still);
+					} else if (sc < 3) {
+						CHECK(early < 0.35f * 0.10f * RW && open_t > 0 && near_t >= 0 && land_t >= 0 &&
+							      near_t - open_t <= 0.15 + dts + 1e-6 && land_t - open_t <= 0.3 + 1e-6,
+						      "blink with a glance %s (%.0f fps, seed %u): %.2f px past where it was or went "
+						      "before the lids were 85%% open (at %.3f s), within 45%% at %.3f s, 25%% at %.3f s",
+						      sc == 1 ? "to the lens" : "to the notes", fps, seed, early, open_t, near_t, land_t);
+						worst_early = fmaxf(worst_early, early);
+						worst_near = fmax(worst_near, near_t - open_t);
+						worst_land = fmax(worst_land, land_t - open_t);
+					} else {
+						CHECK(rise >= 0 && rise <= 1, "looking up to the lens as the lids rise (%.0f fps, seed "
+						      "%u): landed on frame %d", fps, seed, rise);
+						worst_rise = rise > worst_rise ? rise : worst_rise;
+					}
+				}
+		printf("ok: blinks with lid-dragged points (lag 1): gaze still moves the correction %.2f px; a glance "
+		       "during the blink goes %.2f px past either end before the lids are 85%% open, is within 45%% "
+		       "%.3f s and 25%% %.3f s after; looking up with the lids rising lands on frame %d\n",
+		       worst_still, worst_early, worst_near, worst_land, worst_rise);
+	}
+
+	/* 41. The refined points departing from Vision's without an eye movement (patterns seen on the user's
+	 * camera, generic sizes): (a) one eye's point sits 0.05 eye widths low, then the other's drops 0.03;
+	 * (b) one eye's point 0.06 low jumps 0.08 up in one frame; (d) the two disagree by 0.09 for 3 s, then
+	 * the low one spikes 0.05 for a frame; (c) the lids drop a little while both refined points fall
+	 * 0.05-0.09 for 0.15 s. Vision's points don't move, so nothing backs a change: the output never steps
+	 * faster than the slew limit. (c') The same with Vision's points dragged 0.015 too (1.3 px, 2.2 px of
+	 * gaze with the calibrated gain): that is what a short look down looks like, and may show as one, but
+	 * when the points come back so does the correction, at once (within 1 px no later than 0.1 s and a
+	 * frame after the first frame without the drags), not gliding back over half a second. Realistic noise
+	 * with Vision, 25, 30 and 15 fps. */
+	{
+		const double fpss[3] = {25.0, 30.0, 15.0};
+		float worst[5] = {0, 0, 0, 0, 0};
+		double worst_back = 0;
+		for (int fr = 0; fr < 3; fr++)
+			for (int pat = 0; pat < 5; pat++)
+				for (unsigned seed = 0; seed < 4; seed++) {
+					const double fps = fpss[fr], dts = 1.0 / fps;
+					const real_noise rn = {fps, 1, 0.0f, 0, 1.2f, 0.3f, 0.05f};
+					real_vis_cal = pat == 4;
+					const cf_gaze_params pr = real_params();
+					real_vis_cal = 0;
+					cf_gaze_init(&g);
+					rng_seed(101 + 7 * seed + pat);
+					double tt = 100.0;
+					const int n0 = (int)(5.0 * fps), n1 = n0 + (int)(3.0 * fps);
+					float prev = 0, big = 0, steady = 0, dev = 0;
+					double back = -1, clean_t = -1;
+					for (int i = 0; i < n1; i++, tt += dts) {
+						const double tp = (i - n0) * dts;
+						rx = rx_none;
+						if (pat == 0) {
+							rx.drag[1] = tp >= -0.4 ? 0.05f : 0.0f;
+							rx.drag[0] = tp >= 0 ? 0.03f : 0.0f;
+						} else if (pat == 1) {
+							rx.drag[1] = tp >= -1.0 ? (tp >= 0 ? -0.02f : 0.06f) : 0.0f;
+						} else if (pat == 2 || pat == 4) {
+							if (tp >= 0 && tp < 0.15) {
+								rx.open = 0.97f;
+								rx.drag[0] = tp < 0.04 ? 0.05f : 0.09f;
+								rx.drag[1] = tp < 0.04 ? 0.05f : 0.03f;
+								rx.vdrag = pat == 4 ? 0.015f : 0.0f;
+							}
+						} else {
+							rx.drag[1] = tp >= -3.0 ? (tp >= 0 && tp < 0.99 * dts ? 0.04f : 0.09f) : 0.0f;
+						}
+						cf_face f = noisy_real(&rn, at_notes());
+						const int nn = cf_gaze_update(&g, &f, &pr, tt, out);
+						const float c = nn ? -out[0].sy : 0.0f;
+						if (i == n0 - (int)(1.2 * fps))
+							steady = c;
+						if (i > n0 - (int)(1.2 * fps)) {
+							big = fmaxf(big, fabsf(c - prev));
+							dev = fmaxf(dev, fabsf(c - steady));
+						}
+						if (tp >= 0.15 - 1e-6 && clean_t < 0)
+							clean_t = tp; /* the first frame without the drags */
+						if (clean_t >= 0 && back < 0 && fabsf(c - steady) < 1.0f)
+							back = tp - clean_t;
+						prev = c;
+					}
+					rx = rx_none;
+					const float slew = 0.3f * (float)(30.0 / fps) + 0.1f;
+					if (pat == 4) {
+						CHECK(dev < 1.5f || (back >= 0 && back <= 0.1 + dts + 1e-6),
+						      "refined points falling with the lids, Vision's a little (%.0f fps, seed %u): the "
+						      "correction moved %.2f px, back %.3f s after the points",
+						      fps, seed, dev, back);
+						worst[pat] = fmaxf(worst[pat], dev);
+						worst_back = fmax(worst_back, back);
+					} else {
+						CHECK(big < slew, "refined points departing from Vision's, pattern %c (%.0f fps, seed %u): "
+						      "a step of %.2f px", "abcd"[pat], fps, seed, big);
+						worst[pat] = fmaxf(worst[pat], big * (float)(fps / 30.0));
+					}
+				}
+		printf("ok: refined points departing from Vision's: patterns a, b, c, d step at most %.2f / %.2f / %.2f / "
+		       "%.2f px per 1/30 s; c with Vision's dragged too moves the correction %.2f px and is back %.3f s "
+		       "after the points\n",
+		       worst[0], worst[1], worst[2], worst[3], worst[4], worst_back);
+	}
 	test_pose();
 	test_head_lids();
 
