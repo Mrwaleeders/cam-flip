@@ -1,0 +1,66 @@
+name: OBS plugin
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  OBS_VERSION: "33.0.1"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: obs-plugin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: sw_vers && clang --version
+
+      - name: Pixel and eye-contact behaviour tests
+        run: |
+          clang -O2 -Wall -Werror -Isrc tests/test_warp.c src/warp.c -o build_test_warp && ./build_test_warp
+          clang -O2 -Wall -Werror -Isrc tests/test_gaze.c src/gaze.c src/warp.c -o build_test_gaze && ./build_test_gaze
+
+      - name: Build plugin
+        run: CAMFLIP_VERSION="1.0.${{ github.run_number }}" ./build.sh
+
+      - name: Install OBS (for the integration test)
+        run: brew install --cask obs
+
+      - name: Check every OBS function the plugin uses exists in this OBS
+        run: |
+          LIBOBS="$(find /Applications/OBS.app/Contents/Frameworks -path '*libobs.framework/libobs' -o -path '*libobs.framework/Versions/A/libobs' | head -1)"
+          echo "libobs: $LIBOBS"
+          nm -gU "$LIBOBS" | awk '{print $NF}' | sort -u > /tmp/exported.txt
+          nm -u -arch arm64 build/cam-flip.plugin/Contents/MacOS/cam-flip | grep -E '_(obs|blog|bmalloc|bfree|bzalloc|gs)_?' | sort -u > /tmp/needed.txt || true
+          cat /tmp/needed.txt
+          missing=$(comm -23 /tmp/needed.txt /tmp/exported.txt)
+          if [ -n "$missing" ]; then echo "Missing in OBS: $missing"; exit 1; fi
+          echo "All OBS symbols resolve."
+
+      - name: Run filter against real libobs + Apple Vision
+        run: OBS_VERSION="$OBS_VERSION" ./tests/run_plugin_test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cam-flip-obs-macos
+          path: obs-plugin/build/cam-flip-obs-macos.zip
+
+      - name: Publish download (main branch)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest build/cam-flip-obs-macos.zip \
+            --title "Cam Flip for OBS (latest)" \
+            --notes "Built from ${GITHUB_SHA::7}. Install steps: see the README." \
+            --target "$GITHUB_SHA"

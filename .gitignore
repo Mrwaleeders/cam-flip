@@ -3,4 +3,5 @@ build/
 DerivedData/
 *.xcodeproj/
 xcuserdata/
-Config/Local.xcconfig
+standalone-app/Config/Local.xcconfig
+obs-plugin/build_test_*
