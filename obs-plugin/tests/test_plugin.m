@@ -468,6 +468,76 @@ static void run_notes_stale(struct camflip *f, obs_data_t *restore)
 	pthread_mutex_unlock(&f->lock);
 }
 
+/* Step 1 also learns the head looking into the camera (pose.c): saved with the calibration and read
+ * back after a restart. A camera calibration saved by an older version has none: a typical face is
+ * assumed and the panel asks to redo step 1. */
+static void run_head_reference(struct camflip *f, obs_data_t *restore)
+{
+	pthread_mutex_lock(&f->lock);
+	f->needs_recalib = false;
+	f->calib_running = CALIB_IDLE;
+	f->calib_failed = CALIB_IDLE;
+	f->calib_notes_bad = false;
+	f->calib_no_frames = false;
+	f->calib_done_msg = NULL;
+	cf_calib_result lens;
+	memset(&lens, 0, sizeof(lens));
+	lens.target = CF_CALIB_LENS;
+	lens.offset = 0.01f;
+	lens.openness = 0.3f;
+	lens.head = (cf_head_ref){.ok = 1, .side = 0.03f, .vert = 0.62f, .eyes = -0.02f, .tilt = 0.11f};
+	bool bad = false;
+	obs_data_t *changes = apply_calibration_locked(f, &lens, &bad);
+	const bool learnt = changes && !bad && f->head_ref.ok && params_locked(f).head_ref.ok &&
+			    fabsf(params_locked(f).head_ref.vert - 0.62f) < 1e-6f;
+	pthread_mutex_unlock(&f->lock);
+	const bool saved = changes && obs_data_get_bool(changes, S_HEAD_REF) &&
+			   fabs(obs_data_get_double(changes, S_HEAD_TILT) - 0.11) < 1e-6;
+	obs_data_release(changes);
+	check(learnt && saved, "the camera calibration learns and saves the head looking into the camera");
+
+	char text[700];
+	bool warn = false;
+	status_text(f, text, sizeof(text), &warn);
+	check(strstr(text, "camera done") != NULL && strstr(text, "Redo step 1") == NULL,
+	      "status: camera calibrated with the head");
+
+	/* Saved by the previous version: the camera calibrated, no head. */
+	obs_data_t *saved_old = obs_data_create();
+	camflip_defaults(saved_old);
+	obs_data_set_double(saved_old, S_BASELINE, 0.01);
+	obs_data_set_double(saved_old, S_BASELINE_OPEN, 0.3);
+	obs_data_set_int(saved_old, S_CALIB_VERSION, CALIB_VERSION);
+	camflip_update(f, saved_old);
+	pthread_mutex_lock(&f->lock);
+	f->calib_done_msg = NULL;
+	const bool typical = f->lens_done && !f->head_ref.ok && !params_locked(f).head_ref.ok;
+	pthread_mutex_unlock(&f->lock);
+	status_text(f, text, sizeof(text), &warn);
+	printf("info: status panel says:\n%s\n", text);
+	check(typical && !warn && strstr(text, "camera done") != NULL && strstr(text, "Redo step 1") != NULL,
+	      "a camera calibration without the head assumes a typical face and asks to redo step 1");
+
+	/* Read back with it. */
+	obs_data_set_bool(saved_old, S_HEAD_REF, true);
+	obs_data_set_double(saved_old, S_HEAD_SIDE, 0.03);
+	obs_data_set_double(saved_old, S_HEAD_VERT, 0.62);
+	obs_data_set_double(saved_old, S_HEAD_EYES, -0.02);
+	obs_data_set_double(saved_old, S_HEAD_TILT, 0.11);
+	camflip_update(f, saved_old);
+	pthread_mutex_lock(&f->lock);
+	const bool loaded = f->head_ref.ok && fabsf(f->head_ref.vert - 0.62f) < 1e-6f &&
+			    fabsf(f->head_ref.tilt - 0.11f) < 1e-6f && fabsf(f->head_ref.eyes + 0.02f) < 1e-6f;
+	pthread_mutex_unlock(&f->lock);
+	check(loaded, "the head looking into the camera is read back from the settings");
+	obs_data_release(saved_old);
+
+	camflip_update(f, restore);
+	pthread_mutex_lock(&f->lock);
+	f->calib_done_msg = NULL;
+	pthread_mutex_unlock(&f->lock);
+}
+
 static void run_hotkey_names(void)
 {
 	char n[4][512], d[4][512], again[512], again_d[512];
@@ -604,6 +674,15 @@ static void run_face_tracking(struct camflip *f)
 	check(full >= 1, "a real face is found by full face detection");
 	check(tracked >= 1, "the face is then followed by fast tracking");
 	check(seen.found && seen_moved.found && face_still && face_moved, "the gaze model sees the face, still and moving");
+	float head_yaw = 0, head_pitch = 0;
+	cf_head_angles(&seen.head, NULL, &head_yaw, &head_pitch);
+	printf("info: head measures (pose.c): side %.3f vert %.3f eyes %.3f tilt %.3f (moved: side %.3f vert %.3f); "
+	       "a typical face would be turned %.1f deg\n",
+	       seen.head.side, seen.head.vert, seen.head.eyes, seen.head.tilt, seen_moved.head.side, seen_moved.head.vert,
+	       head_yaw);
+	check(seen.has_head_geom && seen_moved.has_head_geom && seen.head.vert > 0.2f && seen.head.vert < 1.5f &&
+		      fabsf(seen.head.side) < 0.5f,
+	      "the head pose is measured from the face's landmarks (eyes and nose), tracked frames included");
 
 	char text[700];
 	bool warn = false;
@@ -624,6 +703,11 @@ static void run_face_tracking(struct camflip *f)
 	check(seen_big.found && seen_big.image_width == 2 * w && iod > 0 && el < 0.1f * iod && er < 0.1f * iod &&
 		      pl < 0.15f * iod,
 	      "frames 2560 px and wider are tracked at reduced size with full-resolution coordinates");
+	printf("info: 2560x1440 head measures: side %.3f vert %.3f eyes %.3f tilt %.3f\n", seen_big.head.side,
+	       seen_big.head.vert, seen_big.head.eyes, seen_big.head.tilt);
+	check(seen_big.has_head_geom && fabsf(seen_big.head.side - seen.head.side) < 0.05f &&
+		      fabsf(seen_big.head.vert - seen.head.vert) < 0.05f,
+	      "the head measures do not depend on the frame size");
 
 	free(pic);
 	free(moved);
@@ -636,9 +720,13 @@ static void run_migration(void)
 	camflip_defaults(old);
 	obs_data_set_double(old, S_BASELINE, 0.3); /* saved by an older version, other units */
 	obs_data_set_double(old, S_MAX_GLANCE, 60.0);
+	obs_data_set_bool(old, S_HEAD_REF, true);
+	obs_data_set_double(old, S_HEAD_VERT, 0.6);
 	struct camflip *f = camflip_create(old, NULL);
 	check(f->needs_recalib && fabsf(f->baseline - (float)DEFAULT_BASELINE) < 1e-6f &&
-		      fabsf(f->max_glance - 0.15f) < 1e-6f && obs_data_get_int(old, S_CALIB_VERSION) == CALIB_VERSION,
+		      fabsf(f->max_glance - 0.15f) < 1e-6f && obs_data_get_int(old, S_CALIB_VERSION) == CALIB_VERSION &&
+		      !f->head_ref.ok && !obs_data_has_user_value(old, S_HEAD_REF) &&
+		      !obs_data_has_user_value(old, S_HEAD_VERT),
 	      "calibration saved by an older version is reset and asks to calibrate again");
 	camflip_destroy(f);
 	obs_data_release(old);
@@ -717,6 +805,7 @@ int main(void)
 	run_baseline_defaults(f, settings);
 	run_face_tracking(f);
 	run_notes_stale(f, settings);
+	run_head_reference(f, settings);
 	run_hotkey_names();
 
 	/* Destroy while a frame is waiting: must stop the tracking thread promptly. */

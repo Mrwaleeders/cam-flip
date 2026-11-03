@@ -19,8 +19,12 @@
  *                      kept one by less than X grey levels (drops real frames while still: avoid); 0 keeps
  *                      every frame.
  *   --baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P
- *                      calibration, as saved in the filter's settings (OBS scene JSON)
- *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead
+ *   --head-side S --head-vert V --head-eyes E --head-tilt K
+ *                      calibration, as saved in the filter's settings (OBS scene JSON); without the
+ *                      --head-* values the head-turn fade assumes a typical face (as the plugin does
+ *                      after a camera calibration by an older version)
+ *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead (--lens
+ *                      also learns the head looking into the camera)
  *   --strength S       0..1 (default 1)
  *   --measure          also track the corrected output and report how much the iris seen by the
  *                      viewer shakes (RMS of value minus its centred 5-frame mean, pixels)
@@ -318,8 +322,9 @@ int main(int argc, char **argv)
 {
 	if (argc < 3) {
 		fprintf(stderr, "usage: render_video <in> <out-dir> [--lag N] [--dedupe X] [--baseline B] "
-				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--lens a-b] "
-				"[--notes a-b] [--strength S] [--measure] [--zoom Z]\n");
+				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--head-side S] "
+				"[--head-vert V] [--head-eyes E] [--head-tilt K] [--lens a-b] [--notes a-b] [--strength S] "
+				"[--measure] [--zoom Z]\n");
 		return 2;
 	}
 	int lag = 1, measure = 0, zoom = 3;
@@ -335,6 +340,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--notes-offset")) { p.notes_offset = (float)atof(v); p.has_notes = 1; i++; }
 		else if (!strcmp(a, "--notes-side")) { p.notes_side = (float)atof(v); i++; }
 		else if (!strcmp(a, "--notes-open")) { p.notes_open = (float)atof(v); i++; }
+		else if (!strcmp(a, "--head-side")) { p.head_ref.side = (float)atof(v); p.head_ref.ok = 1; i++; }
+		else if (!strcmp(a, "--head-vert")) { p.head_ref.vert = (float)atof(v); p.head_ref.ok = 1; i++; }
+		else if (!strcmp(a, "--head-eyes")) { p.head_ref.eyes = (float)atof(v); p.head_ref.ok = 1; i++; }
+		else if (!strcmp(a, "--head-tilt")) { p.head_ref.tilt = (float)atof(v); p.head_ref.ok = 1; i++; }
 		else if (!strcmp(a, "--lens")) { parse_range(v, lens); i++; }
 		else if (!strcmp(a, "--notes")) { parse_range(v, notes_r); i++; }
 		else if (!strcmp(a, "--strength")) { p.strength = (float)atof(v); i++; }
@@ -419,7 +428,11 @@ int main(int argc, char **argv)
 			if (got > 0 && step == 0) {
 				p.baseline = res.offset;
 				p.baseline_open = res.openness;
-				printf("lens calibration: baseline %.4f open %.4f\n", res.offset, res.openness);
+				p.head_ref = res.head;
+				printf("lens calibration: baseline %.4f open %.4f; head %s: side %.4f vert %.4f eyes %.4f tilt "
+				       "%.4f\n",
+				       res.offset, res.openness, res.head.ok ? "learnt" : "not learnt", res.head.side,
+				       res.head.vert, res.head.eyes, res.head.tilt);
 			} else if (got > 0) {
 				p.has_notes = 1;
 				p.notes_offset = res.offset;
@@ -432,6 +445,11 @@ int main(int argc, char **argv)
 		}
 		printf("params: strength %.2f baseline %.4f open %.4f notes %d offset %.4f side %.4f open %.4f, lag %d\n",
 		       p.strength, p.baseline, p.baseline_open, p.has_notes, p.notes_offset, p.notes_side, p.notes_open, lag);
+		if (p.head_ref.ok)
+			printf("head looking into the camera: side %.4f vert %.4f eyes %.4f tilt %.4f\n", p.head_ref.side,
+			       p.head_ref.vert, p.head_ref.eyes, p.head_ref.tilt);
+		else
+			printf("head looking into the camera: not given, a typical face is assumed (head turns only)\n");
 
 		/* Repeated frames, by cadence: frame-to-frame differences alternate small (repeat) / large
 		 * (new camera frame). Per frame, look at a 1 s window: if one parity's mean difference is well
@@ -523,7 +541,8 @@ int main(int argc, char **argv)
 		AVAssetWriterInputPixelBufferAdaptor *afull = nil, *acmp = nil;
 		FILE *csv = fopen([[dir stringByAppendingPathComponent:@"frames.csv"] UTF8String], "w");
 		/* in_*: refined pupil y minus outline centroid (px). l/r_open, l/r_ref, l/r_vis: openness and
-		 * the refined and Vision pupil offsets (eye widths, + = up) the gaze model saw on this frame. */
+		 * the refined and Vision pupil offsets (eye widths, + = up) the gaze model saw on this frame.
+		 * yaw, pitch: the smoothed head pose (pose.c, degrees from the calibrated one) its fade used. */
 		fprintf(csv, "t,n,factor,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,in_ly,in_ry,out_ly,out_ry,"
 			     "l_open,l_ref,l_vis,r_open,r_ref,r_vis,yaw,pitch\n");
 
@@ -684,7 +703,7 @@ int main(int argc, char **argv)
 					"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f\n",
 					t, n, st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
 					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1], em[0][0],
-					em[0][1], em[0][2], em[1][0], em[1][1], em[1][2], face.yaw_deg, face.pitch_deg);
+					em[0][1], em[0][2], em[1][0], em[1][1], em[1][2], gaze.pose.yaw, gaze.pose.pitch);
 
 				/* Writers, sized on the first frame. The close-up crop is fixed from the first face. */
 				if (!wfull) {

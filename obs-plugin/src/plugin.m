@@ -62,6 +62,13 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_NOTES_SIDE "notes_side"
 #define S_HAS_NOTES "has_notes"
 #define S_NOTES_OPEN "notes_open"
+/* The face looking into the camera, learnt by step 1 (pose.c's cf_head_ref): head turns and tilts are
+ * measured from it. No S_HEAD_REF (step 1 done by an older version): a typical face is assumed. */
+#define S_HEAD_REF "head_ref"
+#define S_HEAD_SIDE "head_side"
+#define S_HEAD_VERT "head_vert"
+#define S_HEAD_EYES "head_eyes"
+#define S_HEAD_TILT "head_tilt"
 #define S_CALIB_VERSION "calib_version"
 
 /* Version 2: gaze offsets are in eye widths. Older calibrations are in other units. */
@@ -116,6 +123,7 @@ struct camflip {
 	float notes_offset;
 	float notes_side;
 	float notes_open; /* eye openness at the notes; 0 = unknown (calibrated by an older version) */
+	cf_head_ref head_ref; /* the face looking into the camera; ok 0 = not learnt (older step 1) */
 	bool has_notes;
 	bool notes_stale; /* notes no longer below the (newer) lens calibration: not used until redone */
 	bool lens_done;
@@ -265,6 +273,7 @@ static cf_gaze_params params_locked(const struct camflip *f)
 	p.notes_offset = f->notes_offset;
 	p.notes_side = f->notes_side;
 	p.notes_open = f->notes_open;
+	p.head_ref = f->head_ref;
 	return p;
 }
 
@@ -651,8 +660,9 @@ static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, b
 		f->last_detect_ns = now;
 	}
 	plan_tracking(f, &geom, vw, vh);
-	/* Head pose comes from full detections. If the head has turned or tilted noticeably since
-	 * the last one, detect again on the next frame so the pose (and the fade-out) stays fresh. */
+	/* Tracked passes fit the landmarks with the head pose of the last full detection. If the head
+	 * has turned or tilted noticeably since, detect again on the next frame so the landmarks (which
+	 * the head-turn fade is measured from, below) stay good. */
 	if (track && f->ref_has_nose && geom.has_nose &&
 	    (fabs(geom.side - f->ref_side) > 0.05 || fabs(geom.vert - f->ref_vert) > 0.08))
 		f->last_detect_ns = 0;
@@ -671,6 +681,29 @@ static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, b
 			outs[e][i].y = (float)(vh - pts[i].y); /* Vision's origin is bottom left */
 		}
 		*counts[e] = n;
+	}
+	/* Head pose, on every frame (tracked or full), from the eye outlines and the nose's outline and
+	 * crest (pose.c). Vision's own yaw only reads 0 or 45 degrees and its pitch 0, and only on full
+	 * detections: it is kept below only as a fallback for frames without a nose. */
+	{
+		cf_pt nose[CF_HEAD_MAX_POINTS];
+		int nn = 0;
+		VNFaceLandmarkRegion2D *nose_regions[2] = {lm.nose, lm.noseCrest};
+		for (int r = 0; r < 2; r++) {
+			VNFaceLandmarkRegion2D *region = nose_regions[r];
+			if (!region || region.pointCount < 1)
+				continue;
+			const CGPoint *pts = [region pointsInImageOfSize:size];
+			if (!pts)
+				continue;
+			for (NSUInteger i = 0; i < region.pointCount && nn < CF_HEAD_MAX_POINTS; i++) {
+				nose[nn].x = (float)pts[i].x;
+				nose[nn].y = (float)(vh - pts[i].y);
+				nn++;
+			}
+		}
+		face->has_head_geom = cf_head_measure(face->left_eye, face->left_count, face->right_eye,
+						      face->right_count, nose, nn, &face->head);
 	}
 	if (lm.leftPupil.pointCount < 1 || lm.rightPupil.pointCount < 1)
 		return;
@@ -711,7 +744,7 @@ static unsigned int status_sig_locked(const struct camflip *f)
 	return (unsigned)f->calib_running | ((unsigned)f->calib_failed << 2) | ((unsigned)f->st_face << 4) |
 	       ((unsigned)f->lens_done << 5) | ((unsigned)f->has_notes << 6) | ((unsigned)f->eye_contact << 7) |
 	       ((unsigned)f->calib_notes_bad << 8) | ((unsigned)f->calib_no_frames << 9) |
-	       ((unsigned)f->notes_stale << 10);
+	       ((unsigned)f->notes_stale << 10) | ((unsigned)(f->lens_done && !f->head_ref.ok) << 11);
 }
 
 /*
@@ -743,6 +776,14 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		f->lens_done = true;
 		obs_data_set_double(changes, S_BASELINE, res->offset);
 		obs_data_set_double(changes, S_BASELINE_OPEN, res->openness);
+		/* The head as it was while looking into the camera: turns are measured from here. Not learnt
+		 * (no nose seen) leaves ok 0, a typical face, and the panel asks to redo the step. */
+		f->head_ref = res->head;
+		obs_data_set_bool(changes, S_HEAD_REF, res->head.ok != 0);
+		obs_data_set_double(changes, S_HEAD_SIDE, res->head.side);
+		obs_data_set_double(changes, S_HEAD_VERT, res->head.vert);
+		obs_data_set_double(changes, S_HEAD_EYES, res->head.eyes);
+		obs_data_set_double(changes, S_HEAD_TILT, res->head.tilt);
 		f->calib_done_msg = "Camera calibrated.";
 	}
 	/* A new camera calibration can leave the saved notes above (or level with) the lens. */
@@ -854,8 +895,11 @@ static void process_frame(struct camflip *f, const grey_frame *g)
 			blog(LOG_INFO, "[cam-flip] notes calibrated (offset %.3f, side %.3f eye widths)", res.offset,
 			     res.side);
 		else
-			blog(LOG_INFO, "[cam-flip] camera calibrated (baseline %.3f eye widths, openness %.3f)",
-			     res.offset, res.openness);
+			blog(LOG_INFO,
+			     "[cam-flip] camera calibrated (baseline %.3f eye widths, openness %.3f; head %s: side %.3f "
+			     "vert %.3f eyes %.3f tilt %.3f)",
+			     res.offset, res.openness, res.head.ok ? "learnt" : "not learnt (no nose seen)", res.head.side,
+			     res.head.vert, res.head.eyes, res.head.tilt);
 		if (became_stale)
 			blog(LOG_WARNING, "[cam-flip] the notes calibration is no longer below the new camera "
 					  "calibration and is not used: please redo step 2 (notes)");
@@ -1025,6 +1069,12 @@ static void camflip_update(void *data, obs_data_t *settings)
 	f->notes_open = (float)obs_data_get_double(settings, S_NOTES_OPEN);
 	f->has_notes = obs_data_get_bool(settings, S_HAS_NOTES);
 	f->lens_done = f->baseline_open > 0.0f;
+	memset(&f->head_ref, 0, sizeof(f->head_ref));
+	f->head_ref.ok = f->lens_done && obs_data_get_bool(settings, S_HEAD_REF) ? 1 : 0;
+	f->head_ref.side = (float)obs_data_get_double(settings, S_HEAD_SIDE);
+	f->head_ref.vert = (float)obs_data_get_double(settings, S_HEAD_VERT);
+	f->head_ref.eyes = (float)obs_data_get_double(settings, S_HEAD_EYES);
+	f->head_ref.tilt = (float)obs_data_get_double(settings, S_HEAD_TILT);
 	check_notes_locked(f);
 	if (f->has_notes || f->lens_done)
 		f->needs_recalib = false;
@@ -1046,6 +1096,11 @@ static bool migrate_calibration(obs_data_t *settings)
 	obs_data_unset_user_value(settings, S_NOTES_SIDE);
 	obs_data_unset_user_value(settings, S_NOTES_OPEN);
 	obs_data_unset_user_value(settings, S_HAS_NOTES);
+	obs_data_unset_user_value(settings, S_HEAD_REF);
+	obs_data_unset_user_value(settings, S_HEAD_SIDE);
+	obs_data_unset_user_value(settings, S_HEAD_VERT);
+	obs_data_unset_user_value(settings, S_HEAD_EYES);
+	obs_data_unset_user_value(settings, S_HEAD_TILT);
 	if (obs_data_has_user_value(settings, S_MAX_GLANCE))
 		obs_data_unset_user_value(settings, S_MAX_GLANCE); /* also in different units now */
 	obs_data_set_int(settings, S_CALIB_VERSION, CALIB_VERSION);
@@ -1146,6 +1201,11 @@ static void camflip_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, S_NOTES_SIDE, 0.0);
 	obs_data_set_default_double(settings, S_NOTES_OPEN, 0.0);
 	obs_data_set_default_bool(settings, S_HAS_NOTES, false);
+	obs_data_set_default_bool(settings, S_HEAD_REF, false);
+	obs_data_set_default_double(settings, S_HEAD_SIDE, 0.0);
+	obs_data_set_default_double(settings, S_HEAD_VERT, 0.0);
+	obs_data_set_default_double(settings, S_HEAD_EYES, 0.0);
+	obs_data_set_default_double(settings, S_HEAD_TILT, 0.0);
 	/* S_CALIB_VERSION deliberately has no default, see migrate_calibration(). */
 }
 
@@ -1312,6 +1372,7 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 	const bool stalled = calib_stall_check_locked(f, now_ns());
 	const bool eye_contact = f->eye_contact, face = f->st_face, lens = f->lens_done;
 	const bool notes = f->has_notes && !f->notes_stale, notes_stale = f->notes_stale;
+	const bool head = f->head_ref.ok != 0;
 	const bool recalib = f->needs_recalib;
 	const int running = f->calib_running, failed = f->calib_failed;
 	const bool notes_bad = f->calib_notes_bad, no_frames = f->calib_no_frames, flipped = f->frames_flipped;
@@ -1321,7 +1382,7 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 	if (stalled)
 		log_calib_stalled(flipped);
 
-	char calib[200], track[160], speed[200];
+	char calib[280], track[160], speed[200];
 	*warn = false;
 	if (running == CALIB_LENS)
 		snprintf(calib, sizeof(calib), "Calibrating: keep looking into the camera…");
@@ -1353,8 +1414,11 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 		snprintf(calib, sizeof(calib), "%s%sNotes calibration no longer matches: please redo step 2.",
 			 done ? done : "", done ? " " : "");
 	} else {
-		snprintf(calib, sizeof(calib), "%s%sCalibration: camera %s, notes %s.", done ? done : "", done ? " " : "",
-			 lens ? "done" : "not done", notes ? "done" : "not done");
+		/* Step 1 done by an older version (or without the nose in view): head turns are judged
+		 * against a typical face, which only measures turns, and less precisely. */
+		snprintf(calib, sizeof(calib), "%s%sCalibration: camera %s, notes %s.%s", done ? done : "",
+			 done ? " " : "", lens ? "done" : "not done", notes ? "done" : "not done",
+			 lens && !head ? " Redo step 1 so head turns and tilts are measured for your face." : "");
 	}
 
 	if (!eye_contact)

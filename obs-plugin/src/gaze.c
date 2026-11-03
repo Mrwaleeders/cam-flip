@@ -839,6 +839,7 @@ void cf_gaze_start_calibration(cf_gaze *g, enum cf_calib_target target)
 	g->calib_have_start = 0;
 	g->calib_done = 0;
 	g->calib_failed = 0;
+	g->calib_head_n = 0;
 }
 
 static void finish_calibration(cf_gaze *g)
@@ -846,6 +847,7 @@ static void finish_calibration(cf_gaze *g)
 	g->calib_result = median(g->calib_samples, g->calib_count);
 	g->calib_open_result = median(g->calib_open, g->calib_count);
 	g->calib_side_result = median(g->calib_side, g->calib_count);
+	g->calib_head_result = cf_head_reference(g->calib_head, g->calib_head_n);
 	g->calibrating = 0;
 	g->calib_done = 1;
 }
@@ -881,6 +883,7 @@ int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out)
 	out->offset = g->calib_result;
 	out->openness = g->calib_open_result;
 	out->side = g->calib_side_result;
+	out->head = g->calib_head_result;
 	return 1;
 }
 
@@ -1253,8 +1256,17 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		g->open_ref = clampf(g->open_ref, 0.15f, 0.6f);
 	}
 
-	float abs_yaw = face->has_pose ? fabsf(face->yaw_deg) : 0;
-	float abs_pitch = face->has_pose ? fabsf(face->pitch_deg) : 0;
+	/* Head pose: from this frame's landmarks (pose.c), against the face the lens calibration learnt (a
+	 * typical face while a lens calibration is learning it). The detector's own angles only without
+	 * landmark measures. */
+	float yaw_deg = 0, pitch_deg = 0;
+	const cf_head_ref *head_ref = g->calibrating && g->calib_target == CF_CALIB_LENS ? NULL : &p->head_ref;
+	if (!cf_pose_update(&g->pose, face->has_head_geom ? &face->head : NULL, head_ref, t, &yaw_deg, &pitch_deg) &&
+	    face->has_pose) {
+		yaw_deg = face->yaw_deg;
+		pitch_deg = face->pitch_deg;
+	}
+	float abs_yaw = fabsf(yaw_deg), abs_pitch = fabsf(pitch_deg);
 	abs_yaw = isfinite(abs_yaw) ? abs_yaw : 0; /* broken pose: ignore it rather than poison the factor */
 	abs_pitch = isfinite(abs_pitch) ? abs_pitch : 0;
 
@@ -1265,6 +1277,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		g->calib_open[g->calib_count] = openness;
 		g->calib_side[g->calib_count] = side;
 		g->calib_count++;
+		if (face->has_head_geom && g->calib_head_n < 64)
+			g->calib_head[g->calib_head_n++] = face->head;
 		if (g->calib_count >= CF_CALIB_SAMPLES)
 			finish_calibration(g);
 	}
@@ -1409,8 +1423,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	}
 
 	/* Everything that should gently switch the effect off. Each term is 1 when it's fine. */
-	const float f_yaw = 1.0f - smoothstepf(15.0f, 28.0f, abs_yaw);
-	const float f_pitch = 1.0f - smoothstepf(20.0f, 35.0f, abs_pitch);
+	const float f_yaw = 1.0f - smoothstepf(CF_YAW_FADE_LO, CF_YAW_FADE_HI, abs_yaw);
+	const float f_pitch = 1.0f - smoothstepf(CF_PITCH_FADE_LO, CF_PITCH_FADE_HI, abs_pitch);
 	const float f_side = 1.0f - smoothstepf(SIDE_FADE_LO, SIDE_FADE_HI, fabsf(side_dev));
 	/* Far fade: how much the gaze is still on the notes rather than past them (keyboard). It goes into
 	 * the eased factor below, with the shift held at its pre-look-away size while it fades, so letting go

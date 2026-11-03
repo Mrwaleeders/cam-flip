@@ -17,6 +17,7 @@ Teams, Zoom and Meet mirror only your **own preview**. They always send the unfl
 * **Looks natural when you move:**
   * Eye tracking runs in the background, a little behind the video, and Cam Flip predicts where your eyes are in each frame it corrects. So the correction stays on your eyes during normal head movement. Very fast, sudden movements can briefly show it a few pixels off before tracking catches up.
   * When you turn your head, look far down (for example at the keyboard) or to the side, the correction fades out smoothly instead of forcing a stare. When you look back, it fades in again over about a third of a second. It never switches suddenly.
+  * Head turns and tilts are measured on every frame from your eye corners and nose, against how your head sits when you look into the camera (step 1). Turning or tilting your head more than about 15° either way starts the fade, and by about 25 to 30° the correction is gone. The exact angles vary a little from face to face.
   * When you blink, the correction is held steady through the blink, so your eyes don't flicker. If your eyes stay closed for longer, it fades out.
   * Automated tests check these behaviours on every build. See `obs-plugin/tests/test_gaze.c`.
 * **Image quality:**
@@ -79,7 +80,7 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 | Eye contact | Turns gaze correction on or off. |
 | Eye contact strength | Starts at 100%, which fully cancels the glance at your notes. Lower values keep a little of the natural movement. |
 | Correct glances up to | How far down you can look and still be corrected. Beyond this, your real eyes show again, gradually. Not used once step 2 is calibrated, because Cam Flip then knows where your notes are. |
-| 1. Click, then look into the camera | Learns where your pupils sit, and how open your eyes are, when you look into the lens. |
+| 1. Click, then look into the camera | Learns where your pupils sit, how open your eyes are, and how your head is turned and tilted, when you look into the lens. |
 | 2. Click, then look at your notes | Learns exactly how far down (and sideways) your notes are, and how open your eyes are while you read, so that glance is fully cancelled. Your notes must be below the camera. If they aren't, or you looked elsewhere, the status says **Notes calibration failed** and nothing is changed. |
 | Forget notes calibration | Goes back to using the "Correct glances up to" slider. |
 | Status | Shows calibration progress and problems, whether your face is found, and how long tracking takes. |
@@ -97,6 +98,7 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 * **Status says "Calibration gave up":** Cam Flip didn't see a steady, front-facing face for about 10 seconds. Light your face, face the camera, keep your head still and try again.
 * **Status says "Notes calibration failed":** step 2 measured a gaze that wasn't below the camera. Look at the middle of your notes under the camera (not at the screen or the camera) and try again. If it keeps failing, redo step 1 first.
 * **Status says "Notes calibration no longer matches: please redo step 2":** a newer step 1 put the camera level with or below your saved notes position. Do step 2 again.
+* **Status says "Redo step 1 so head turns and tilts are measured for your face":** step 1 was done by an older version (or your nose wasn't in view). Until you redo it, Cam Flip assumes a typical face: turning your head still fades the correction, a little later than it should, but tilting your head up or down doesn't.
 * **Others see you un-mirrored:** check the filter is on the camera source, and the call app uses **OBS Virtual Camera**.
 
 ## Repo layout
@@ -105,6 +107,7 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 | --- | --- |
 | `obs-plugin/src/plugin.m` | The OBS filter, plus Apple Vision face tracking |
 | `obs-plugin/src/gaze.c` | Eye-contact logic: smoothing, fading, calibration |
+| `obs-plugin/src/pose.c` | Head turn and tilt from the face landmarks, for the fade |
 | `obs-plugin/src/warp.c` | Mirror and eye warp, working directly on the camera's own pixel formats |
 | `obs-plugin/tests/` | Behaviour, quality and OBS integration tests, which run on every push |
 | `obs-plugin/build.sh` | Builds the plugin. It only needs clang, and GitHub runs it for you |

@@ -588,6 +588,8 @@ static void real_look_away(const real_noise *rn, real_gaze away, unsigned seed, 
 	}
 }
 
+#include "test_pose.c"
+
 int main(void)
 {
 	const cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f};
@@ -2083,6 +2085,8 @@ int main(void)
 					       w_back, 0.10f * RW);
 				}
 	}
+
+	test_pose();
 
 	if (failures) {
 		printf("%d FAILED\n", failures);

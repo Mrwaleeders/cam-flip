@@ -4,11 +4,17 @@
  *
  *   replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength 0..1] [--out per-frame.csv]
  *          [--baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P]
+ *          [--head-side S --head-vert V --head-eyes E --head-tilt K]
+ *
+ *   build: cc -O2 -Isrc tools/replay.c src/gaze.c src/warp.c src/pose.c -lm -o replay
  *
  * --lag N     the tracking result used for frame k comes from frame k-N (background tracking),
  *             moved forward with cf_gaze_predict(); 0 = analysed in step with the video.
  * --lens a-b  seconds during which the person looked into the lens (calibration step 1)
  * --notes a-b seconds during which they looked at their notes (calibration step 2)
+ * --head-*    the head looking into the camera, as saved by step 1 (--lens learns it too); without
+ *             it a typical face is assumed for the head-turn fade. CSVs from before the head columns
+ *             fall back to Vision's own yaw and pitch.
  *
  * Shake metric: for each signal, the RMS of (value - centred 5-frame mean). Real movement is
  * smooth across 5 frames, so what remains is frame-to-frame jitter, in pixels.
@@ -71,14 +77,25 @@ static int parse(const char *path, row_t **rows_out)
 		f->right_pupil = (cf_pt){(float)v[17], (float)v[18]};
 		int i = 19;
 		int nl = (int)v[i++];
-		for (int j = 0; j < nl && j < CF_MAX_EYE_POINTS && i + 1 < k; j++, i += 2)
-			f->left_eye[j] = (cf_pt){(float)v[i], (float)v[i + 1]};
+		if (nl < 0)
+			nl = 0;
+		for (int j = 0; j < nl && j < CF_MAX_EYE_POINTS && i + 2 * j + 1 < k; j++)
+			f->left_eye[j] = (cf_pt){(float)v[i + 2 * j], (float)v[i + 2 * j + 1]};
 		f->left_count = nl < CF_MAX_EYE_POINTS ? nl : CF_MAX_EYE_POINTS;
+		i += 2 * nl;
 		if (i < k) {
 			int nr = (int)v[i++];
-			for (int j = 0; j < nr && j < CF_MAX_EYE_POINTS && i + 1 < k; j++, i += 2)
-				f->right_eye[j] = (cf_pt){(float)v[i], (float)v[i + 1]};
+			if (nr < 0)
+				nr = 0;
+			for (int j = 0; j < nr && j < CF_MAX_EYE_POINTS && i + 2 * j + 1 < k; j++)
+				f->right_eye[j] = (cf_pt){(float)v[i + 2 * j], (float)v[i + 2 * j + 1]};
 			f->right_count = nr < CF_MAX_EYE_POINTS ? nr : CF_MAX_EYE_POINTS;
+			i += 2 * nr;
+		}
+		/* Head measures (newer CSVs): used by the head-turn fade instead of Vision's angles. */
+		if (i + 4 < k && v[i] > 0.5) {
+			f->has_head_geom = 1;
+			f->head = (cf_head){(float)v[i + 1], (float)v[i + 2], (float)v[i + 3], (float)v[i + 4]};
 		}
 		n++;
 	}
@@ -133,6 +150,7 @@ int main(int argc, char **argv)
 	const char *outp = NULL;
 	float cal[5] = {0, 0, 0, 0, 0}; /* baseline, baseline_open, notes_offset, notes_side, notes_open */
 	int have_cal = 0;
+	cf_head_ref head = {0, 0, 0, 0, 0};
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "--lag") && i + 1 < argc)
 			lag = atoi(argv[++i]);
@@ -154,6 +172,14 @@ int main(int argc, char **argv)
 			cal[3] = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "--notes-open") && i + 1 < argc)
 			cal[4] = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--head-side") && i + 1 < argc)
+			head.side = (float)atof(argv[++i]), head.ok = 1;
+		else if (!strcmp(argv[i], "--head-vert") && i + 1 < argc)
+			head.vert = (float)atof(argv[++i]), head.ok = 1;
+		else if (!strcmp(argv[i], "--head-eyes") && i + 1 < argc)
+			head.eyes = (float)atof(argv[++i]), head.ok = 1;
+		else if (!strcmp(argv[i], "--head-tilt") && i + 1 < argc)
+			head.tilt = (float)atof(argv[++i]), head.ok = 1;
 	}
 	row_t *rows;
 	const int n = parse(argv[1], &rows);
@@ -163,7 +189,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Calibrate exactly like the buttons do, on the given time ranges. */
-	cf_gaze_params p = {.strength = strength, .max_glance = 0.15f};
+	cf_gaze_params p = {.strength = strength, .max_glance = 0.15f, .head_ref = head};
 	/* Calibration as saved in the filter's settings (OBS scene JSON), if given. */
 	if (have_cal & 1) {
 		p.baseline = cal[0];
@@ -194,7 +220,10 @@ int main(int argc, char **argv)
 		if (got > 0 && step == 0) {
 			p.baseline = res.offset;
 			p.baseline_open = res.openness;
-			printf("lens calibration: baseline %.4f open %.4f\n", res.offset, res.openness);
+			p.head_ref = res.head;
+			printf("lens calibration: baseline %.4f open %.4f; head %s: side %.4f vert %.4f eyes %.4f tilt %.4f\n",
+			       res.offset, res.openness, res.head.ok ? "learnt" : "not learnt", res.head.side, res.head.vert,
+			       res.head.eyes, res.head.tilt);
 		} else if (got > 0) {
 			p.has_notes = 1;
 			p.notes_offset = res.offset;

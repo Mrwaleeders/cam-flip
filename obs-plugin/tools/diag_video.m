@@ -7,7 +7,9 @@
  * Columns: frame, t (s), ms (tracking time), found, full (1 = full face detection, 0 = tracked),
  * conf (Vision landmark confidence), yaw, pitch (deg), face_w (px), image w, h,
  * Vision pupils (lx, ly, rx, ry), refined pupils (lx, ly, rx, ry), then the left eye outline
- * (count, x0, y0, ...) and the right eye outline (count, x0, y0, ...). Pixels, origin top left.
+ * (count, x0, y0, ...) and the right eye outline (count, x0, y0, ...), then the head measures from
+ * the landmarks (pose.c): head (1 = measured), side, vert, eyes, tilt. Pixels, origin top left.
+ * yaw and pitch are Apple Vision's own angles (coarse; the plugin's fade uses the head measures).
  *
  * The CSV holds only numbers (no image data). tools/diag.sh builds and runs this on a Mac.
  */
@@ -56,7 +58,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		fprintf(csv, "frame,t,ms,found,full,conf,yaw,pitch,face_w,w,h,vlx,vly,vrx,vry,lx,ly,rx,ry,"
-			     "nl,left...,nr,right...\n");
+			     "nl,left...,nr,right...,head,side,vert,eyes,tilt\n");
 
 		grey_frame g;
 		memset(&g, 0, sizeof(g));
@@ -102,6 +104,8 @@ int main(int argc, char **argv)
 			fprintf(csv, ",%d", face.right_count);
 			for (int i = 0; i < face.right_count; i++)
 				fprintf(csv, ",%.3f,%.3f", face.right_eye[i].x, face.right_eye[i].y);
+			fprintf(csv, ",%d,%.5f,%.5f,%.5f,%.5f", face.has_head_geom, face.head.side, face.head.vert,
+				face.head.eyes, face.head.tilt);
 			fprintf(csv, "\n");
 			frame++;
 		}

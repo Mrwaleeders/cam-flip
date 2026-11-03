@@ -8,7 +8,7 @@ OBS_SRC="build/obs-studio-$OBS_VERSION"
 FW="$OBS_APP/Contents/Frameworks"
 clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -Wall -fobjc-arc \
   -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
-  tests/test_plugin.m src/gaze.c src/warp.c \
+  tests/test_plugin.m src/gaze.c src/warp.c src/pose.c \
   -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
   -o build/test_plugin
@@ -25,7 +25,7 @@ clang -arch "$(uname -m)" -mmacosx-version-min=13.0 \
 for tool in diag_video render_video; do
   clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -fobjc-arc -Wall -Werror \
     -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
-    "tools/$tool.m" src/gaze.c src/warp.c \
+    "tools/$tool.m" src/gaze.c src/warp.c src/pose.c \
     -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
     -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
     -framework AVFoundation -framework CoreMedia \

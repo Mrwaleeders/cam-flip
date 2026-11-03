@@ -41,7 +41,7 @@ clang -bundle -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -O2 -Wall -Wext
   -fobjc-arc -fvisibility=hidden \
   -I"$OBS_SRC/libobs" -I"$SIMDE_SRC" -Ibuild/include -Isrc \
   -DCAMFLIP_VERSION="\"$VERSION\"" \
-  src/plugin.m src/gaze.c src/warp.c \
+  src/plugin.m src/gaze.c src/warp.c src/pose.c \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
   -undefined dynamic_lookup \
   -o "$OUT/Contents/MacOS/cam-flip"

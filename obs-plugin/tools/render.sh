@@ -19,7 +19,7 @@ esac
 
 clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O2 -fobjc-arc \
   -I"build/obs-studio-$OBS_VERSION/libobs" -Ibuild/simde -Ibuild/include -Isrc \
-  tools/render_video.m src/gaze.c src/warp.c \
+  tools/render_video.m src/gaze.c src/warp.c src/pose.c \
   -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
   -framework AVFoundation -framework CoreMedia \
@@ -43,6 +43,9 @@ for p in glob.glob(os.path.expanduser("~/Library/Application Support/obs-studio/
                 if st.get("has_notes"):
                     out += ["--notes-offset", st.get("notes_offset", 0), "--notes-side", st.get("notes_side", 0),
                             "--notes-open", st.get("notes_open", 0)]
+                if st.get("head_ref"):  # the head looking into the camera (step 1); else a typical face
+                    out += ["--head-side", st.get("head_side", 0), "--head-vert", st.get("head_vert", 0),
+                            "--head-eyes", st.get("head_eyes", 0), "--head-tilt", st.get("head_tilt", 0)]
                 print(" ".join(str(x) for x in out))
                 raise SystemExit
 PY

@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 
+#include "pose.h"
 #include "warp.h"
 
 #ifdef __cplusplus
@@ -24,9 +25,7 @@ extern "C" {
 #define CF_CALIB_TIMEOUT_FRAMES 300 /* about 10 s at 30 fps */
 #define CF_CALIB_WARMUP_S 0.6        /* s: samples ignored after starting (eyes still on the button) */
 
-typedef struct {
-	float x, y; /* image pixels, origin top left */
-} cf_pt;
+/* cf_pt (image pixels, origin top left) is in pose.h. */
 
 typedef struct {
 	int found;
@@ -39,6 +38,11 @@ typedef struct {
 	 * movement. has_vision_pupils 0 = not given (then only the refined points are used). */
 	cf_pt left_pupil_vision, right_pupil_vision;
 	int has_vision_pupils;
+	/* Head pose measured from the landmarks on every frame (pose.c, cf_head_measure): used for the
+	 * head-turn fade whenever given. has_pose / yaw_deg / pitch_deg are the detector's own angles,
+	 * used only while there are no head measures. */
+	int has_head_geom;
+	cf_head head;
 	int has_pose;
 	float yaw_deg, pitch_deg;
 	float face_width; /* pixels */
@@ -54,6 +58,7 @@ typedef struct {
 	float notes_offset;  /* gaze offset when looking at the notes (notes calibration) */
 	float notes_side;    /* sideways gaze offset (eye widths) at the middle of the notes (notes calibration) */
 	float notes_open;    /* eye openness when looking at the notes (notes calibration); 0 = unknown */
+	cf_head_ref head_ref; /* the face looking into the lens (lens calibration); ok 0 = a typical face */
 } cf_gaze_params;
 
 /* A notes calibration is only usable when the notes are clearly below the lens: at least this many
@@ -71,6 +76,7 @@ typedef struct {
 	float offset;   /* median gaze offset while calibrating (same units as baseline) */
 	float openness; /* median eye openness while calibrating */
 	float side;     /* median sideways gaze offset while calibrating (eye widths, along the eye axis) */
+	cf_head_ref head; /* the head while calibrating (ok 0: too few frames with head measures) */
 } cf_calib_result;
 
 /* What the filter panel shows. */
@@ -202,6 +208,12 @@ typedef struct {
 	cf_pt axis;             /* smoothed eye axis (unit, from the left eye towards the right eye) */
 	cf_eye last_out[2];
 	int last_n;
+
+	/* Head pose (pose.c): the smoothed landmark measures, and the calibration's samples of them. */
+	cf_pose pose;
+	cf_head calib_head[64];
+	int calib_head_n;
+	cf_head_ref calib_head_result;
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);
