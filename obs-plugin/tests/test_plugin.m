@@ -559,7 +559,7 @@ static void run_face_tracking(struct camflip *f)
 	       bl.x, bl.y, br.x, br.y, el, er, pl, iod);
 	check(seen_big.found && seen_big.image_width == 2 * w && iod > 0 && el < 0.1f * iod && er < 0.1f * iod &&
 		      pl < 0.15f * iod,
-	      "frames wider than 1920 px are tracked at reduced size with full-resolution coordinates");
+	      "frames 2560 px and wider are tracked at reduced size with full-resolution coordinates");
 
 	free(pic);
 	free(moved);

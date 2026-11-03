@@ -54,7 +54,7 @@ typedef struct {
 /* A notes calibration is only usable when the notes are clearly below the lens: at least this many
  * eye widths of downward gaze (baseline - notes_offset). Smaller or reversed means the user wasn't
  * looking at notes under the camera (or the lens calibration is off). */
-#define CF_NOTES_MIN_GLANCE 0.02f
+#define CF_NOTES_MIN_GLANCE 0.01f
 
 /* 1 when a notes calibration at notes_offset is meaningfully below the lens baseline. */
 int cf_gaze_notes_valid(float baseline, float notes_offset);
@@ -117,6 +117,10 @@ typedef struct {
 	float down_noise;       /* typical frame-to-frame change of the raw glance (eye widths): landmark noise */
 	float last_down_raw;
 	int have_down_raw;
+	int released;           /* a "closing" hold was just released as a glance: undone if a blink follows */
+	double released_t;
+	double released_down;   /* g->down and g->far_fade from before that release */
+	float released_far;
 	enum cf_calib_target calib_target;
 	float calib_open[64];
 	float calib_side[64];

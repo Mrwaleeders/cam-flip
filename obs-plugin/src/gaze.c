@@ -47,7 +47,8 @@
 #define DOWN_HI_MAX 0.05f
 #define DOWN_CUTOFF 1.2       /* Hz: low-pass for noise-sized vertical changes */
 #define GLANCE_PUPIL 0.02f    /* eye widths: lids dropping with the pupil moving down this much = a glance */
-#define LID_GATE 0.8f         /* lid cue only once the pupil already reads this fraction of the limit */
+#define GLANCE_MIN_R 0.6f     /* ... but only while the lids are still this open (relative): lower is a blink */
+#define LID_GATE 1.05f        /* lid cue only once the pupil already reads past the limit (x this) */
 
 /* ---- One Euro filter (Casiez et al.): adaptive low-pass, little jitter and little lag. */
 
@@ -489,13 +490,32 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	g->last_rel_open = r;
 	g->have_rel_open = 1;
 	const float down_raw = p->baseline - offset;
+	const int was_blink = g->blink;
 	update_blink(g, r, rate, t);
 	/* Lids dropping fast while the pupil drops with them is a glance down (the upper lid follows the
 	 * eye), not a blink: a blink leaves the pupil where it was or loses it upwards. Holding the glance
-	 * at its old value here showed the whole glance for a frame and then slid the correction in. */
-	if (g->closing && !g->blink && g->down.ready && down_raw - (float)g->down.value > GLANCE_PUPIL)
+	 * at its old value here showed the whole glance for a frame and then slid the correction in.
+	 * Only while the lids are still fairly open: as they close, Vision's pupil point slides down with
+	 * the upper lid, which looked like a glance. */
+	if (g->closing && !g->blink && g->down.ready && r > GLANCE_MIN_R &&
+	    down_raw - (float)g->down.value > GLANCE_PUPIL) {
 		g->closing = 0;
+		g->released = 1;
+		g->released_t = t;
+		g->released_down = g->down.value;
+		g->released_far = g->far_fade;
+	}
+	/* ...and if the lids then shut after all, it was a blink: undo what that frame changed, so the
+	 * held correction is the one from before the blink. */
+	if (g->blink && !was_blink && g->released && t - g->released_t <= CLOSING_MAX) {
+		g->down.value = g->released_down;
+		g->far_fade = g->released_far;
+	}
+	if (g->released && (g->blink || t - g->released_t > CLOSING_MAX))
+		g->released = 0;
 	const int hold = holding(g, t);
+	/* Lids steady enough to read a far glance from: not shut, not in the middle of closing. */
+	const int lids_steady = !g->blink && !g->closing && rate < CLOSING_RATE;
 	/* Landmark noise: mean frame-to-frame change of the raw glance while the lids are steady. Clipped
 	 * so the occasional real saccade barely moves it. */
 	if (!hold && g->have_down_raw) {
@@ -615,7 +635,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * known, so lids lowered by a smile or a squint while reading don't count, and gated well above
 	 * the notes, so reading itself never triggers it. */
 	float far = (float)down;
-	if (!hold && far > LID_GATE * limit) {
+	if (lids_steady && far > LID_GATE * limit) {
 		float lid_glance;
 		if (notes && p->notes_open > 0)
 			lid_glance = notes_glance + LID_GLANCE_K * (p->notes_open - openness) / fmaxf(ref, 0.05f);
@@ -630,9 +650,10 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float f_side = 1.0f - smoothstepf(SIDE_FADE_LO, SIDE_FADE_HI, fabsf(side_dev));
 	/* Far fade is applied directly, like the sideways fade: easing it made the eyes slide up for
 	 * ~0.7 s after landing back on the notes from the keyboard, and slide down on the way out. Held
-	 * through blinks (the lid cue is meaningless with the lids shut). The visible position
-	 * (glance x (1 - f_far)) only ever moves the same way as the real gaze. */
-	if (!hold)
+	 * while the lids are shut or closing (the lid cue is meaningless then), recomputed as soon as they
+	 * are open again (also during the settle time after a blink, from the fresh lids). The visible
+	 * position (glance x (1 - f_far)) only ever moves the same way as the real gaze. */
+	if (!g->blink && !g->closing)
 		g->far_fade = 1.0f - smoothstepf(limit, limit + band, far);
 	const float f_far = g->far_fade;
 	float f_size = smoothstepf(0.05f, 0.09f, face->face_width / fmaxf((float)face->image_width, 1.0f));

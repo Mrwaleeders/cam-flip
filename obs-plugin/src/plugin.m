@@ -8,7 +8,7 @@
  *     gaze model where the eyes are *now* (cf_gaze_predict), warps the eyes and mirrors. It never
  *     waits for face tracking, so the filter adds no delay and never stalls OBS.
  *   - Tracking thread (one per filter): runs Apple Vision on the newest copied frame (older
- *     frames are dropped, never queued; frames wider than 1920 px are shrunk first), refines the
+ *     frames are dropped, never queued; frames 2560 px and wider are shrunk first), refines the
  *     pupils on the full-resolution copy and feeds cf_gaze_update().
  *   The gaze model is shared by both and guarded by `gaze_lock`; everything else that both
  *   threads touch is guarded by `lock`. The two locks are never held together.
@@ -79,9 +79,10 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define REFRESH_NS 1000000000ull     /* settings panel status refresh, at most this often */
 #define CALIB_STALL_NS 12000000000ull /* calibration gives up after this long without camera frames */
 
-/* Vision runs on frames up to this wide at full size (the pupil needs the detail). Wider frames
- * (1440p, 4K) are shrunk by a whole factor first: Vision's time grows with the pixel count. */
-#define VISION_MAX_W 1920
+/* Vision runs on frames up to twice this wide at full size (the pupil needs the detail). Wider
+ * frames (1440p, 4K) are shrunk by the whole factor that keeps them at least this wide: Vision's
+ * time grows with the pixel count. 2048 px stays full size; 2560 -> 1280, 3840 -> 1280. */
+#define VISION_MIN_W 1280
 
 static uint64_t now_ns(void)
 {
@@ -126,6 +127,7 @@ struct camflip {
 	int calib_failed;  /* CALIB_IDLE or the step that gave up */
 	bool calib_notes_bad; /* last notes calibration was not below the camera: rejected */
 	bool calib_no_frames; /* last calibration gave up: no camera frames arrived */
+	bool frames_flipped;  /* the camera sends upside-down frames (frame->flip): not tracked */
 	bool calib_cancel;    /* worker: drop the calibration the gaze model may still be running */
 	uint64_t calib_progress_ns; /* when the calibration was requested or last got a frame */
 	const char *calib_done_msg;
@@ -170,7 +172,7 @@ struct camflip {
 	void *handler;   /* VNSequenceRequestHandler, retained */
 	void *request;   /* VNDetectFaceLandmarksRequest, retained */
 	void *last_face; /* VNFaceObservation to track from on the next frame, retained, or NULL */
-	grey_frame small; /* shrunk copy for Vision, for frames wider than VISION_MAX_W */
+	grey_frame small; /* shrunk copy for Vision, for frames at least 2 x VISION_MIN_W wide */
 	uint8_t *bgra;
 	size_t bgra_size;
 	bool vision_needs_bgra;
@@ -288,11 +290,16 @@ static bool calib_stall_check_locked(struct camflip *f, uint64_t now)
 	return true;
 }
 
-static void log_calib_stalled(void)
+static void log_calib_stalled(bool flipped)
 {
-	blog(LOG_WARNING, "[cam-flip] calibration didn't finish: no camera frames for %d s. Make sure the camera "
-			  "is on and try again",
-	     (int)(CALIB_STALL_NS / 1000000000ull));
+	if (flipped)
+		blog(LOG_WARNING, "[cam-flip] calibration didn't finish: the camera sends upside-down (flipped) "
+				  "frames, which eye contact can't track yet");
+	else
+		blog(LOG_WARNING,
+		     "[cam-flip] calibration didn't finish: no camera frames for %d s. Make sure the camera "
+		     "is on and try again",
+		     (int)(CALIB_STALL_NS / 1000000000ull));
 }
 
 /* ------------------------------------------------- settings written from other threads */
@@ -477,17 +484,17 @@ static VNFaceObservation *vision_pass(struct camflip *f, CVPixelBufferRef pb, VN
 }
 
 /*
- * The image Vision analyses: the frame itself, or for frames wider than VISION_MAX_W a copy
- * shrunk by a whole factor (box filter: each output pixel is the mean of a scale x scale block).
+ * The image Vision analyses: the frame itself, or for frames at least 2 x VISION_MIN_W wide a copy
+ * shrunk by a whole factor (as large as possible while staying at least VISION_MIN_W wide) (box filter: each output pixel is the mean of a scale x scale block).
  * Pixel x of the copy covers full-resolution pixels [x * scale, (x + 1) * scale), so Vision's
  * normalised coordinates map back to full resolution with an image size of (w * scale, h * scale).
  */
 static const grey_frame *vision_input(struct camflip *f, const grey_frame *g, int *scale)
 {
 	*scale = 1;
-	if (g->w <= VISION_MAX_W)
+	const int k = g->w / VISION_MIN_W;
+	if (k <= 1)
 		return g;
-	const int k = (g->w + VISION_MAX_W - 1) / VISION_MAX_W;
 	const int sw = g->w / k, sh = g->h / k;
 	if (sh < 1 || !ensure(&f->small.data, &f->small.cap, (size_t)sw * sh))
 		return g;
@@ -853,11 +860,12 @@ static void *worker_main(void *data)
 			/* A calibration is waiting for frames: check once a second that they still come. */
 			if (calib_stall_check_locked(f, now_ns())) {
 				f->calib_cancel = false;
+				const bool flipped = f->frames_flipped;
 				pthread_mutex_unlock(&f->lock);
 				pthread_mutex_lock(&f->gaze_lock);
 				cf_gaze_init(&f->gaze); /* drop the half-done calibration */
 				pthread_mutex_unlock(&f->gaze_lock);
-				log_calib_stalled();
+				log_calib_stalled(flipped);
 				queue_ui(f, NULL); /* show it in an open panel */
 				pthread_mutex_lock(&f->lock);
 				continue;
@@ -1268,12 +1276,12 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 	const bool notes = f->has_notes && !f->notes_stale, notes_stale = f->notes_stale;
 	const bool recalib = f->needs_recalib;
 	const int running = f->calib_running, failed = f->calib_failed;
-	const bool notes_bad = f->calib_notes_bad, no_frames = f->calib_no_frames;
+	const bool notes_bad = f->calib_notes_bad, no_frames = f->calib_no_frames, flipped = f->frames_flipped;
 	const char *done = f->calib_done_msg;
 	const double vms = f->ema_vision_ms, fps = f->ema_fps, wms = f->ema_warp_ms;
 	pthread_mutex_unlock(&f->lock);
 	if (stalled)
-		log_calib_stalled();
+		log_calib_stalled(flipped);
 
 	char calib[200], track[160], speed[200];
 	*warn = false;
@@ -1281,7 +1289,12 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 		snprintf(calib, sizeof(calib), "Calibrating: keep looking into the camera…");
 	else if (running == CALIB_NOTES)
 		snprintf(calib, sizeof(calib), "Calibrating: keep looking at the middle of your notes…");
-	else if (no_frames) {
+	else if (no_frames && flipped) {
+		*warn = true;
+		snprintf(calib, sizeof(calib),
+			 "Calibration didn't finish: this camera sends upside-down (flipped) frames, which eye "
+			 "contact can't track yet.");
+	} else if (no_frames) {
 		*warn = true;
 		snprintf(calib, sizeof(calib),
 			 "Calibration didn't finish: no camera frames. Make sure the camera is on and try again.");
@@ -1308,6 +1321,9 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 
 	if (!eye_contact)
 		snprintf(track, sizeof(track), "Eye contact is off.");
+	else if (flipped)
+		snprintf(track, sizeof(track),
+			 "Eye contact can't run: this camera sends upside-down (flipped) frames. Mirroring still works.");
 	else if (!face)
 		snprintf(track, sizeof(track), "No face found. Light your face and look towards the camera.");
 	else
@@ -1409,6 +1425,7 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 	const bool show_eyes = f->show_eyes;
 	const bool calibrating = f->calib_request != 0 || f->calib_running != 0;
 	const cf_gaze_params params = params_locked(f);
+	f->frames_flipped = frame->flip; /* such frames aren't tracked (below): the panel says why */
 	pthread_mutex_unlock(&f->lock);
 
 	const enum cf_format fmt = to_cf_format(frame->format);

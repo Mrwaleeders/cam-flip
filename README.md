@@ -20,7 +20,7 @@ Teams, Zoom and Meet mirror only your **own preview**. They always send the unfl
   * When you blink, the correction is held steady through the blink, so your eyes don't flicker. If your eyes stay closed for longer, it fades out.
   * Automated tests check these behaviours on every build. See `obs-plugin/tests/test_gaze.c`.
 * **Image quality:**
-  * Cam Flip works on the camera's frames in their native format (NV12, UYVY, BGRA and others). It never converts, scales or compresses them. (For cameras wider than 1920 pixels, face tracking looks at a reduced-size copy to stay fast. The pupils are still located on the full-size frame, and the video itself is never scaled.)
+  * Cam Flip works on the camera's frames in their native format (NV12, UYVY, BGRA and others). It never converts, scales or compresses them. (For cameras 2560 pixels wide or more, face tracking looks at a reduced-size copy to stay fast. The pupils are still located on the full-size frame, and the video itself is never scaled.)
   * Pixels outside your eyes are not touched at all. The tests check this byte for byte.
 * **Delay:** Cam Flip adds no frame of delay. Eye tracking runs in the background on its own thread, always on the newest frame. Each frame is corrected as it passes through, using where your eyes are predicted to be at that moment, which takes well under a millisecond. So OBS never waits for face tracking. OBS's virtual camera adds roughly 15–20 ms with the settings below.
   * OBS's log (Help › Log Files) shows the real numbers every 10 seconds, for example `[cam-flip] tracking 6.1 ms avg (30 fps analysed, 10 full face detections), warp 0.20 ms`.
@@ -86,7 +86,7 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 | Show tracked eyes (for tuning) | While a glance is being corrected, draws thin outlines exactly where the correction is applied in that frame: a white ellipse for the area that may change, and black for the eye opening your iris is moved inside. Nothing is drawn while you look into the camera. Turn it off before a call. |
 | Defaults | Resets everything, including calibration. |
 
-**Hotkey:** to switch eye contact on and off during a call, set a key in **OBS › Settings › Hotkeys**. Look for **Cam Flip: toggle eye contact** under your camera's name. If a camera has more than one Cam Flip filter, each one has its own hotkey, named after the filter, for example **Cam Flip: toggle eye contact (Cam Flip 2)**. Renaming a filter keeps its key.
+**Hotkey:** to switch eye contact on and off during a call, set a key in **OBS › Settings › Hotkeys**. Look for **Cam Flip: toggle eye contact** under your camera's name. If a camera has more than one Cam Flip filter, each one has its own hotkey, named after the filter, for example **Cam Flip: toggle eye contact (Cam Flip (mirror + eye contact) 2)** for a second filter OBS named “Cam Flip (mirror + eye contact) 2”. Renaming a filter keeps its key.
 
 ## Troubleshooting
 
