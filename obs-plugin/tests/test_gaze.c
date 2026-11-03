@@ -723,7 +723,7 @@ static void real_look_away(const real_noise *rn, real_gaze away, unsigned seed, 
 
 #include "test_pose.c"
 
-/* ---- Head and lids (checks 32-40)
+/* ---- Head and lids (checks H1-H9)
  *
  * The user's case: a MacBook camera at 0.5-0.7 m, eyes ~75 px wide and ~23 px open, notes 5-15 cm under the
  * camera. Reading, the eyes move only ~1.5 px against their corners, the head tilts down ~6 deg (up to
@@ -856,7 +856,7 @@ static void test_head_lids(void)
 	cf_eye out[2];
 	const double dt = 1.0 / 30.0;
 
-	/* 32. Step 1 learns the lids: upper above and lower below the corner line, eye widths. */
+	/* H1. Step 1 learns the lids: upper above and lower below the corner line, eye widths. */
 	CHECK(fabsf(lens.upper - 0.5f * HH / HW) < 0.003f && fabsf(lens.lower - 0.5f * HH / HW) < 0.003f && lens.head.ok,
 	      "lens calibration: lids %.4f / %.4f (expected %.4f), head %d", lens.upper, lens.lower, 0.5f * HH / HW,
 	      lens.head.ok);
@@ -865,7 +865,7 @@ static void test_head_lids(void)
 	printf("ok: step 1 learns the lids (upper %.4f, lower %.4f eye widths), step 2 the notes at %.4f\n", lens.upper,
 	       lens.lower, p.baseline - p.notes_offset);
 
-	/* 33. Reading with the head tilted down 0-10 deg: the iris is lifted by the eyes' drop plus
+	/* H2. Reading with the head tilted down 0-10 deg: the iris is lifted by the eyes' drop plus
 	 * EYE_K sin(tilt) (the tilt as measured), the upper lid by LID_SHIFT of that plus what is left of its
 	 * drop, the lower lid by its rise: the opening is restored to the lens one within 20%. */
 	const float pitches[5] = {0, 3, 6, 10, 15};
@@ -910,7 +910,7 @@ static void test_head_lids(void)
 	}
 	printf("ok: head tilt and lids: the iris is lifted by the eyes' drop plus 0.41 sin(tilt), the opening restored\n");
 
-	/* 34. The head tilted down while the eyes look into the lens (the eyes then turn up in the head by just
+	/* H3. The head tilted down while the eyes look into the lens (the eyes then turn up in the head by just
 	 * as much): nothing to correct. And without a lens calibration of the head (a typical face, whose
 	 * tilt is not measured) the head adds nothing. */
 	{
@@ -951,7 +951,7 @@ static void test_head_lids(void)
 	cf_gaze g2;
 	cf_eye out2[2];
 
-	/* 35. Smooth: lens -> notes (saccade) with the head following down to 8 deg and the lids narrowing over
+	/* H4. Smooth: lens -> notes (saccade) with the head following down to 8 deg and the lids narrowing over
 	 * 0.3 s; reading lines (the eyes sweep sideways, then a return saccade) with the head nodding; back to
 	 * the lens, the head following up while the eyes hold the lens (turning down in the head as it comes up,
 	 * which the gate takes in steps: glide_catch_up()). What the head and lid terms add (against the twin)
@@ -1038,7 +1038,7 @@ static void test_head_lids(void)
 	}
 	printf("ok: head and lid terms ease in and out (no step over 0.3 px outside saccades)\n");
 
-	/* 36. Letting go still works. To the keyboard with the head (eyes far down, head 25 deg, lids
+	/* H5. Letting go still works. To the keyboard with the head (eyes far down, head 25 deg, lids
 	 * dropping): the correction fades out. The head alone tilted far down (35 deg): the pitch fade lets go.
 	 * Either way the head's share of the eyes as the viewer sees them (its tilt, less what the head and lid
 	 * terms add to the lift, against the twin) only ever moves down with the head, never back up against it.
@@ -1099,7 +1099,7 @@ static void test_head_lids(void)
 		printf("ok: keyboard and far head tilts still let go, reading with the head down is kept\n");
 	}
 
-	/* 37. A blink while reading with the head down holds the head and lid terms: what they add to the iris and
+	/* H6. A blink while reading with the head down holds the head and lid terms: what they add to the iris and
 	 * to either lid (against the twin) stays within 0.15 px through the blink and after it. (The whole
 	 * output, the glance's own hold included, is printed.) */
 	{
@@ -1137,7 +1137,7 @@ static void test_head_lids(void)
 		printf("ok: a blink holds the head and lid terms too\n");
 	}
 
-	/* 38. Strength over 100%: the iris (and the upper lid that follows it) is lifted proportionally more,
+	/* H7. Strength over 100%: the iris (and the upper lid that follows it) is lifted proportionally more,
 	 * the lids are restored no further than the lens opening, and the warp's cap still holds. */
 	{
 		float iris[2], lid_x[2], low[2];
@@ -1180,7 +1180,7 @@ static void test_head_lids(void)
 		(void)lift6;
 	}
 
-	/* 39. The head turned while reading, the eyes turning back in the head to the notes: half of the turn is
+	/* H8. The head turned while reading, the eyes turning back in the head to the notes: half of the turn is
 	 * made up for sideways (the sideways damping acts on the eyes plus half the head). Eyes alone scanning
 	 * a line are damped exactly as before. */
 	{
@@ -1216,7 +1216,7 @@ static void test_head_lids(void)
 		printf("ok: half the head's turn is made up for sideways, the eyes' scanning damped as before\n");
 	}
 
-	/* 40. Real-camera noise while reading with the head down (eye landmarks 0.4 px; head landmarks 0.2 px,
+	/* H9. Real-camera noise while reading with the head down (eye landmarks 0.4 px; head landmarks 0.2 px,
 	 * and a noisier 0.6 px as test_pose.c's): what the head and lid terms add to the jitter of what the eyes
 	 * show (RMS frame-to-frame change of the iris and of both lids, and the iris' spread, against a twin run
 	 * without head and lid calibration). At 0.2 px it is a few hundredths of a pixel. The head term carries

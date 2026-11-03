@@ -1429,7 +1429,7 @@ static float med3f(float a, float b, float c)
  * turning against it to hold a spot show at once, so the lift would run ahead of the head and lag back.
  * These are the median of the pose's last three measures (a one-frame glitch never shows), through a One
  * Euro filter: smoothed harder than the pose's while the head is still, a frame or two behind it while it
- * moves. (Landmark noise still passes more than it does into the glance: see the report in test 40.) */
+ * moves. (Landmark noise still passes more than it does into the glance: see check H9 in tests/test_gaze.c.) */
 static void head_angles(cf_gaze *g, const cf_gaze_params *p, double t, float *yaw, float *pitch)
 {
 	const cf_pose *ps = &g->pose;
