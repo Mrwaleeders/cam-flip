@@ -8,7 +8,7 @@ OBS_SRC="build/obs-studio-$OBS_VERSION"
 FW="$OBS_APP/Contents/Frameworks"
 ls "$FW" | head -50
 clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -fobjc-arc \
-  -I"$OBS_SRC/libobs" -Ibuild/simde -Isrc \
+  -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
   tests/test_plugin.m src/gaze.c src/warp.c \
   -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \

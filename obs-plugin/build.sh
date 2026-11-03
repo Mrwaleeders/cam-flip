@@ -21,13 +21,24 @@ if [ ! -d "$SIMDE_SRC/simde" ]; then
   git clone -q --depth 1 --branch v0.8.2 https://github.com/simd-everywhere/simde.git "$SIMDE_SRC"
 fi
 
+# libobs/obs-config.h includes a header that OBS generates at build time; plugins only need stubs.
+mkdir -p build/include
+cat > build/include/obsconfig.h <<'CFG'
+#pragma once
+#define OBS_DATA_PATH "../../data"
+#define OBS_PLUGIN_PATH "../../obs-plugins"
+#define OBS_PLUGIN_DESTINATION "obs-plugins"
+#define OBS_RELEASE_CANDIDATE 0
+#define OBS_BETA 0
+CFG
+
 OUT="build/cam-flip.plugin"
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
 
 clang -bundle -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -O2 -Wall \
   -fobjc-arc -fvisibility=hidden \
-  -I"$OBS_SRC/libobs" -I"$SIMDE_SRC" -Isrc \
+  -I"$OBS_SRC/libobs" -I"$SIMDE_SRC" -Ibuild/include -Isrc \
   -DCAMFLIP_VERSION="\"$VERSION\"" \
   src/plugin.m src/gaze.c src/warp.c \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
