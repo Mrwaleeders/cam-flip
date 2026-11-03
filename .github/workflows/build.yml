@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project CamFlip.xcodeproj -scheme CamFlip -configuration Release \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build | tail -n 80
+
+      - name: Check app bundle layout
+        run: |
+          APP="build/Build/Products/Release/CamFlip.app"
+          ls -la "$APP/Contents/Library/SystemExtensions/"
+          test -d "$APP/Contents/Library/SystemExtensions/com.mrwaleeders.CamFlip.Extension.systemextension"
+          test -f "$APP/Contents/Resources/default.metallib"
+          /usr/libexec/PlistBuddy -c "Print :CMIOExtension" \
+            "$APP/Contents/Library/SystemExtensions/com.mrwaleeders.CamFlip.Extension.systemextension/Contents/Info.plist"
+
+      - name: GPU pipeline self-test
+        run: swift Tests/KernelSelfTest.swift "build/Build/Products/Release/CamFlip.app/Contents/Resources/default.metallib"

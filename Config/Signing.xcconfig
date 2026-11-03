@@ -1,0 +1,12 @@
+// Shared signing settings. Do not put your team ID here; put it in
+// Config/Local.xcconfig (git-ignored), for example:
+//
+//   DEVELOPMENT_TEAM = ABCDE12345
+//
+// Find your Team ID at https://developer.apple.com/account (Membership details).
+// Installing a camera extension needs a paid Apple Developer Program membership.
+
+CAMFLIP_BUNDLE_ID = com.mrwaleeders.CamFlip
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"
