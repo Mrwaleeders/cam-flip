@@ -72,6 +72,13 @@ static float shift_px(const cf_eye *e)
 	return sqrtf(e->sx * e->sx + e->sy * e->sy);
 }
 
+/* Is the model holding (blink, half blink, closing lids or settling)? Only what the status shows is
+ * public; this peeks at the state for the squint test. */
+static int holding_now(const cf_gaze *g, double t)
+{
+	return g->blink || g->closing || g->half || t < g->settle_until;
+}
+
 static int update(cf_gaze *g, cf_face f, const cf_gaze_params *p, double t, cf_eye out[2])
 {
 	return cf_gaze_update(g, &f, p, t, out);
@@ -791,14 +798,87 @@ int main(void)
 		CHECK(zero == 0 && lo > 0.95f * st, "blink with sliding pupil (notes %.2f, lids %.0f px): %d frames lost the "
 						     "correction, min %.2f of %.2f px",
 		      gl, h1, zero, lo, st);
-		/* The 11 px frame may over-correct by up to the 1 px slide (Vision's own reading). */
-		CHECK(hi < st + 1.0f, "blink with sliding pupil (notes %.2f, lids %.0f px): over-corrected to %.2f px (%.2f)",
+		CHECK(hi < 1.1f * st, "blink with sliding pupil (notes %.2f, lids %.0f px): over-corrected to %.2f px (%.2f)",
 		      gl, h1, hi, st);
 		CHECK(after_lo > st - 0.1f && after_hi < st + 0.1f,
 		      "after the blink the correction moved %.2f..%.2f px (steady %.2f): a snap", after_lo, after_hi, st);
 		printf("ok: blink with sliding pupil (notes %.2f, first lid frame %.0f px): correction %.2f..%.2f px of %.2f, "
 		       "%d frames lost\n",
 		       gl, h1, lo, hi, st, zero);
+	}
+
+	/* 19. Half blinks while reading: the lids close only to r 0.42 or 0.5 (just above the blink
+	 * threshold) and reopen, while Vision's pupil point slides 0, 1 or 2 px down with the lid. Reading
+	 * normally (lids 14 px) or smiling (lids 11 px). The correction must not drop (no frames of lost
+	 * correction, no snap back) and must not overshoot. */
+	{
+		const float gl = 0.04f, gpx = gl * 40.0f;
+		const cf_gaze_params ph = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		float worst_lo = 1e9f, worst_hi = 0;
+		for (int smile = 0; smile < 2; smile++)
+			for (int depth = 0; depth < 2; depth++)
+				for (int slide = 0; slide <= 2; slide++) {
+					const float base = smile ? 11.0f : 14.0f, dh = (depth ? 0.5f : 0.42f) * 16.0f;
+					const float lids[] = {0.5f * (base + dh), dh, dh, dh, dh, 0.5f * (base + dh)};
+					cf_gaze_init(&g);
+					const float st = settle(&g, face_px(960, 500, 0, gpx, base, 0, 0), &ph, &t, 60, out);
+					float lo = 1e9f, hi = 0;
+					for (int i = 0; i < 6 + 30; i++, t += dt) {
+						const float h = i < 6 ? lids[i] : base;
+						const float pd = gpx + (float)slide * (base - h) / (base - dh);
+						n = update(&g, face_px(960, 500, 0, pd, h, 0, 0), &ph, t, out);
+						const float s = n ? shift_px(&out[0]) : 0;
+						lo = fminf(lo, s);
+						hi = fmaxf(hi, s);
+					}
+					CHECK(lo > 0.9f * st && hi < 1.1f * st,
+					      "half blink to r %.2f (%s, %d px slide): correction %.2f..%.2f px (steady %.2f)",
+					      depth ? 0.5 : 0.42, smile ? "smiling" : "reading", slide, lo, hi, st);
+					worst_lo = fminf(worst_lo, lo / st);
+					worst_hi = fmaxf(worst_hi, hi / st);
+				}
+		printf("ok: half blinks (r 0.42/0.5, 0-2 px slide, smiling or not): correction %.0f%%..%.0f%% of steady\n",
+		       100 * worst_lo, 100 * worst_hi);
+
+		/* Sustained squint: lids drop quickly to r 0.55 and stay there for 2 s while reading. Held at
+		 * first (could be a half blink), then measured normally: still corrected, not stuck. */
+		cf_gaze_init(&g);
+		const float st = settle(&g, face_px(960, 500, 0, gpx, 14, 0, 0), &ph, &t, 60, out);
+		float lo = 1e9f, hi = 0;
+		int held = 0;
+		for (int i = 0; i < 60; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, gpx, i == 0 ? 11.4f : 8.8f, 0, 0), &ph, t, out);
+			const float s = n ? shift_px(&out[0]) : 0;
+			lo = fminf(lo, s);
+			hi = fmaxf(hi, s);
+			if (i == 59)
+				held = holding_now(&g, t);
+		}
+		CHECK(lo > 0.9f * st && hi < 1.1f * st && !held, "sustained squint: correction %.2f..%.2f (steady %.2f), held %d",
+		      lo, hi, st, held);
+		/* And once it has settled, a glance at the lens is followed (not frozen). */
+		float lens = 9;
+		for (int i = 0; i < 5; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, 0, 8.8f, 0, 0), &ph, t, out);
+			lens = n ? shift_px(&out[0]) : 0;
+		}
+		CHECK(lens < 0.3f, "after a long squint the gaze is frozen (%.2f px left at the lens)", lens);
+		printf("ok: sustained squint at r 0.55 for 2 s: correction %.2f..%.2f px of %.2f, then follows the gaze\n", lo,
+		       hi, st);
+
+		/* A keyboard glance that drops the lids deep (to r 0.44, like a half blink) is not held: the
+		 * pupil moves far more than a lid could drag it, so the correction lets go at once. */
+		cf_gaze_init(&g);
+		settle(&g, face_px(960, 500, 0, gpx, 14, 0, 0), &ph, &t, 60, out);
+		float kb = 0;
+		for (int i = 0; i < 15; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, 12.0f, 7.0f, 0, 0), &ph, t, out);
+			if (i >= 1)
+				kb = fmaxf(kb, n ? shift_px(&out[0]) : 0);
+		}
+		CHECK(kb < 0.2f, "keyboard glance with deep lids was held (%.2f px corrected after the first frame)", kb);
+		printf("ok: keyboard glance with the lids at r 0.44 is not held (%.2f px after the first frame)\n", kb);
 	}
 
 	/* 13. Iris refinement: finds a dark iris offset from Vision's guess, partly under the lower lid. */

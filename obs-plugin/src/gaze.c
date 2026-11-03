@@ -48,6 +48,19 @@
 #define DOWN_CUTOFF 1.2       /* Hz: low-pass for noise-sized vertical changes */
 #define GLANCE_PUPIL 0.02f    /* eye widths: lids dropping with the pupil moving down this much = a glance */
 #define GLANCE_MIN_R 0.6f     /* ... but only while the lids are still this open (relative): lower is a blink */
+#define GLANCE_BIG 0.06f      /* eye widths: a pupil drop this big (and at least the lid drop) is a glance even
+			       * with the lids half shut (keyboard): far more than a lid can drag the point */
+#define GLANCE_LID_RATIO 0.5f /* ... and only if the pupil fell at least this fraction of the lid drop: the
+			       * lid follows a glance about 1:1, a pupil point dragged by a closing lid moves less */
+#define HALF_ENTER 0.60f      /* relative openness: a quick drop below this is a half blink (held) ... */
+#define HALF_DROP 0.12f       /* ... when the lids just fell at least this much (recent peak minus now) */
+#define HALF_DECAY 1.2f       /* per second: how fast the recent peak forgets (slower drops, like a smile, never count) */
+#define HALF_EXIT 0.80f       /* reopened above this (or close to where they were before) ends it */
+#define HALF_MAX 0.50         /* s: lids that stay half shut this long are a squint: released, measured normally */
+#define HALF_STEP 0.06f       /* relative openness: a single-frame drop this big (below HALF_ENTER) starts one too */
+#define LID_NOISE_INIT 0.02f  /* mean frame-to-frame change of the relative openness assumed before measuring */
+#define LID_STEADY_STEP 0.05f /* relative openness per frame: lids moving more than this are not steady */
+#define LID_STEADY_TIME 0.10  /* s: the lid cue needs the lids steady this long */
 #define LID_GATE 1.05f        /* lid cue only once the pupil already reads past the limit (x this) */
 
 /* ---- One Euro filter (Casiez et al.): adaptive low-pass, little jitter and little lag. */
@@ -229,6 +242,7 @@ void cf_gaze_init(cf_gaze *g)
 	g->open_ref = DEFAULT_OPEN;
 	g->far_fade = 1.0f;
 	g->down_noise = DOWN_NOISE_INIT;
+	g->lid_noise = LID_NOISE_INIT;
 }
 
 int cf_gaze_notes_valid(float baseline, float notes_offset)
@@ -342,18 +356,53 @@ static float ease_factor(float factor, float target, double dt)
  * then they stay. So: below BLINK_ENTER = blink; dropping fast = hold until it's clear which
  * one it is; a drop that stops above BLINK_ENTER is released as a glance (or squint).
  */
-static void update_blink(cf_gaze *g, float r, float rate, double t)
+/* step: how much r fell since the last frame. The half-blink and steadiness thresholds widen with
+ * the measured lid noise, so noisy landmarks don't keep starting holds. */
+static void update_blink(cf_gaze *g, float r, float rate, float step, double t)
 {
+	/* Where the lids count as open again: HALF_EXIT, or a little under where they were before the
+	 * hold (lids lowered by a smile never get back to HALF_EXIT). */
+	if (!g->blink && !g->closing && !g->half)
+		g->open_r = g->r_peak;
+	const float reopen = fminf(HALF_EXIT, g->open_r - 0.08f);
 	if (g->blink) {
 		const double len = t - g->hold_start;
 		if (r > BLINK_EXIT || (r > BLINK_ENTER + 0.05f && fabsf(rate) < 1.0f && len > 0.1)) {
 			g->blink = 0;
+			if (r > reopen) {
+				g->settle_until = t + SETTLE_TIME;
+			} else { /* still half shut: the pupil point is still unreliable */
+				g->half = 1;
+				g->half_start = t;
+			}
+		}
+		return;
+	}
+	if (g->half) {
+		if (r < BLINK_ENTER) {
+			g->half = 0;
+			g->blink = 1;
+		} else if (r > reopen) {
+			g->half = 0;
 			g->settle_until = t + SETTLE_TIME;
+		} else if (t - g->half_start > HALF_MAX) {
+			g->half = 0; /* a squint, not a half blink: measure normally from here on */
 		}
 		return;
 	}
 	if (r < BLINK_ENTER) {
 		g->blink = 1;
+		if (!g->closing)
+			g->hold_start = t;
+		g->closing = 0;
+		return;
+	}
+	/* Half blink: the lids fell quickly to well below open but not shut. Vision's pupil point slides
+	 * with the upper lid, so it is held like a blink. */
+	if (r < HALF_ENTER && (g->closing || g->r_peak - r > fmaxf(HALF_DROP, 4.0f * g->lid_noise) ||
+			       step > fmaxf(HALF_STEP, 3.0f * g->lid_noise))) {
+		g->half = 1;
+		g->half_start = t;
 		if (!g->closing)
 			g->hold_start = t;
 		g->closing = 0;
@@ -372,7 +421,7 @@ static void update_blink(cf_gaze *g, float r, float rate, double t)
 
 static int holding(const cf_gaze *g, double t)
 {
-	return g->blink || g->closing || t < g->settle_until;
+	return g->blink || g->closing || g->half || t < g->settle_until;
 }
 
 /* ---- Output */
@@ -454,7 +503,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		g->tracking = 0;
 		g->have_rel_open = 0;
 		g->have_down_raw = 0;
-		g->blink = g->closing = 0;
+		g->blink = g->closing = g->half = 0;
 		/* The detector often misses a frame or two: hold the correction through that instead of
 		 * letting the eyes dip and climb back. Lost for longer: fade out. */
 		const int brief = g->have_geometry && g->cx[0].ready && t - g->cx[0].t < LOST_HOLD;
@@ -487,35 +536,50 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float ref = p->baseline_open > 0 ? p->baseline_open : g->open_ref;
 	const float r = openness / fmaxf(ref, 0.05f);
 	const float rate = g->have_rel_open ? (g->last_rel_open - r) / (float)dt : 0.0f;
+	if (!g->have_rel_open)
+		g->r_peak = r;
+	const float step = g->have_rel_open ? g->last_rel_open - r : 0.0f;
+	/* Lid noise, learned while nothing is held (blinks are not noise). */
+	if (g->have_rel_open && !holding(g, t))
+		g->lid_noise += (float)(1.0 - exp(-dt / DOWN_NOISE_TAU)) * (fminf(fabsf(step), 0.15f) - g->lid_noise);
 	g->last_rel_open = r;
 	g->have_rel_open = 1;
 	const float down_raw = p->baseline - offset;
-	const int was_blink = g->blink;
-	update_blink(g, r, rate, t);
+	const int was_held = g->blink || g->half;
+	update_blink(g, r, rate, step, t);
+	g->r_peak = fmaxf(r, g->r_peak - HALF_DECAY * (float)dt);
 	/* Lids dropping fast while the pupil drops with them is a glance down (the upper lid follows the
 	 * eye), not a blink: a blink leaves the pupil where it was or loses it upwards. Holding the glance
 	 * at its old value here showed the whole glance for a frame and then slid the correction in.
 	 * Only while the lids are still fairly open: as they close, Vision's pupil point slides down with
 	 * the upper lid, which looked like a glance. */
-	if (g->closing && !g->blink && g->down.ready && r > GLANCE_MIN_R &&
-	    down_raw - (float)g->down.value > GLANCE_PUPIL) {
-		g->closing = 0;
+	const float pupil_drop = g->down.ready ? down_raw - (float)g->down.value : 0.0f;
+	const float lid_drop = (g->open_r - r) * fmaxf(ref, 0.05f); /* eye widths */
+	const int glance = (r > GLANCE_MIN_R && pupil_drop > GLANCE_PUPIL && pupil_drop >= GLANCE_LID_RATIO * lid_drop) ||
+			   (pupil_drop > GLANCE_BIG && pupil_drop >= lid_drop);
+	if ((g->closing || g->half) && !g->blink && g->down.ready && glance) {
+		g->closing = g->half = 0;
+		g->r_peak = r; /* the lids are where the glance put them: not a fresh drop next frame */
 		g->released = 1;
 		g->released_t = t;
 		g->released_down = g->down.value;
 		g->released_far = g->far_fade;
 	}
-	/* ...and if the lids then shut after all, it was a blink: undo what that frame changed, so the
-	 * held correction is the one from before the blink. */
-	if (g->blink && !was_blink && g->released && t - g->released_t <= CLOSING_MAX) {
+	/* ...and if the lids then shut (or half shut) after all, it was a blink: undo what that frame
+	 * changed, so the held correction is the one from before the blink. */
+	const int held_now = g->blink || g->half;
+	if (held_now && !was_held && g->released && t - g->released_t <= CLOSING_MAX) {
 		g->down.value = g->released_down;
 		g->far_fade = g->released_far;
 	}
-	if (g->released && (g->blink || t - g->released_t > CLOSING_MAX))
+	if (g->released && (held_now || t - g->released_t > CLOSING_MAX))
 		g->released = 0;
 	const int hold = holding(g, t);
-	/* Lids steady enough to read a far glance from: not shut, not in the middle of closing. */
-	const int lids_steady = !g->blink && !g->closing && rate < CLOSING_RATE;
+	/* Lids steady enough to read a far glance from: not shut, half shut or moving, and settled for
+	 * LID_STEADY_TIME (half-shut lids that just stopped falling still have the pupil point slid). */
+	if (held_now || g->closing || fabsf(step) > fmaxf(LID_STEADY_STEP, 3.0f * g->lid_noise))
+		g->lid_move_t = t;
+	const int lids_steady = t - g->lid_move_t >= LID_STEADY_TIME;
 	/* Landmark noise: mean frame-to-frame change of the raw glance while the lids are steady. Clipped
 	 * so the occasional real saccade barely moves it. */
 	if (!hold && g->have_down_raw) {
@@ -609,7 +673,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	} else {
 		down = g->down.ready ? g->down.value : 0;
 		/* Only a real blink (lids shut), not a noise-triggered "closing" hold, may resync. */
-		g->was_holding |= g->blink;
+		g->was_holding |= g->blink || g->half;
 	}
 
 	/* Sideways position for reading damping. Eyes move in saccades: a return sweep jumps a
@@ -653,7 +717,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * while the lids are shut or closing (the lid cue is meaningless then), recomputed as soon as they
 	 * are open again (also during the settle time after a blink, from the fresh lids). The visible
 	 * position (glance x (1 - f_far)) only ever moves the same way as the real gaze. */
-	if (!g->blink && !g->closing)
+	if (!g->blink && !g->closing && !g->half)
 		g->far_fade = 1.0f - smoothstepf(limit, limit + band, far);
 	const float f_far = g->far_fade;
 	float f_size = smoothstepf(0.05f, 0.09f, face->face_width / fmaxf((float)face->image_width, 1.0f));

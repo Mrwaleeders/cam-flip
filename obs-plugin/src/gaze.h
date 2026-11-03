@@ -107,6 +107,13 @@ typedef struct {
 	int have_rel_open;
 	int blink;              /* lids closed: correction and geometry are held */
 	int closing;            /* lids dropping fast: held until it is clear whether it is a blink */
+	int half;               /* half blink: lids dropped quickly well below open but not shut. Held like a
+				 * blink until they reopen, or released after HALF_MAX (a squint) */
+	double half_start;
+	float r_peak;           /* recent highest relative openness (decays): how far the lids just dropped */
+	float open_r;           /* relative openness before the current hold: where "reopened" is */
+	float lid_noise;        /* mean frame-to-frame change of the relative openness while steady: landmark noise */
+	double lid_move_t;      /* last time the lids moved (or were held): the lid cue waits for them to settle */
 	double hold_start;      /* when the current blink/closing hold began */
 	double settle_until;    /* glance stays frozen until then, after a blink */
 	int face_found;
