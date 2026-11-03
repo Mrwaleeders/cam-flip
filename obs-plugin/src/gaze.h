@@ -54,11 +54,19 @@ typedef struct {
 	float notes_offset;  /* gaze offset when looking at the notes (notes calibration) */
 	float notes_side;    /* sideways gaze offset (eye widths) at the middle of the notes (notes calibration) */
 	float notes_open;    /* eye openness when looking at the notes (notes calibration); 0 = unknown */
+
+	/* Vision's own pupil point at the two calibration steps (cf_calib_result.vis_offset of each), so the model
+	 * knows how much of a glance it shows (it under-reads glances, by a factor that differs per person and
+	 * camera). has_vis_calib: 1 when both are from calibrations (then has_notes must be set too). */
+	int has_vis_calib;
+	float vis_baseline; /* at the lens */
+	float vis_notes;    /* at the notes */
 } cf_gaze_params;
 
 /* A notes calibration is only usable when the notes are clearly below the lens: at least this many
  * eye widths of downward gaze (baseline - notes_offset). Smaller or reversed means the user wasn't
- * looking at notes under the camera (or the lens calibration is off). */
+ * looking at notes under the camera (or the lens calibration is off). Kept this low on purpose: notes
+ * 2-3 cm under the lens at arm's length are a real glance of about 0.02. */
 #define CF_NOTES_MIN_GLANCE 0.01f
 
 /* 1 when a notes calibration at notes_offset is meaningfully below the lens baseline. */
@@ -71,7 +79,34 @@ typedef struct {
 	float offset;   /* median gaze offset while calibrating (same units as baseline) */
 	float openness; /* median eye openness while calibrating */
 	float side;     /* median sideways gaze offset while calibrating (eye widths, along the eye axis) */
+
+	/* Vision's own pupil point while calibrating (cf_face.has_vision_pupils): has_vis 1 when it was given on
+	 * most frames, and its median offset (same units and direction as offset). Saved as the params'
+	 * vis_baseline / vis_notes. */
+	int has_vis;
+	float vis_offset;
+
+	/* How steady it was while calibrating: the samples' spread about the median of their half of the time
+	 * (a robust standard deviation, eye widths: what is left of the landmark noise, or the gaze moving
+	 * about), how far the second half's median moved from the first half's (the gaze moving on), and the
+	 * root-mean-square deviation of the openness from its median (the lids moving: a squint coming and
+	 * going). See cf_gaze_calib_hints(). */
+	float spread;
+	float drift;
+	float open_spread;
 } cf_calib_result;
+
+/* Hints about a finished calibration that was still taken (bit flags, 0 = looks fine), for the panel:
+ *  CF_CALIB_HINT_UNSTEADY: the gaze moved while calibrating (or the lids kept moving), so the result may be
+ *    off: redo that step, keeping still.
+ *  CF_CALIB_HINT_SMALL_GLANCE (notes): the notes read less than CF_NOTES_SMALL_GLANCE below the lens. Right
+ *    for notes just under the camera; otherwise the camera step was probably taken looking a little low
+ *    (at the screen instead of into the lens).
+ * baseline: the camera calibration the notes are measured from (unused for a camera result). */
+#define CF_CALIB_HINT_UNSTEADY 1
+#define CF_CALIB_HINT_SMALL_GLANCE 2
+#define CF_NOTES_SMALL_GLANCE 0.03f
+int cf_gaze_calib_hints(const cf_calib_result *res, float baseline);
 
 /* What the filter panel shows. */
 typedef struct {
@@ -97,8 +132,26 @@ typedef struct {
 	float v_gain;     /* refined change per Vision change (Vision's point is coarse: it under-reads) */
 	float v_gain_err; /* typical error of v_gain (log ratio), seen on the saccades it was learnt from */
 	int have_v;
-	float v_off;      /* the reading minus v_gain x Vision's, averaged since the last change taken ... */
+	double v_jump_t;  /* when Vision's reading last jumped (moved past its noise in one frame) */
+	float v_off;     /* the reading minus v_gain x Vision's, averaged since the last change taken ... */
 	int v_off_n;      /* ... over this many readings (0: none yet) */
+	float v_ref;      /* ... and Vision's reading, averaged over the same readings */
+	float v_res;      /* recent mean of the readings minus the offset, and of Vision's (see gate()) */
+	float v_fast;
+	/* A jump of Vision's point that the refined reading has not (yet) shown: not believed for VIS_PEND_TIME
+	 * (the fused reading stays where it was), then taken out of the offset unless the refined reading
+	 * followed it. */
+	int v_pend;       /* one is pending */
+	double v_pend_t;  /* when it jumped ... */
+	float v_pend_v0;  /* ... from where (Vision's reading) */
+	float v_pend_vs;  /* Vision's readings since (sum) ... */
+	float v_pend_rs;  /* ... and the refined ones, less where they were before it (sum, clamped) */
+	int v_pend_n;
+	/* Learning v_gain from a backed saccade, once its landing has been averaged: the refined and Vision
+	 * means before it (v_off + v_gain x v_ref, v_ref) ... */
+	int learn;
+	float learn_x, learn_v;
+	int learn_n;      /* ... (over this many readings) */
 	/* While outliers are about: up to two other levels the readings keep going to (as offsets from where
 	 * Vision's point says the gaze is, see vote()), and the share of readings at the accepted level and at
 	 * each, recently (w_) and over a longer memory (s_). */
@@ -116,23 +169,34 @@ typedef struct {
 	double jump_t;    /* the last change taken at once: when, ... */
 	float jump_from, jump_size; /* ... from where, and how big (to see it come straight back) */
 	int jump_weak;    /* ... and only both eyes moving alike backed it up (no Vision point, lids still) */
-	int settle;       /* readings since that change: the first few are averaged in quickly */
+	int jump_vis;     /* ... or Vision's point did: where it was before (jump_v0) and after (jump_v1), and the
+			   * gain before that jump taught it anything */
+	float jump_v0, jump_v1, jump_gain, jump_gain_err;
+	int settle;       /* readings averaged in since that change: the first few are averaged in quickly */
+	int land_n;       /* frames since that change: the first LANDING_FRAMES are still its landing */
+	int mid;          /* last frame's reading was a move short of a saccade that Vision's point backs (its sign) */
 	double out_t;     /* last time an outlier was seen (the measurement counts as clean a while after) */
 	double shown;     /* the value the output uses: the accepted one, smoothed and slew-limited (see slew()) */
 	double shown_x;   /* the accepted value it last followed */
 	int have_shown;
+	int gliding;      /* shown is gliding (an S-curve) from glide_from, started at glide_t0, to the accepted value */
+	double glide_from, glide_t0;
 } cf_robust;
 
 typedef struct {
 	cf_one_euro cx[2], cy[2], rx[2], ry[2], eye_h[2];
 	cf_one_euro down;
 	cf_one_euro roll;  /* head roll (angle of the eye axis), smoothed: sets g->up and g->axis */
-	float factor;      /* current, smoothed 0..1 (head turn, face size, and looking away all fade it) */
+	float factor;      /* current, smoothed 0..1 (head turn, face size and losing the face fade it) */
 	float factor_mid;  /* the first of its two easing stages */
 	/* The glance and sideways position the shift is made from: the live ones while the gaze is on the
-	 * notes, held while it is away, so a look-away fades out from where it left. */
+	 * notes; while it is away, no further than the edge of the band where the correction applies, and
+	 * never growing, so a look-away only ever lets go. */
 	float d_lock, side_lock;
 	int have_lock;
+	/* Looking away (past the notes, or sideways out of them): 0..1, how much of the correction applies. It
+	 * switches with a saccade (hidden by the eye's own jump), and eases like `factor` otherwise. */
+	float lock_f, lock_mid;
 	float last_target; /* for diagnostics */
 	cf_pt up;          /* smoothed face "up" direction */
 	double last_t;
@@ -164,10 +228,12 @@ typedef struct {
 	double lid_move_t;      /* last time the lids moved (or were held): the lid cue waits for them to settle */
 	double hold_start;      /* when the current blink/closing hold began */
 	double settle_until;    /* glance stays frozen until then, after a blink */
+	double reacq_until;     /* after a blink: a change taken before then is shown as a glide (see GLIDE_TIME) */
 	int face_found;
 	int tracking;           /* last update saw the face (prediction may extrapolate) */
 	cf_pt vel[2];           /* eye centre velocity (px/s) for prediction: quick to follow starts and stops */
-	int was_holding;        /* a real blink happened during the current hold: resync the glance after it */
+	int was_holding;        /* a real blink (2) or half blink (1) happened during the current hold: resync the
+				 * glance after it */
 	float far_fade;         /* 0..1, "looking far past the notes" fade, applied directly (not eased) */
 	float down_noise;       /* typical frame-to-frame change of the raw glance (eye widths): landmark noise */
 	float last_down_raw;
@@ -202,6 +268,18 @@ typedef struct {
 	cf_pt axis;             /* smoothed eye axis (unit, from the left eye towards the right eye) */
 	cf_eye last_out[2];
 	int last_n;
+
+	/* Vision's pupil point while calibrating, and the gain the calibrations gave (see cf_gaze_params). */
+	float calib_vis[64];
+	int calib_vis_count;
+	float calib_vis_result;
+	float vis_gain_cal; /* the calibrated gain v_gain was last set to (0: none) */
+	float calib_spread, calib_drift, calib_open_spread; /* see cf_calib_result */
+	float base_prev; /* the lens baseline the glance state is measured from (it moves with a new calibration) */
+	int have_base;
+	float d_live_prev, side_live_prev; /* last frame's live glance and sideways position (see d_lock) */
+	float noise_slow; /* down_noise's recent peak (forgotten over FAR_NOISE_TAU): sets where the far fade starts */
+	int reopen_fast;  /* the correction faded out with the eyes closed for long: it comes back in quickly */
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);

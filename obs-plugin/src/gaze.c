@@ -18,12 +18,25 @@
 /* ---- Tuning */
 
 #define DEFAULT_OPEN 0.30f    /* typical eye height / width, until calibrated or learned */
+#define FAR_MARGIN 0.04f      /* eye widths: the far fade starts at least this far past the calibrated notes ... */
+#define FAR_NOISE_K 5.0f      /* ... and this many times the landmark noise: a small notes calibration (notes just
+			       * under the lens, or a lens step taken looking a little low) must not switch the
+			       * correction off for reading a little lower, or for noise */
+#define FAR_NOISE_TAU 10.0    /* s: (that noise's recent peak, forgotten this slowly: the fade start holds still) */
+#define CALIB_OPEN_K 3.0f     /* calibration frames whose openness is off its median by this x its spread ... */
+#define CALIB_OPEN_MIN 0.02f  /* ... and by this at least (height / width) are left out */
+#define CALIB_DRIFT_MAX 0.02f /* eye widths: a calibration whose halves differ more than this is unsteady ... */
+#define CALIB_SPREAD_MAX 0.04f /* ... and so is one whose samples spread more than this ... */
+#define CALIB_OPEN_SPREAD_MAX 0.015f /* ... or whose openness does (RMS, height / width: 3x its landmark noise) */
 #define BLINK_ENTER 0.40f     /* relative openness (vs. open-eye) below which the lids count as closed */
 #define BLINK_EXIT 0.50f      /* ... and above which the blink is over (hysteresis) */
 #define CLOSING_RATE 5.0f     /* relative openness per second: lids dropping this fast may be a blink */
 #define CLOSING_MAX 0.15      /* s: lids that stop dropping above BLINK_ENTER are a glance or a squint */
 #define BLINK_HOLD_MAX 0.40   /* s: a "blink" longer than this is eyes closed: fade out */
-#define SETTLE_TIME 0.07      /* s: ignore the pupil this long after the lids reopen */
+#define SETTLE_TIME 0.07      /* s: ignore the pupil this long after the lids reopen ... */
+#define SETTLE_OPEN 0.85f     /* ... unless (or until) they are back this open (relative): measured from there */
+#define REACQ_TIME 0.25       /* s: after a blink, a change taken this soon is shown as a glide ... */
+#define GLIDE_TIME 0.15       /* ... over this long (an S-curve), never as a jump with the eyes open */
 #define LID_GLANCE_K 0.30f    /* eye widths of downward gaze per unit of lid drop (far-glance cue only) */
 #define LID_SHIFT 0.45f       /* upper lid follows the iris by this fraction (real lids track vertical gaze) */
 #define AMOUNT_MAX_RY 0.38f   /* vertical iris shift limit, fraction of ry (well inside the fold limit) */
@@ -33,6 +46,7 @@
 #define SIDE_FADE_HI 0.45f
 #define FADE_IN_TAU 0.15      /* s: per stage of the fade in (10-90% in ~0.5 s) ... */
 #define FADE_OUT_TAU 0.10     /* s: ... and out (~0.35 s): looking away, back, turning the head */
+#define REOPEN_FADE_TAU 0.04  /* s: per stage, back in after eyes closed for long (10-90% in ~0.13 s) */
 #define PREDICT_MAX_DT 0.10   /* s: never extrapolate further than this */
 #define VEL_TAU 0.05         /* s: smoothing of the velocity used for prediction */
 #define LOST_HOLD 0.20        /* s: a face missing for less than this (detector dropout) is held, not faded */
@@ -57,6 +71,8 @@
 			       * with the lids half shut (keyboard): far more than a lid can drag the point */
 #define GLANCE_LID_RATIO 0.5f /* ... and only if the pupil fell at least this fraction of the lid drop: the
 			       * lid follows a glance about 1:1, a pupil point dragged by a closing lid moves less */
+#define LID_VIS_RATIO 0.5f    /* ... and Vision's point at least this fraction of it (it under-reads a glance
+			       * by less than that; a lid drags it far less than the lid moves) */
 #define HALF_ENTER 0.60f      /* relative openness: a quick drop below this is a half blink (held) ... */
 #define HALF_DROP 0.12f       /* ... when the lids just fell at least this much (recent peak minus now) */
 #define HALF_DECAY 1.2f       /* per second: how fast the recent peak forgets (slower drops, like a smile, never count) */
@@ -85,18 +101,21 @@
 #define LR_MIN 0.025f         /* ... (clamped to these, eye widths) is an outlier in one eye: the other eye's */
 #define LR_MAX 0.07f          /* ... reading is used (the eyes move together, up/down and sideways) */
 #define LR_NOISE_INIT 0.012f
-#define VIS_FRAC 0.2f         /* Vision's own pupil point backs a change up when it moved the same way by this
-			       * fraction of it (it is coarse: it under-reads glances) ... */
+#define VIS_CONSIST 0.6f      /* Vision's own pupil point backs a saccade up when it moved the same way by this
+			       * fraction of what v_gain says it should (consistent in size; the gain taken as
+			       * up to twice its typical error larger) ... */
+#define VIS_FRAC_MIN 0.2f     /* ... and by this fraction of the change at least (coarse as it is, it never
+			       * under-reads a glance by 5x) ... */
 #define VIS_K 3.0f            /* ... and by more than this x its own frame-to-frame noise ... */
-#define VIS_K_SMALL 4.5f      /* ... (this x for a change short of a saccade, which noisy refined readings
-			       * reach now and then: both sensors' noise must not line up into a jump) ... */
 #define VIS_MIN 0.008f        /* ... and at least this (eye widths: 0.7 px on an 86 px eye) */
 #define VIS_NOISE_INIT 0.003f
 #define LIDC_FRAC 0.3f        /* (no Vision points) the upper lid backs up a vertical change when it moved with
 			       * it by this fraction of it ... */
 #define LIDC_K 3.0f           /* ... and by more than this x its noise */
 #define ANCHOR_TAU 0.3        /* s: between jumps, "where the backing-up sensors were" follows them this fast ... */
-#define ANCHOR_HOLD 1.0       /* ... and Vision's point this slowly while it is well away (it moved) */
+#define ANCHOR_HOLD 1.0       /* ... and Vision's point this slowly just after it jumped (by more than its noise
+			       * in a frame), VIS_HOLD long: the refined reading may show that a frame or two late */
+#define VIS_HOLD 0.15         /* s */
 #define CLEAN_TIME 1.5        /* s: the measurement counts as clean this long after the last outlier */
 #define PERSIST_LONG 5        /* frames an unbacked change must stay put while outliers are about */
 #define VOTE_FRAMES 24.0f     /* frames: memory of the vote between two levels (see gate()) ... */
@@ -105,14 +124,32 @@
 #define VIS_AGREE 0.35f       /* a refined reading this far (x the move) from where Vision's point says the
 			       * gaze went is not taken with the saccade: Vision's estimate is */
 #define LANDING_FRAMES 3      /* frames after a jump that still count as landing it */
+#define VIS_MID_K 1.5f        /* a move short of a saccade's size needs Vision's point to move this x its threshold */
 #define EYES_K 6.0f           /* (no Vision) both eyes back a change up only past this x the glance noise */
 #define VOTE_RATIO 1.3f       /* the other level wins with this many times the accepted level's share ... */
 #define VOTE_MIN 0.3f         /* ... and at least this share of the recent readings */
 #define VOTE_NEW 0.1f         /* a reading at neither level replaces an other level weaker than this */
-#define VIS_GAIN_INIT 1.5f    /* refined change per Vision change until learned ... */
-#define VIS_GAIN_ERR_INIT 0.3f /* ... and its typical (log) error until measured */
-#define VIS_OFF_TAU 2.0       /* s: memory of the refined-minus-Vision offset between changes (see gate()) */
+#define VIS_GAIN_INIT 2.0f    /* refined change per Vision change until calibrated or learned (seen: 1-3.3) ... */
+#define VIS_GAIN_ERR_INIT 0.6f /* ... and its typical (log) error until then: anything in that range */
+#define VIS_GAIN_ERR_CAL 0.08f /* ... and once calibrated (see use_vis_calib()) */
+#define VIS_GAIN_ERR_MIN 0.04f /* learning never makes it surer than this ... */
+#define VIS_GAIN_Q 0.002f     /* ... and each saccade learnt from leaves this much (log, squared) room to change */
+#define VIS_GAIN_MIN 0.5f
+#define VIS_GAIN_MAX 5.0f
+#define VIS_CAL_MIN 0.004f    /* eye widths: Vision's point must have moved this much between the calibrations ... */
+#define VIS_CAL_MIN_FRAC 0.1f /* ... and this fraction of the refined move, for a usable gain */
+#define LEARN_N 6             /* readings averaged in after a backed saccade before its size is learnt from ... */
+#define LEARN_MIN_HI 2.0f     /* ... if it moved this x the saccade size at least: a smaller one is only taken when
+			       * its reading overshot (noise past the saccade size), and would teach a gain too big */
+#define VIS_CAL_DR_ERR 0.004f /* eye widths: typical error of the refined move between the two calibrations */
+#define VIS_OFF_TAU 3.0       /* s: memory of the refined-minus-Vision offset between changes (see gate()) ... */
+#define VIS_RES_TAU 0.5       /* ... unless the readings' recent mean (over this) keeps off it ... */
+#define VIS_RES_K 3.0f        /* ... by this x its standard error: then it follows over VIS_RES_TAU */
+#define VIS_PEND_TIME 0.1     /* s: a jump of Vision's point alone waits this long for the refined reading */
+#define LR_TAU_OUT 10.0       /* s: the eyes disagreeing past the outlier threshold is learnt this slowly */
+#define FACE_GONE 1.0         /* s: the face missing this long: what Vision's point said before is stale */
 #define REVERT_TIME 0.15      /* s: a jump undone this soon was an outlier */
+#define VIS_REVERT_TIME 0.4   /* s: a jump Vision's point backed, undone by both sensors this soon, is undone at once */
 #define SLEW_PX 0.3f          /* px per 1/30 s: fastest the shown gaze moves without a backed-up saccade */
 #define SIDE_LO 0.02f         /* eye widths: sideways noise band (or 2x the noise, up to twice this) ... */
 #define SIDE_HI 0.06f         /* ... and saccade size (or twice the band) */
@@ -206,8 +243,11 @@ static float lr_combine(cf_robust *c, const cf_one_euro *f, float a, float b, in
 		}
 	}
 	if (learn) {
-		const float k = (float)(1.0 - exp(-dt / LR_TAU));
-		c->lr_bias += k * clampf(d, -thr, thr); /* an outlier moves it no more than noise would */
+		/* An outlier moves it no more than noise would, and far more slowly: one eye's point departing
+		 * from the other's (slipping) for seconds is not learnt as their usual difference, which would
+		 * then average the two again; the other eye stays the one used. */
+		const float k = (float)(1.0 - exp(-dt / LR_TAU)), k_out = (float)(1.0 - exp(-dt / LR_TAU_OUT));
+		c->lr_bias += (*outlier ? k_out : k) * clampf(d, -thr, thr);
 		if (!*outlier)
 			c->lr_noise += k * (fabsf(d) - c->lr_noise);
 	}
@@ -226,6 +266,7 @@ typedef struct {
 	float resync;           /* > 0 on the first frame after a blink: both eyes moving this much is enough */
 	float eyes_min;         /* both eyes moving alike back a change up only from this size (far past noise) */
 	float noise;            /* typical frame-to-frame change of the reading (landmark noise) */
+	int lid_drag;           /* a lid is dragging the pupil points this frame: nothing backs a change up */
 } gate_in;
 
 /* A new accepted level: no other levels yet, and the vote counts readings from now on (no head start:
@@ -355,12 +396,35 @@ static int vote(cf_robust *c, float x0, float acc, float u, const gate_in *in, f
 	return 1;
 }
 
+/* Vision's gain from one backed saccade: the refined reading moved dx (with variance var_dx) and Vision's dv.
+ * The measure is weighed by how sure it is against how sure the gain already is (a Kalman filter on its
+ * log): the first saccades teach an uncalibrated gain most of what they show, later ones (and a calibrated
+ * gain) only adjust it. One far off what the gain says, once that is known, is something else (a level the
+ * refiner flipped to, a lid) and teaches nothing. The offset and the other levels keep where they are
+ * (v: Vision's reading now). */
+static void learn_gain(cf_robust *c, float dx, float dv, float var_dx, float v)
+{
+	if (!(dx * dv > 0))
+		return;
+	const float r = logf(dx / (c->v_gain * dv)), var_r = var_dx / (dx * dx), pe = c->v_gain_err * c->v_gain_err;
+	if (!(r * r <= 9.0f * (pe + var_r)))
+		return;
+	const float kg = pe / (pe + var_r);
+	const float g1 = clampf(c->v_gain * expf(kg * r), VIS_GAIN_MIN, VIS_GAIN_MAX);
+	c->v_gain_err = fmaxf(sqrtf((1.0f - kg) * pe + VIS_GAIN_Q), VIS_GAIN_ERR_MIN);
+	c->v_off += (c->v_gain - g1) * c->v_ref;
+	for (int j = 0; j < 2; j++)
+		c->alt[j] += (c->v_gain - g1) * v;
+	c->v_gain = g1;
+}
+
 /*
  * Moves the accepted value f->value towards this frame's combined reading m. Changes inside the noise
- * band are low-passed (with Vision's point, as a reading it makes steadier: see mf). A bigger change is
- * taken at once only when it is backed up:
- *  - Vision's own pupil point (if given) moved the same way by a fair part of it. Vision's point is
- *    coarse but never jumps the way the refined one can, so with it nothing else may back a change up;
+ * band are low-passed (with Vision's point, as a reading it makes steadier: see mf). A saccade-sized
+ * change is taken at once only when it is backed up:
+ *  - Vision's own pupil point (if given) moved the same way, by about as much as its gain says it should
+ *    (see v_need). Vision's point is coarse but never jumps the way the refined one can, so with it
+ *    nothing else may back a change up;
  *  - without Vision's points: both eyes moved alike by a saccade's size while the measurement has been
  *    clean (no outlier for CLEAN_TIME), or the upper lid moved with it (it follows a vertical glance).
  * Otherwise a change short of a saccade is averaged like noise if Vision's point (which would have shown
@@ -374,14 +438,43 @@ static int vote(cf_robust *c, float x0, float acc, float u, const gate_in *in, f
 static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double t, double dt)
 {
 	const float x0 = (float)f->value;
-	int jump = 0, big = 0, switched = 0, landed = 0, averaged = 0, away = 0, followed = 0;
-	/* Where Vision's point says the gaze is (the vote's reference, see vote()), and how far it says the gaze
-	 * moved since the accepted value was taken. */
+	int jump = 0, big = 0, switched = 0, landed = 0, averaged = 0, away = 0, followed = 0, by_v = 0, mid = 0;
 	const float g0 = c->v_gain, u = in->vis ? g0 * in->v : 0.0f;
-	const float shift = in->vis && c->have_v ? g0 * (in->v - c->v_anchor) : 0.0f;
-	const int init = !f->ready || t - f->t > 0.5;
+	const float v_thr = fmaxf(VIS_K * c->v_noise, VIS_MIN);
+	const int vis = in->vis && c->have_v; /* Vision's point now, and last frame */
+	const int have_off = vis && c->v_off_n > 0;
+	/* A gap with no readings (a stalled camera, the face lost a moment) starts afresh from this reading,
+	 * unless Vision's point is known from before it: the change since is then checked like any other. */
+	const int init = !f->ready || (t - f->t > 0.5 && !vis);
 	if (in->vis != c->have_v)
 		new_level(c); /* the levels' reference changed */
+	if (!have_off)
+		c->v_pend = 0;
+	/* Vision's point jumped (past its noise, in one frame) and the two eyes' readings did not both move
+	 * with it by half as much (with the gain taken as up to twice its typical error smaller: an unsure
+	 * gain may overstate the move): for VIS_PEND_TIME that jump is not believed, and the reading it steadies
+	 * (mf) stays where it was. Vision's point refits now and then, and a lid or a smile drags it; a real
+	 * move shows in the refined reading too. Then, what of it stayed is taken out of the offset between the
+	 * two unless the refined readings followed it (see the end). A saccade is backed up by it all the same
+	 * (see by_vision). */
+	if (have_off && !init && fabsf(in->v - c->v_last) > v_thr) {
+		const float step = g0 * (in->v - c->v_last), half = 0.5f * step * step * expf(-2.0f * c->v_gain_err);
+		if (in->lr_out || in->e[0] * step < half || in->e[1] * step < half) {
+			/* (another jump while one is pending: the wait starts again, from before the first one) */
+			if (!c->v_pend)
+				c->v_pend_v0 = c->v_anchor;
+			c->v_pend = 1;
+			c->v_pend_t = t;
+			c->v_pend_vs = c->v_pend_rs = 0;
+			c->v_pend_n = 0;
+		}
+	}
+	/* Where Vision's point says the gaze is: v_gain x its reading plus the offset between the two readings,
+	 * averaged since the last change taken (est; what averaging already took in of a move counts once),
+	 * and the same with Vision's reading from before a jump not believed yet (base). Without the offset
+	 * yet: the accepted value, moved on by what Vision's point says moved since it was taken. */
+	const float est = have_off ? u + c->v_off : (vis ? x0 + g0 * (in->v - c->v_anchor) : x0);
+	const float base = c->v_pend ? g0 * c->v_pend_v0 + c->v_off : est;
 	if (init) {
 		f->value = m;
 		f->deriv = 0;
@@ -389,6 +482,7 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 		c->steady_n = 0;
 		c->held_big = 0;
 		c->jump_weak = 0;
+		c->learn = 0;
 		new_level(c);
 		jump = landed = 1;
 	} else {
@@ -397,10 +491,12 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 		const int clean = t - c->out_t > CLEAN_TIME;
 		/* Right after a jump the accepted value carries that one frame's noise: the next readings are
 		 * averaged in (1/2, 1/3, ...: a running mean of the readings taken since, outliers left out)
-		 * until that is no quicker than the usual low-pass, and for the first few of them anything short
-		 * of a saccade counts as that noise (it is the same landing). */
+		 * until that is no quicker than the usual low-pass, and for the first few frames after it
+		 * anything short of a saccade counts as that noise (it is the same landing). */
 		const double a_lp = fmax(in->alpha, 1.0 / (double)(c->settle + 1));
-		const int landing = c->settle <= LANDING_FRAMES;
+		if (c->land_n < 1000)
+			c->land_n++;
+		const int landing = c->land_n <= LANDING_FRAMES;
 		const float lo = landing ? in->hi : in->lo;
 		big = ae > in->hi;
 		/* The reading stayed put since last frame, which was already away from the accepted value (this is
@@ -409,17 +505,26 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 		const int steady = c->away && c->have_prev && fabsf(m - c->m_prev) <= fmaxf(lo, 0.5f * ae);
 		/* What a noise-sized change is averaged as. With Vision's point, the reading made steadier by it:
 		 * Vision's point is several times less noisy frame to frame (in the user's clip 0.3 px against the
-		 * refined 1.2-2 px), but coarse and offset from the refined one. So the offset between them,
-		 * averaged since the last change taken, puts Vision's reading (u + v_off) where the refined one
-		 * says, and the two are weighted by their noise. What is averaged then wanders far less with the
-		 * refined reading's noise, and a refined outlier pulls it only by its small share; a real small
-		 * move shows in both. Without Vision's point it is the refined reading itself, and so it is while
-		 * a landing is still being averaged: the offset is only being learnt then (from the same readings). */
+		 * refined 1.2-2 px), but coarse and offset from the refined one. So base puts Vision's reading
+		 * where the refined one says, and the two are weighted by their noise. What is averaged then
+		 * wanders far less with the refined reading's noise, and a refined outlier pulls it only by its
+		 * small share; a real small move shows in both. The refined reading's share pulls no further than
+		 * twice its usual noise: a refined point that departs from Vision's (one eye's point slipping, both
+		 * sliding with a lid) shifts it only that far, and only the offset can follow such a departure,
+		 * over seconds. Without Vision's point it is the refined reading itself, and so it is while a
+		 * landing is still being averaged: the offset is only being learnt then (from the same readings). */
 		float mf = m;
-		if (in->vis && c->have_v && c->v_off_n > 0 && a_lp <= in->alpha) {
+		const float lim = 2.0f * in->noise;
+		if (have_off && a_lp <= in->alpha) {
 			const float n_p = c->v_noise * g0, var_m = in->noise * in->noise, var_p = n_p * n_p;
 			if (var_m + var_p > 0)
-				mf = m + var_m / (var_m + var_p) * (u + c->v_off - m);
+				mf = base + var_p / (var_m + var_p) * clampf(m - base, -lim, lim);
+		}
+		if (c->v_pend) { /* did the refined reading follow Vision's jump? */
+			const float cap = fmaxf(lim, 1.5f * fabsf(est - base));
+			c->v_pend_rs += clampf(m - base, -cap, cap);
+			c->v_pend_vs += in->v;
+			c->v_pend_n++;
 		}
 		const float ef = clampf(mf - x0, -lo, lo); /* (pulling no harder than the band's edge) */
 		/* The vote between levels (see vote()): a level the readings clearly keep going to wins. */
@@ -432,7 +537,23 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 			c->jump_weak = 0;
 			c->held_big = 0;
 			c->steady_n = 0;
-		} else if (vote(c, x0, x0 + shift, u, in, &vote_to)) {
+		} else if (c->jump_vis && vis && !in->lr_out && ae > lo && t - c->jump_t <= VIS_REVERT_TIME &&
+			   fabsf(m - c->jump_from) <= fmaxf(in->lo, 0.3f * fabsf(c->jump_size)) &&
+			   (in->v - c->jump_v0) * (c->jump_v1 - c->jump_v0) <=
+				   0.25f * (c->jump_v1 - c->jump_v0) * (c->jump_v1 - c->jump_v0)) {
+			/* Both eyes' readings straight back where the last jump Vision's point backed came from, and
+			 * Vision's point back at least halfway to where it was: a short look there and back, or the
+			 * points dragged there and back together (a lid, a squint) that only looked like one. Either
+			 * way it goes back at once, not by averaging over half a second; a gain learnt from that jump
+			 * is unlearnt. */
+			f->value = c->jump_from;
+			c->v_gain = c->jump_gain;
+			c->v_gain_err = c->jump_gain_err;
+			jump = landed = 1;
+			c->jump_vis = 0;
+			c->held_big = 0;
+			c->steady_n = 0;
+		} else if (vote(c, x0, est, u, in, &vote_to)) {
 			f->value = vote_to;
 			switched = 1;
 			c->held_big = 0;
@@ -446,13 +567,35 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 			c->held_big = 0;
 			c->steady_n = 0;
 		} else {
-			const float v_min = fmaxf((big ? VIS_K : VIS_K_SMALL) * c->v_noise, VIS_MIN);
-			const int by_vision = in->vis && c->have_v &&
-					      (in->v - c->v_anchor) * (float)s >= fmaxf(VIS_FRAC * ae, v_min);
-			const int by_eyes = !in->vis && clean && !in->lr_out &&
+			/* A lid dragging the points moves Vision's along (and the lid itself) the same way: no backing
+			 * then; and right after a blink, not with the two eyes disagreeing either (one still dragged). */
+			const int may = !in->lid_drag && !(in->resync > 0 && in->lr_out);
+			/* Vision's point must have moved the same way, past its noise, and by about as much as its
+			 * gain says a move this size moves it (VIS_CONSIST of it, the gain taken as up to twice its
+			 * typical error larger), and VIS_FRAC_MIN of it at least: a refined point departing from it
+			 * (one eye slipping, both sliding with a lid) while it moves a little is not a glance. A
+			 * saccade-sized change at once; one short of that (a line change while reading: in noisy
+			 * tracking the saccade size is 4 px) only when Vision's point clearly jumped too (VIS_MID_K x
+			 * its noise threshold, and believed: see v_pend), both eyes moved its way, and the reading
+			 * stayed there a second frame: noise that happens to line up with a small move of Vision's
+			 * point (or with a refit of it) is averaged like the rest. */
+			const float frac = fmaxf(VIS_CONSIST / (g0 * expf(2.0f * c->v_gain_err)), VIS_FRAC_MIN);
+			const float v_need = fmaxf(frac * ae, v_thr);
+			const float dvs = vis ? (in->v - c->v_anchor) * (float)s : 0.0f;
+			mid = may && vis && !big && !c->v_pend && !in->lr_out && dvs >= fmaxf(v_need, VIS_MID_K * v_thr) &&
+			      in->e[0] * (float)s > 0 && in->e[1] * (float)s > 0;
+			const int mid_held = mid && c->mid == s && c->have_prev && fabsf(m - c->m_prev) <= fmaxf(lo, 0.5f * ae);
+			/* A jump of Vision's point that the refined readings haven't followed for two frames, by half
+			 * as much on average (pending, see v_pend), is backed up only by both eyes' readings following
+			 * it: one eye's outlier lining up with it is no saccade. */
+			const int stale = c->v_pend && c->v_pend_n >= 3 &&
+					  c->v_pend_rs / (float)c->v_pend_n * (float)s < 0.5f * fabsf(est - base) &&
+					  (in->lr_out || in->e[0] * (float)s <= 0 || in->e[1] * (float)s <= 0);
+			const int by_vision = may && vis && dvs >= v_need && (big || mid_held) && !stale;
+			const int by_eyes = may && !in->vis && clean && !in->lr_out &&
 					    ae > fmaxf(in->resync > 0 ? in->resync : in->hi, in->eyes_min) &&
 					    in->e[0] * (float)s > in->lo && in->e[1] * (float)s > in->lo;
-			const int by_lids = !in->vis && in->lid && c->have_lid && big &&
+			const int by_lids = may && !in->vis && in->lid && c->have_lid && big &&
 					    (c->lid_anchor - in->open) * (float)s >=
 						    fmaxf(LIDC_FRAC * ae, LIDC_K * in->open_noise);
 			if (by_vision || by_eyes || by_lids) {
@@ -464,50 +607,57 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 					c->out_t = t;
 				float to = m;
 				if (by_vision) {
-					/* Vision's point is coarse but never flips: where it says the gaze went (it
-					 * under-reads by v_gain, learned here). A refined reading far from that, e.g.
-					 * a flip landing with the saccade, is not taken: Vision's estimate is, and
+					/* Where the gaze landed: the refined reading and Vision's estimate (est), weighted
+					 * by how far off each tends to be. The refined reading carries this frame's
+					 * landmark noise; Vision's estimate its own noise (scaled up by v_gain) and the
+					 * error of v_gain itself, which grows with the size of the move. So the landing
+					 * doesn't carry one noisy frame's reading, and while the gain is unsure (not
+					 * calibrated, little learnt) the refined reading decides. A reading far further
+					 * from Vision's estimate than the two tend to be apart (3 sigma), or, with the two
+					 * eyes' readings disagreeing (one may be an outlier landing with the saccade, e.g.
+					 * a flip), far from it at all, is not mixed in: the estimate is taken alone, and
 					 * the next readings settle it. */
-					const float dv = in->v - c->v_anchor, pred = x0 + dv * c->v_gain;
-					if (fabsf(m - pred) > fmaxf(in->hi, VIS_AGREE * fabsf(pred - x0))) {
-						to = pred;
-					} else {
-						/* Both say where the gaze landed: weighted by how far off each tends
-						 * to be. The refined reading carries this frame's landmark noise;
-						 * Vision's estimate its own noise (scaled up by v_gain) and the error
-						 * of v_gain itself, which grows with the size of the move. So the
-						 * landing doesn't carry one noisy frame's reading. */
-						const float n_p = c->v_noise * c->v_gain;
-						const float n_g = c->v_gain_err * fabsf(pred - x0);
-						const float var_m = in->noise * in->noise;
-						const float var_p = n_p * n_p + n_g * n_g;
-						if (var_m + var_p > 0)
-							to = m + var_m / (var_m + var_p) * (pred - m);
-					}
-					/* Learnt from backed saccades the eyes agree on, roughly as Vision said (not
-					 * a flip, or a wrong level it moved from, which would teach a wrong gain),
-					 * each moving it only so far, and how far off it was. */
-					const float far = fabsf(pred - x0);
-					if (!in->lr_out && big && dv * e > 0 && fabsf(m - pred) <= 0.7f * far) {
-						const float r = logf(e / dv / c->v_gain);
-						c->v_gain_err += 0.3f * (fminf(fabsf(r), 0.5f) - c->v_gain_err);
-						c->v_gain *= expf(0.3f * clampf(r, -0.25f, 0.25f));
-					}
-					c->v_gain = clampf(c->v_gain, 0.5f, 5.0f);
+					by_v = 1;
+					c->jump_v0 = c->v_anchor;
+					c->jump_v1 = in->v;
+					c->jump_gain = c->v_gain;
+					c->jump_gain_err = c->v_gain_err;
+					const float n_p = c->v_noise * g0, n_g = c->v_gain_err * fabsf(est - x0);
+					const float var_m = in->noise * in->noise, var_p = n_p * n_p + n_g * n_g;
+					const int agree = !in->lr_out && fabsf(in->e[0] - in->e[1]) <= in->hi;
+					const float tol = agree ? fmaxf(in->hi, 3.0f * sqrtf(var_m + var_p))
+								: fmaxf(in->hi, VIS_AGREE * fabsf(est - x0) + 2.0f * sqrtf(var_p));
+					if (fabsf(m - est) > tol)
+						to = est;
+					else if (var_m + var_p > 0)
+						to = m + var_m / (var_m + var_p) * (est - m);
+					/* Its size teaches v_gain: at once while the gain is unsure (from this frame's
+					 * reading, if both eyes read the move alike), and again once the landing is
+					 * averaged in (see the end). */
+					c->learn = 1;
+					c->learn_x = have_off ? c->v_off + g0 * c->v_ref : x0;
+					c->learn_v = have_off ? c->v_ref : c->v_anchor;
+					c->learn_n = have_off ? c->v_off_n : 1;
+					if (agree && c->v_gain_err > 2.0f * VIS_GAIN_ERR_CAL &&
+					    fabsf(m - c->learn_x) > LEARN_MIN_HI * in->hi)
+						learn_gain(c, m - c->learn_x, in->v - c->learn_v,
+							   var_m * (1.0f + 1.0f / (float)c->learn_n) + n_p * n_p, in->v);
 				}
 				c->jump_t = t;
 				c->jump_from = x0;
 				c->jump_size = to - x0;
 				c->jump_weak = by_eyes && !by_lids && !back; /* (going back is not a guess) */
+				c->jump_vis = by_vision && !back;
 				f->value = to;
 				jump = landed = 1;
 				c->steady_n = 0;
 				c->held_big = 0;
 			} else if (in->vis && !big) {
 				/* Past the noise band but short of a saccade, and Vision's point, which shows any real
-				 * move this big, saw none: a larger draw of the noise. Averaged like the rest of it (as
-				 * the reading Vision's point steadies), its pull capped at the band's edge, so a run of
-				 * them can't carry the value off. */
+				 * move this big, saw none (or not one this size): a larger draw of the noise, or the
+				 * refined point departing from where the eye is. Averaged like the rest of it (as the
+				 * reading Vision's point steadies), its pull capped at the band's edge, so a run of them
+				 * can't carry the value off. */
 				f->value += a_lp * ef;
 				averaged = 1;
 				if (c->held_big)
@@ -519,9 +669,12 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 				if (c->held_big && !steady)
 					c->out_t = t;
 				c->steady_n = steady ? c->steady_n + 1 : 0;
-				if (big && !clean) {
-					c->held_big = 1; /* saccade-sized, unbacked, outliers about: left to the vote */
-				} else if (c->steady_n >= (clean && !(big && in->vis) ? 1 : PERSIST_LONG)) {
+				if (big && (!clean || in->vis)) {
+					/* Saccade-sized and unbacked, while outliers are about or Vision's point (which
+					 * would have shown it) saw no such move: left to the vote, which takes a level only
+					 * once the readings have clearly kept going there; never followed for persisting. */
+					c->held_big = 1;
+				} else if (c->steady_n >= (clean ? 1 : PERSIST_LONG)) {
 					/* Persisting: followed like before (small changes partly, more the longer
 					 * they stay, saccade-sized ones fully), but shown at once only when nothing
 					 * could have said otherwise, and it was saccade-sized on both frames (noise
@@ -541,54 +694,119 @@ static int gate(cf_robust *c, cf_one_euro *f, float m, const gate_in *in, double
 		}
 	}
 	f->t = t;
+	c->mid = mid && !jump ? (m > x0 ? 1 : -1) : 0;
 	c->m_prev = m;
 	c->have_prev = 1;
 	c->away = away;
 	c->followed = followed;
 	const int took = jump || switched || fabsf((float)f->value - x0) > in->hi;
 	if (took && !switched && !init) {
-		if (in->vis && c->have_v) {
+		if (vis) {
 			/* The levels are offsets from where Vision's point says the gaze is: the accepted one only
-			 * changes when the gaze moved more (or less) than Vision's point says. */
-			const float o_old = x0 - g0 * c->v_anchor, o_new = (float)f->value - u;
-			if (fabsf(o_new - o_old) > in->hi)
+			 * changes when the gaze moved more (or less) than Vision's point says. Not with a saccade it
+			 * backed up: what differs then is the error of its gain, and the other levels (a refiner's
+			 * spots, at fixed offsets from where the eye is) move along with the accepted one. */
+			const float o_old = est - u, o_new = (float)f->value - u;
+			if (by_v) {
+				for (int j = 0; j < 2; j++)
+					c->alt[j] += o_new - o_old;
+			} else if (fabsf(o_new - o_old) > in->hi) {
 				move_level(c, o_old, o_new, in->hi);
+			}
 		} else {
 			new_level(c); /* the gaze moved: the old level is history, not one to vote back to */
 		}
 	}
-	/* Only a saccade shown at once has a landing to settle (a glide or a vote arrives already averaged);
-	 * it counts the readings averaged in since. */
+	/* Only a saccade shown at once has a landing to settle (a glide or a vote arrives already averaged): it
+	 * counts the readings averaged in since (for the running mean) and the frames since (the landing). */
 	c->settle = landed ? 1 : (averaged && c->settle < 1000 ? c->settle + 1 : c->settle);
+	if (landed)
+		c->land_n = 0;
+	else if (switched || followed)
+		c->land_n = LANDING_FRAMES + 1; /* (arrived already averaged: nothing to land) */
+	if (init || switched || followed || (landed && !by_v))
+		c->learn = 0; /* (that saccade's landing is no clean measure any more) */
 
-	/* Where the backing-up sensors were: reset on a taken change, otherwise following them slowly. A move
+	/* Where the backing-up sensors were: reset on a taken change, otherwise following them slowly. A jump
 	 * of Vision's point well past its noise is kept a while longer (the refined reading may only show it
-	 * a frame or two later, both eyes having read wrong when it happened). */
+	 * a frame or two later, both eyes having read wrong when it happened), but only just after it jumped:
+	 * Vision's point drifting off slowly must not pile up into a move that backs a later, unrelated jump
+	 * of the refined point. */
 	const float ka = (float)(1.0 - exp(-dt / ANCHOR_TAU));
 	if (in->vis) {
 		if (c->have_v && !big && !took) {
 			const float kn = (float)(1.0 - exp(-dt / DOWN_NOISE_TAU));
 			c->v_noise += kn * (fminf(fabsf(in->v - c->v_last), 0.03f) - c->v_noise);
 		}
-		const int v_moved = c->have_v && fabsf(in->v - c->v_anchor) > fmaxf(VIS_K * c->v_noise, VIS_MIN);
+		if (c->have_v && fabsf(in->v - c->v_last) > v_thr)
+			c->v_jump_t = t;
+		const int v_moved = c->have_v && t - c->v_jump_t <= VIS_HOLD && fabsf(in->v - c->v_anchor) > v_thr;
 		const float kh = v_moved ? (float)(1.0 - exp(-dt / ANCHOR_HOLD)) : ka;
 		c->v_anchor = (!c->have_v || took) ? in->v : c->v_anchor + kh * (in->v - c->v_anchor);
 		c->v_last = in->v;
-		/* The refined-minus-Vision offset (see mf above): restarted from the accepted value on a taken
-		 * change (with the gain as just learnt), then a running mean of the readings averaged in (never an
-		 * outlier, or a flipping refiner's other level), each pulling no further than the band's edge,
-		 * until that is no quicker than VIS_OFF_TAU. */
+		/* The refined-minus-Vision offset (see mf above) and Vision's mean: restarted from the accepted
+		 * value on a taken change, then running means of the readings averaged in (never an outlier, or a
+		 * flipping refiner's other level), each pulling the offset no further than the band's edge, until
+		 * that is no quicker than VIS_OFF_TAU. Held while a jump of Vision's point is pending: once
+		 * VIS_PEND_TIME is over, it is kept if the refined readings since moved half as much at least, or
+		 * else taken out of the offset (and out of the anchor: it backs nothing up). */
 		const float u1 = c->v_gain * in->v;
 		if (took || !c->have_v || c->v_off_n == 0) {
 			c->v_off = (float)f->value - u1;
+			c->v_ref = in->v;
 			c->v_off_n = 1;
+			c->v_res = 0;
+			c->v_fast = in->v;
+			c->v_pend = 0;
+		} else if (c->v_pend) {
+			if (t - c->v_pend_t >= VIS_PEND_TIME - 1e-6 && c->v_pend_n >= 2) {
+				/* What of the jump stayed (Vision's mean since, against its level before), and what the
+				 * refined readings did meanwhile. */
+				const float dv = c->v_pend_vs / (float)c->v_pend_n - c->v_pend_v0;
+				const float dr = c->v_pend_rs / (float)c->v_pend_n, dg = c->v_gain * dv;
+				if (fabsf(dv) > v_thr && dr * dg < 0.5f * dg * dg) {
+					c->v_off -= dg;
+					c->v_ref += dv;
+					c->v_anchor = in->v; /* (nothing moved) */
+				}
+				c->v_pend = 0;
+			}
 		} else if (averaged && !in->lr_out) {
-			const float k = fmaxf((float)(1.0 - exp(-dt / VIS_OFF_TAU)), 1.0f / (float)(c->v_off_n + 1));
-			c->v_off += k * clampf(m - u1 - c->v_off, -in->hi, in->hi);
+			/* Vision's point drifting off slowly while the refined one stays shows as the readings' recent
+			 * mean (v_res) staying off the offset by more than its noise allows, with Vision's own recent
+			 * mean (v_fast) off its longer one the matching way: the offset then follows that share of it
+			 * quicker, as fast as VIS_RES_TAU once it is twice that far off. The other way round (the
+			 * refined point departing, Vision's still) it doesn't: Vision's point says where the eye is,
+			 * and only VIS_OFF_TAU follows the refined one. A one-off departure (a lid dragging both
+			 * points, a refit) is past the band's edge, not averaged, and builds no such mean. */
+			const float r = clampf(m - u1 - c->v_off, -in->hi, in->hi), n_p = c->v_noise * c->v_gain;
+			const float kf = (float)(1.0 - exp(-dt / VIS_RES_TAU));
+			c->v_res += kf * (r - c->v_res);
+			c->v_fast += kf * (in->v - c->v_fast);
+			const float se = sqrtf((in->noise * in->noise + n_p * n_p) * kf / (2.0f - kf));
+			const float w = se > 0 ? clampf(fabsf(c->v_res) / (VIS_RES_K * se) - 1.0f, 0.0f, 1.0f) : 0.0f;
+			const float share =
+				c->v_res != 0 ? clampf(c->v_gain * (c->v_ref - c->v_fast) / c->v_res, 0.0f, 1.0f) : 0.0f;
+			const float k = fmaxf(fmaxf((float)(1.0 - exp(-dt / VIS_OFF_TAU)), 1.0f / (float)(c->v_off_n + 1)),
+					      w * share * kf);
+			c->v_off += k * r;
+			c->v_ref += k * (in->v - c->v_ref);
 			c->v_off_n += c->v_off_n < 1000;
+		}
+		/* Learning v_gain (see learn_gain()): once LEARN_N readings since a backed saccade are averaged
+		 * in, its size is measured again from the means, far surer than from one frame. */
+		if (c->learn && !took && !c->v_pend && c->v_off_n >= LEARN_N) {
+			c->learn = 0;
+			const float x1 = c->v_off + c->v_gain * c->v_ref, dx = x1 - c->learn_x, dv = c->v_ref - c->learn_v;
+			const float n_p = c->v_noise * c->v_gain;
+			if (fabsf(dx) > LEARN_MIN_HI * in->hi)
+				learn_gain(c, dx, dv, (in->noise * in->noise + n_p * n_p) *
+							      (1.0f / (float)c->v_off_n + 1.0f / (float)c->learn_n), in->v);
 		}
 	} else {
 		c->v_off_n = 0;
+		c->v_pend = 0;
+		c->learn = 0;
 	}
 	c->have_v = in->vis;
 	if (in->lid)
@@ -624,6 +842,26 @@ static double slew(cf_robust *c, double x, int snap, float step, double alpha, i
 	}
 	c->shown_x = x;
 	c->have_shown = 1;
+	return c->shown;
+}
+
+/* What the output shows (see slew()). A jump right after a blink (`reacq`) becomes a glide instead: an
+ * S-curve from where the output was to the accepted value (which may still settle meanwhile), over
+ * GLIDE_TIME, the first step on the frame of the jump. */
+static double show(cf_robust *c, double x, int snap, int reacq, double t, double dt, float step, double alpha,
+		   int pass)
+{
+	if (snap && reacq && c->have_shown && !c->gliding) {
+		c->gliding = 1;
+		c->glide_from = c->shown;
+		c->glide_t0 = t;
+	}
+	if (!c->gliding)
+		return slew(c, x, snap, step, alpha, pass);
+	const double u = fmin((t - c->glide_t0 + dt) / fmax(GLIDE_TIME, dt), 1.0);
+	c->shown = c->glide_from + u * u * (3.0 - 2.0 * u) * (x - c->glide_from);
+	c->shown_x = x;
+	c->gliding = u < 1.0;
 	return c->shown;
 }
 
@@ -776,7 +1014,8 @@ void cf_gaze_init(cf_gaze *g)
 	g->axis.y = 0;
 	g->open_ref = DEFAULT_OPEN;
 	g->far_fade = 1.0f;
-	g->down_noise = DOWN_NOISE_INIT;
+	g->lock_f = g->lock_mid = 1.0f;
+	g->down_noise = g->noise_slow = DOWN_NOISE_INIT;
 	g->side_noise = DOWN_NOISE_INIT;
 	g->lid_noise = LID_NOISE_INIT;
 	cf_robust *rb[2] = {&g->rb_down, &g->rb_side};
@@ -786,6 +1025,7 @@ void cf_gaze_init(cf_gaze *g)
 		rb[i]->v_gain = VIS_GAIN_INIT;
 		rb[i]->v_gain_err = VIS_GAIN_ERR_INIT;
 		rb[i]->out_t = -1e9; /* clean until an outlier is seen */
+		rb[i]->v_jump_t = -1e9;
 	}
 }
 
@@ -813,7 +1053,62 @@ static cf_gaze_params sanitize(const cf_gaze_params *in)
 		p.has_notes = 0;
 		p.notes_offset = p.notes_side = p.notes_open = 0.0f;
 	}
+	if (!p.has_notes || !isfinite(p.vis_baseline) || !isfinite(p.vis_notes))
+		p.has_vis_calib = 0;
 	return p;
+}
+
+/* Vision's gain from the two calibrations: how far the refined pupil moved between the lens and the notes,
+ * per how far Vision's point moved. Measured on many steady frames each, so it is far surer than what one
+ * saccade shows: taken as known (VIS_GAIN_ERR_CAL), and both channels start from it (sideways the eye can
+ * only be assumed to under-read alike, so that one is still learnt as unsure). Set again only when the
+ * calibration changes. */
+static void use_vis_calib(cf_gaze *g, const cf_gaze_params *p)
+{
+	if (!p->has_vis_calib)
+		return;
+	const float dr = p->baseline - p->notes_offset, dv = p->vis_baseline - p->vis_notes;
+	if (!(dv > VIS_CAL_MIN_FRAC * dr && dv > VIS_CAL_MIN))
+		return; /* Vision's point barely moved: no usable gain */
+	const float gain = dr / dv;
+	if (!(gain >= VIS_GAIN_MIN && gain <= VIS_GAIN_MAX) || gain == g->vis_gain_cal)
+		return;
+	g->vis_gain_cal = gain;
+	cf_robust *rb[2] = {&g->rb_down, &g->rb_side};
+	for (int i = 0; i < 2; i++) {
+		rb[i]->v_gain = gain;
+		rb[i]->v_off_n = 0; /* the offset and levels go with the gain: start them afresh */
+		rb[i]->learn = 0;
+		rb[i]->v_pend = 0;
+		new_level(rb[i]);
+	}
+	/* (a small notes glance measures the gain less surely: the two medians carry their noise) */
+	g->rb_down.v_gain_err = fmaxf(VIS_GAIN_ERR_CAL, VIS_CAL_DR_ERR / dr);
+}
+
+/* A new lens calibration moved where "looking into the lens" reads (baseline, by delta): everything the
+ * glance channel keeps (the accepted and shown glance, the offset from Vision's point, the levels, the
+ * history) is measured from the old one. All of it moves along, so the change doesn't read as the gaze
+ * jumping (an unbacked jump, voted on and glided in over a second or more). */
+static void rebase_down(cf_gaze *g, float delta)
+{
+	cf_robust *c = &g->rb_down;
+	if (g->down.ready)
+		g->down.value += delta;
+	c->v_off += delta;
+	c->learn_x += delta;
+	for (int j = 0; j < 2; j++)
+		c->alt[j] += delta;
+	c->jump_from += delta;
+	c->m_prev += delta;
+	c->shown += delta;
+	c->shown_x += delta;
+	c->glide_from += delta;
+	g->last_down_raw += delta;
+	for (int k = 0; k < g->hist_n; k++)
+		g->hist[k].down += delta;
+	g->d_lock = fmaxf(g->d_lock + delta, 0.0f);
+	g->d_live_prev = fmaxf(g->d_live_prev + delta, 0.0f);
 }
 
 /* ---- Calibration */
@@ -839,15 +1134,82 @@ void cf_gaze_start_calibration(cf_gaze *g, enum cf_calib_target target)
 	g->calib_have_start = 0;
 	g->calib_done = 0;
 	g->calib_failed = 0;
+	g->calib_vis_count = 0;
 }
 
+/* Median of n values, leaving them as they are. */
+static float median_of(const float *v, int n)
+{
+	float tmp[64];
+	memcpy(tmp, v, (size_t)n * sizeof(float));
+	return median(tmp, n);
+}
+
+/* A standard deviation that a few wild values don't move: 1.4826 x the median distance from the median. */
+static float robust_sd(const float *v, int n, float med)
+{
+	float d[64];
+	for (int i = 0; i < n; i++)
+		d[i] = fabsf(v[i] - med);
+	return 1.4826f * median(d, n);
+}
+
+/* The medians of the samples. Frames whose lids were well off their usual height during the calibration (a
+ * partial blink or a squint too slight to be held, a lid half over the iris) read the pupil off: the lid
+ * drags the landmarks and covers part of the iris. They are left out, unless that leaves too few. */
 static void finish_calibration(cf_gaze *g)
 {
-	g->calib_result = median(g->calib_samples, g->calib_count);
-	g->calib_open_result = median(g->calib_open, g->calib_count);
-	g->calib_side_result = median(g->calib_side, g->calib_count);
+	const int n = g->calib_count;
+	const float open_med = median_of(g->calib_open, n);
+	const float open_tol = fmaxf(CALIB_OPEN_K * robust_sd(g->calib_open, n, open_med), CALIB_OPEN_MIN);
+	int lids_off = 0;
+	for (int i = 0; i < n; i++)
+		lids_off += fabsf(g->calib_open[i] - open_med) > open_tol;
+	const int trim = n - lids_off >= CF_CALIB_MIN_SAMPLES;
+	float off[64], side[64], open[64], vis[64];
+	int k = 0, kv = 0;
+	for (int i = 0; i < n; i++) {
+		if (trim && fabsf(g->calib_open[i] - open_med) > open_tol)
+			continue;
+		off[k] = g->calib_samples[i];
+		side[k] = g->calib_side[i];
+		open[k] = g->calib_open[i];
+		k++;
+		if (isfinite(g->calib_vis[i]))
+			vis[kv++] = g->calib_vis[i];
+	}
+	g->calib_result = median_of(off, k);
+	g->calib_open_result = median_of(open, k);
+	g->calib_side_result = median_of(side, k);
+	/* How steady it was (see cf_calib_result): each half of the time (in order) about its own median, and how
+	 * far apart those are; and the lids over all the frames. */
+	const int h = k / 2;
+	const float m1 = median_of(off, h), m2 = median_of(off + h, k - h);
+	g->calib_spread = 0.5f * (robust_sd(off, h, m1) + robust_sd(off + h, k - h, m2));
+	g->calib_drift = fabsf(m2 - m1);
+	float o2 = 0;
+	for (int i = 0; i < n; i++)
+		o2 += (g->calib_open[i] - open_med) * (g->calib_open[i] - open_med);
+	g->calib_open_spread = sqrtf(o2 / (float)n);
+	/* Vision's point, if it was given on most of the frames used. */
+	g->calib_vis_count = 2 * kv >= k ? kv : 0;
+	g->calib_vis_result = g->calib_vis_count ? median_of(vis, kv) : 0.0f;
 	g->calibrating = 0;
 	g->calib_done = 1;
+}
+
+int cf_gaze_calib_hints(const cf_calib_result *res, float baseline)
+{
+	int hints = 0;
+	/* The gaze moved on: the halves differ by more than CALIB_DRIFT_MAX, and by more than their noise could
+	 * make them (twice the spread: the halves' medians differ by about half the spread on their own). Or it
+	 * moved about a lot, or the lids kept moving. */
+	if (!(res->drift <= fmaxf(CALIB_DRIFT_MAX, 2.0f * res->spread)) || !(res->spread <= CALIB_SPREAD_MAX) ||
+	    !(res->open_spread <= CALIB_OPEN_SPREAD_MAX))
+		hints |= CF_CALIB_HINT_UNSTEADY;
+	if (res->target == CF_CALIB_NOTES && baseline - res->offset < CF_NOTES_SMALL_GLANCE)
+		hints |= CF_CALIB_HINT_SMALL_GLANCE;
+	return hints;
 }
 
 /* Called once per frame while calibrating, whether or not a face was found, so a calibration
@@ -881,6 +1243,11 @@ int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out)
 	out->offset = g->calib_result;
 	out->openness = g->calib_open_result;
 	out->side = g->calib_side_result;
+	out->has_vis = g->calib_vis_count > 0;
+	out->vis_offset = g->calib_vis_result;
+	out->spread = g->calib_spread;
+	out->drift = g->calib_drift;
+	out->open_spread = g->calib_open_spread;
 	return 1;
 }
 
@@ -889,10 +1256,11 @@ int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out)
 /* Moves the correction strength towards `target` through two equal first-order stages (a critically
  * damped ease): it starts moving gently and arrives gently, an S-curve with no kink at either end, so a
  * fade never shows as a snap. Exact per stage for any frame time, so it looks the same at 15 fps as at
- * 30. Fades in a little slower than it fades out. */
+ * 30. Fades in a little slower than it fades out; after eyes closed for long, back in about as quickly
+ * as the lids open (reopen_fast): what was let go of then went while they were shut. */
 static void ease_factor(cf_gaze *g, float target, double dt)
 {
-	const double tau = target > g->factor_mid ? FADE_IN_TAU : FADE_OUT_TAU;
+	const double tau = target > g->factor_mid ? (g->reopen_fast ? REOPEN_FADE_TAU : FADE_IN_TAU) : FADE_OUT_TAU;
 	const float a = (float)(1.0 - exp(-dt / tau));
 	g->factor_mid += a * (target - g->factor_mid);
 	g->factor += a * (g->factor_mid - g->factor);
@@ -913,12 +1281,19 @@ static void update_blink(cf_gaze *g, float r, float r2, float slow_drop, float r
 	if (!g->blink && !g->closing && !g->half)
 		g->open_r = g->r_peak;
 	const float reopen = fminf(HALF_EXIT, g->open_r - 0.08f);
+	/* After a hold the pupil points are still pulled by the lids for a moment: the glance stays frozen a
+	 * little longer, but only while the lids are not yet back near open. Once they are, it is measured
+	 * again at once (any change since the blink then glides in, see REACQ_TIME), so a correction held
+	 * wrong is never shown for frames with the eyes open, to jump once the time is up. */
+	const float settled = fminf(SETTLE_OPEN, g->open_r - 0.05f);
+	if (t < g->settle_until && r >= settled)
+		g->settle_until = t;
 	if (g->blink) {
 		const double len = t - g->hold_start;
 		if (r > BLINK_EXIT || (r > BLINK_ENTER + 0.05f && fabsf(rate) < 1.0f && len > 0.1)) {
 			g->blink = 0;
 			if (r > reopen) {
-				g->settle_until = t + SETTLE_TIME;
+				g->settle_until = r < settled ? t + SETTLE_TIME : t;
 			} else { /* still half shut: the pupil point is still unreliable */
 				g->half = 1;
 				g->half_start = t;
@@ -932,7 +1307,7 @@ static void update_blink(cf_gaze *g, float r, float r2, float slow_drop, float r
 			g->blink = 1;
 		} else if (r > reopen) {
 			g->half = 0;
-			g->settle_until = t + SETTLE_TIME;
+			g->settle_until = r < settled ? t + SETTLE_TIME : t;
 		} else if (t - g->half_start > HALF_MAX) {
 			g->half = 0; /* a squint, not a half blink: measure normally from here on */
 			g->ease = 1; /* ... handing over gently: the eyes are still */
@@ -1027,7 +1402,7 @@ static void emit(const cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 static int finish_output(cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 {
 	emit(g, p, out);
-	int n = g->factor < 0.005f ? 0 : 2;
+	int n = g->factor * g->lock_f < 0.005f ? 0 : 2;
 	if (n && fabsf(g->amount_unit[0]) + fabsf(g->amount_unit[1]) + fabsf(g->hshift_unit[0]) +
 			     fabsf(g->hshift_unit[1]) < 0.01f)
 		n = 0; /* nothing to move (looking into the lens): skip the warp */
@@ -1041,6 +1416,11 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 {
 	const cf_gaze_params ps = sanitize(p_in);
 	const cf_gaze_params *p = &ps;
+	use_vis_calib(g, p);
+	if (g->have_base && p->baseline != g->base_prev)
+		rebase_down(g, p->baseline - g->base_prev);
+	g->base_prev = p->baseline;
+	g->have_base = 1;
 	double dt = g->last_t > 0 ? t - g->last_t : 1.0 / 30.0;
 	if (dt <= 0 || dt > 0.5)
 		dt = 1.0 / 30.0;
@@ -1070,7 +1450,11 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		g->rb_down.held_big = g->rb_side.held_big = 0;
 		g->rb_down.away = g->rb_side.away = g->rb_down.followed = g->rb_side.followed = 0;
 		g->rb_down.have_prev = g->rb_side.have_prev = 0;
-		g->rb_down.have_v = g->rb_side.have_v = 0;
+		/* Where Vision's point was stays known through a short loss: the first frame back is checked
+		 * against it like any other, so a glance made meanwhile is taken at once. After a long one it is
+		 * stale (the person may have moved): everything starts afresh then. */
+		if (!g->cx[0].ready || t - g->cx[0].t > FACE_GONE)
+			g->rb_down.have_v = g->rb_side.have_v = 0;
 		g->rb_down.have_lid = 0;
 		/* The detector often misses a frame or two: hold the correction exactly as it was through
 		 * that instead of letting the eyes dip and climb back. Lost for longer, the person may well
@@ -1114,7 +1498,6 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 					  vis, v_down, learn_lr, t, dt, e_down, &lr_down);
 	const float side =
 		lr_combine(&g->rb_side, &g->side, m[0].side, m[1].side, vis, v_side, learn_lr, t, dt, e_side, &lr_side);
-	const float offset = p->baseline - down_raw;
 	const float openness = fminf(m[0].openness, m[1].openness);
 	/* The noise band and saccade size of the glance follow the measured landmark noise: as tight as
 	 * clean tracking allows, wider when it is noisy. */
@@ -1161,14 +1544,30 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * at its old value here showed the whole glance for a frame and then slid the correction in.
 	 * Only while the lids are still fairly open: as they close, Vision's pupil point slides down with
 	 * the upper lid, which looked like a glance. */
-	const float pupil_drop = g->down.ready ? down_raw - (float)g->down.value : 0.0f;
+	/* A glance with the lids following, or a lid dragging the pupil points (a blink starting)? A lid drags
+	 * each eye's refined point its own way (one down, the other not, or even up), and Vision's point only
+	 * part of the way, while a glance moves both eyes alike and the lids by less than the eyes. So: with
+	 * Vision's point, it must have dropped by at least LID_VIS_RATIO of the lid drop, and the pupil drop is
+	 * the combined reading (which leans on the eye Vision's point moved with); without it, both refined
+	 * points must have dropped, alike: the smaller drop counts. */
+	const int have_vis = vis && g->rb_down.have_v;
+	const float v_drop = have_vis ? v_down - g->rb_down.v_anchor : 0.0f; /* Vision's, from the accepted gaze */
+	const float v_step = have_vis ? v_down - g->rb_down.v_last : 0.0f;   /* ... and since the last frame */
+	const int eyes_agree = !lr_down;
+	const float eyes_drop = g->down.ready ? fminf(e_down[0], e_down[1]) : 0.0f;
+	const float pupil_drop = !g->down.ready ? 0.0f
+				 : have_vis	    ? down_raw - (float)g->down.value
+				 : eyes_agree	    ? eyes_drop
+						    : 0.0f;
 	const float lid_drop = (g->open_r - r) * fmaxf(ref, 0.05f); /* eye widths */
+	const int vis_lid = have_vis && v_drop < LID_VIS_RATIO * lid_drop; /* Vision's point: a lid, not a glance */
 	/* (Both thresholds sit above the pupil noise, so a noisy reading doesn't end a hold.) */
-	const int glance = (r > GLANCE_MIN_R && pupil_drop > fmaxf(GLANCE_PUPIL, 2.0f * g->down_noise) &&
-			    pupil_drop >= GLANCE_LID_RATIO * lid_drop) ||
-			   (pupil_drop > GLANCE_BIG + 2.0f * g->down_noise && pupil_drop >= lid_drop);
+	const int glance = !vis_lid && ((r > GLANCE_MIN_R && pupil_drop > fmaxf(GLANCE_PUPIL, 2.0f * g->down_noise) &&
+					 pupil_drop >= GLANCE_LID_RATIO * lid_drop) ||
+					(pupil_drop > GLANCE_BIG + 2.0f * g->down_noise && pupil_drop >= lid_drop));
 	if ((g->closing || g->half) && !g->blink && g->down.ready && glance) {
 		g->closing = g->half = 0;
+		g->was_holding &= 2; /* (that "half blink" was this glance: nothing to resync or glide in) */
 		g->r_peak = r; /* the lids are where the glance put them: not a fresh drop next frame */
 		g->r_slow = g->r_slow_prev[0] = g->r_slow_prev[1] = r;
 	}
@@ -1207,6 +1606,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	int glance_trusted; /* this frame's change may be kept by a rollback; finished once far_fade is known */
 	int lids_clear;     /* ... because the lids were clearly steady (not just a glance-like pupil move) */
 	float glance_step;
+	int lid_drag;       /* the lids are dragging the pupil points this frame */
 	{
 		/* Is what this frame is about to change trustworthy (see the rollback above)? Yes if the lids
 		 * were clearly steady, or the pupil clearly moved like a glance (at least ROLLBACK_GLANCE of the
@@ -1219,11 +1619,23 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		const float pupil_step = down_raw - g->last_down_raw;
 		const int clearly_steady = !g->closing && !held_now && fabsf(step) < LID_STEADY_STEP &&
 					   lid_fall < LID_STEADY_STEP;
+		/* Moved with the lids like a glance, as for `glance` above (this frame's moves): Vision's point
+		 * by at least LID_VIS_RATIO of the lid's, or without it both refined points. */
+		const int like_glance = have_vis ? v_step >= LID_VIS_RATIO * lid_step
+						 : eyes_agree && eyes_drop >= ROLLBACK_GLANCE * lid_step;
 		const int clearly_glance = pupil_step > fmaxf(ROLLBACK_PUPIL, 3.0f * g->down_noise) &&
-					   pupil_step >= ROLLBACK_GLANCE * lid_step + 3.0f * g->down_noise;
+					   pupil_step >= ROLLBACK_GLANCE * lid_step + 3.0f * g->down_noise && like_glance;
 		glance_trusted = clearly_steady || clearly_glance;
 		lids_clear = clearly_steady;
 		glance_step = pupil_step;
+		/* The lids clearly fell this frame and the pupils didn't move with them like a glance: the points
+		 * are being dragged by a lid (a blink starting). Nothing may back a change up this frame. This
+		 * frame's own lid fall against this frame's pupil moves (a glance spread over two frames has the
+		 * lids falling on both, and the pupils moving with them on both). */
+		const float lid_now = fmaxf(step, 0.0f) * fmaxf(ref, 0.05f);
+		const int drag_like_glance = have_vis ? v_step >= LID_VIS_RATIO * lid_now
+						      : eyes_agree && eyes_drop >= ROLLBACK_GLANCE * lid_now;
+		lid_drag = step > fmaxf(LID_STEADY_STEP, 3.0f * g->lid_noise) && !drag_like_glance;
 	}
 	/* Landmark noise: mean frame-to-frame change of the raw glance while the lids are steady. A change of a
 	 * saccade's size is a saccade or an outlier, not noise: left out (a refiner jumping between two spots
@@ -1231,6 +1643,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	if (!hold && g->have_down_raw && fabsf(down_raw - g->last_down_raw) <= down_hi) {
 		const float ch = fabsf(down_raw - g->last_down_raw);
 		g->down_noise += (float)(1.0 - exp(-dt / DOWN_NOISE_TAU)) * (ch - g->down_noise);
+		g->noise_slow = fmaxf(g->down_noise, g->noise_slow + (float)(1.0 - exp(-dt / FAR_NOISE_TAU)) *
+								     (g->down_noise - g->noise_slow));
 	}
 	const float down_jump = fabsf(down_raw - g->last_down_raw); /* this frame's raw pupil move */
 	g->last_down_raw = down_raw;
@@ -1258,12 +1672,15 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	abs_yaw = isfinite(abs_yaw) ? abs_yaw : 0; /* broken pose: ignore it rather than poison the factor */
 	abs_pitch = isfinite(abs_pitch) ? abs_pitch : 0;
 
-	/* The first moments after starting are skipped: the eyes are still on the Calibrate button. */
+	/* Calibration samples: each frame's own readings (the accepted gaze would carry one frame's lid or outlier
+	 * into the next few). The first moments after starting are skipped: the eyes are still on the Calibrate
+	 * button. */
 	const int calib_warm = g->calibrating && t - g->calib_start >= CF_CALIB_WARMUP_S;
 	if (calib_warm && !hold && abs_yaw < 15 && g->calib_count < 64) {
-		g->calib_samples[g->calib_count] = offset;
+		g->calib_samples[g->calib_count] = p->baseline - down_raw;
 		g->calib_open[g->calib_count] = openness;
 		g->calib_side[g->calib_count] = side;
+		g->calib_vis[g->calib_count] = vis ? -v_down : NAN; /* (up positive, like offset) */
 		g->calib_count++;
 		if (g->calib_count >= CF_CALIB_SAMPLES)
 			finish_calibration(g);
@@ -1339,15 +1756,22 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 			.resync = g->was_holding ? fmaxf(RESYNC_JUMP, 3.0f * g->down_noise) : 0.0f,
 			.eyes_min = EYES_K * g->down_noise,
 			.noise = g->down_noise,
+			.lid_drag = lid_drag,
 		};
+		if (g->was_holding)
+			g->reacq_until = t + REACQ_TIME; /* the first look after a blink: see below */
 		g->was_holding = 0;
 		snap_down |= gate(&g->rb_down, &g->down, down_raw, &gi, t, dt);
 		down = g->down.value;
 	} else {
 		down = g->down.ready ? g->down.value : 0;
-		g->was_holding |= g->blink || g->half;
+		g->was_holding |= g->blink ? 2 : g->half ? 1 : 0;
 		/* (cut short by a blink: no outlier) */
 		g->rb_down.steady_n = g->rb_down.held_big = g->rb_down.away = g->rb_down.followed = 0;
+		/* Held, not lost: the first reading after a long blink is checked like any other (resync), not
+		 * taken as a fresh start. */
+		if (g->down.ready)
+			g->down.t = t;
 	}
 
 	/* Sideways position for reading damping. Eyes move in saccades: a return sweep jumps a
@@ -1373,6 +1797,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	} else {
 		side_f = g->side.ready ? g->side.value : side_c;
 		g->rb_side.steady_n = g->rb_side.held_big = g->rb_side.away = g->rb_side.followed = 0;
+		if (g->side.ready)
+			g->side.t = t;
 	}
 
 	/* Output slew guard: what the warp shows follows the accepted gaze, but without a backed-up saccade
@@ -1381,14 +1807,26 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * READ_DAMP of the gaze, so the gaze may move that much faster for the same shift. */
 	const float wmax = fmaxf(fmaxf((float)g->rx[0].value, (float)g->rx[1].value), 1.0f);
 	const float slew_step = SLEW_PX * (float)fmin(dt * 30.0, 1.0) / wmax; /* per frame, at 30 fps or slower */
-	down = slew(&g->rb_down, down, snap_down, slew_step, noise_alpha(DOWN_OUT_CUTOFF, dt), 0);
-	side_f = slew(&g->rb_side, side_f, snap_side, slew_step / READ_DAMP, noise_alpha(SIDE_OUT_CUTOFF, dt), 1);
+	/* Just after a blink, a change taken at once (the gaze moved while the eyes were shut, or what was held
+	 * was off) glides in over GLIDE_TIME instead: it may only be measured once the lids are nearly open,
+	 * and a jump then would show with the eyes open. Most of it lands while the lids are still opening. */
+	const int reacq = t < g->reacq_until;
+	const double down_was = g->rb_down.have_shown ? g->rb_down.shown : down;
+	const double side_was = g->rb_side.have_shown ? g->rb_side.shown : side_f;
+	down = show(&g->rb_down, down, snap_down, reacq && !rolled_back, t, dt, slew_step,
+		    noise_alpha(DOWN_OUT_CUTOFF, dt), 0);
+	side_f = show(&g->rb_side, side_f, snap_side, reacq, t, dt, slew_step / READ_DAMP,
+		      noise_alpha(SIDE_OUT_CUTOFF, dt), 1);
 	const float side_dev = (float)side_f - side_c;
 
-	/* Glance limit: just past the notes when calibrated, else the manual setting. */
+	/* Glance limit: just past the notes when calibrated (by 40%, and by FAR_MARGIN and FAR_NOISE_K x the
+	 * landmark noise at least: reading lower down the page, or a calibration that came out small, stays
+	 * corrected), else the manual setting. */
 	const int notes = p->has_notes; /* sanitize() cleared it if the notes aren't below the lens */
 	const float notes_glance = p->baseline - p->notes_offset;
-	const float limit = notes ? 1.4f * notes_glance : p->max_glance;
+	const float limit = notes ? fmaxf(1.4f * notes_glance,
+					  notes_glance + fmaxf(FAR_MARGIN, FAR_NOISE_K * g->noise_slow))
+				  : p->max_glance;
 	const float band = fmaxf(0.5f * limit, 0.04f);
 	/* Second cue: lids drop when looking down. When the pupil already reads close to the limit, a big
 	 * lid drop means a far glance (keyboard) even if the pupil landmark under-reads it. It can only
@@ -1408,15 +1846,16 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		far = fmaxf(far, lid_glance);
 	}
 
-	/* Everything that should gently switch the effect off. Each term is 1 when it's fine. */
+	/* Everything that should switch the effect off. Each term is 1 when it's fine. The head's (f_yaw,
+	 * f_pitch, f_size) fade it gently; the gaze's (f_side, f_far) let go with a saccade (see lock_f). */
 	const float f_yaw = 1.0f - smoothstepf(15.0f, 28.0f, abs_yaw);
 	const float f_pitch = 1.0f - smoothstepf(20.0f, 35.0f, abs_pitch);
 	const float f_side = 1.0f - smoothstepf(SIDE_FADE_LO, SIDE_FADE_HI, fabsf(side_dev));
 	/* Far fade: how much the gaze is still on the notes rather than past them (keyboard). It goes into
-	 * the eased factor below, with the shift held at its pre-look-away size while it fades, so letting go
-	 * and taking over are gradual and the visible eye only ever moves the same way as the real gaze.
-	 * Held while the lids are shut or closing (the lid cue is meaningless then), recomputed as soon as
-	 * they are open again (also during the settle time after a blink, from the fresh lids). */
+	 * the gaze's lock below (lock_f), with the shift no bigger than at the limit while it fades, so the
+	 * visible eye only ever moves the same way as the real gaze. Held while the lids are shut or closing
+	 * (the lid cue is meaningless then), recomputed as soon as they are open again (also during the
+	 * settle time after a blink, from the fresh lids). */
 	if (!g->blink && !g->closing && !g->half)
 		g->far_fade = 1.0f - smoothstepf(limit, limit + band, far);
 	const float f_far = g->far_fade;
@@ -1432,33 +1871,71 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	/* No "down <= 0 -> off" here: the shift is already 0 at the lens (it is proportional to the
 	 * glance), and switching the factor off there made every glance at the notes start from 0 and
 	 * ease in over half a second, so the eyes visibly dipped and climbed back each time. */
-	/* Looking away (past the notes, or sideways out of them) lets go, and looking back takes over again,
-	 * through the same smooth fade as a head turn: an S-curve over a few hundred ms, never a snap. While
-	 * the gaze is away (lock < 1), the shift fades from what it was when the gaze left (d_lock,
-	 * side_lock), not from the far-away gaze itself, so it only ever shrinks, without a jump or a wobble
-	 * on the way. Back in, it follows the gaze again at once (scaled by the fading-in factor). */
-	const float lock = f_side * f_far;
-	const float target = f_yaw * f_pitch * f_size * lock;
+	const float target = f_yaw * f_pitch * f_size;
 	if (hold) {
 		/* Blink: hold the correction steady (the gaze terms are held too). Only head-based fades
 		 * (reliable while the eyes are closed) may lower it; eyes closed for long fade out. */
-		if (g->blink && t - g->hold_start > BLINK_HOLD_MAX)
+		if (g->blink && t - g->hold_start > BLINK_HOLD_MAX) {
 			ease_factor(g, 0, dt);
-		else if (target < g->factor)
+			g->reopen_fast = 1;
+		} else if (target < g->factor) {
 			ease_factor(g, target, dt);
-		else
+		} else {
 			g->factor_mid = g->factor;
+		}
 	} else {
 		ease_factor(g, target, dt);
+		if (g->factor >= 0.98f * target)
+			g->reopen_fast = 0;
 	}
-	g->last_target = target;
+	/* Looking away (past the notes, or sideways out of them) lets go of the correction, and looking back
+	 * takes over again (lock_f). With a saccade (the shown gaze jumping by a saccade's size this frame) that
+	 * happens at once, inside the eye's own jump, where it can't be seen: the eye lands where a real one
+	 * would, instead of landing with the old correction and then rolling the rest of the way. Otherwise (a
+	 * slow drift past the notes, the lids saying the gaze went far, the gaze gliding in after a blink) it
+	 * eases like a head turn, an S-curve over a few hundred ms. Held through blinks. */
+	const float lock = f_side * f_far;
+	const int glide = g->rb_down.gliding || g->rb_side.gliding;
+	const int sacc = (snap_down && fabs(down - down_was) > down_hi) || (snap_side && fabs(side_f - side_was) > side_hi);
+	if (!hold) {
+		if (sacc) {
+			g->lock_f = g->lock_mid = lock;
+		} else {
+			const float a = (float)(1.0 - exp(-dt / (lock > g->lock_mid ? FADE_IN_TAU : FADE_OUT_TAU)));
+			g->lock_mid += a * (lock - g->lock_mid);
+			g->lock_f += a * (g->lock_mid - g->lock_f);
+		}
+	}
+	g->last_target = target * lock;
 
+	/* The glance and sideways position the shift is made from. While the gaze is on the notes, the live
+	 * ones; while it is away (lock < 1), no further than the edge of the band where the correction applies
+	 * (the limit, SIDE_FADE_LO), and never growing unless with a saccade (or moving with a glide after a
+	 * blink): so a fade only ever lets go, without a wobble, and how much is corrected is continuous in how
+	 * far the gaze went. Back on the notes without a saccade, they follow the live ones' moves, and what is
+	 * left of the gap the fade made closes at twice the output slew limit (no snap). */
 	const float d_live = (float)(down > 0 ? down : 0);
-	if (lock >= 0.999f || !g->have_lock) {
+	const float d_cap = fminf(d_live, limit), s_cap = clampf(side_dev, -SIDE_FADE_LO, SIDE_FADE_LO);
+	const float d_move = d_live - g->d_live_prev, s_move = side_dev - g->side_live_prev;
+	if (!g->have_lock || (lock >= 0.999f && sacc)) {
 		g->d_lock = d_live;
 		g->side_lock = side_dev;
 		g->have_lock = 1;
+	} else if (lock >= 0.999f) {
+		const float gd = g->d_live_prev - g->d_lock, gs = g->side_live_prev - g->side_lock;
+		const float sd = 2.0f * slew_step, ss = sd / READ_DAMP;
+		g->d_lock = fmaxf(d_live - (gd > 0 ? fmaxf(gd - sd, 0.0f) : fminf(gd + sd, 0.0f)), 0.0f);
+		g->side_lock = side_dev - (gs > 0 ? fmaxf(gs - ss, 0.0f) : fminf(gs + ss, 0.0f));
+	} else if (sacc) {
+		g->d_lock = d_cap;
+		g->side_lock = s_cap;
+	} else {
+		g->d_lock = fminf(glide ? fmaxf(g->d_lock + d_move, 0.0f) : g->d_lock, d_cap);
+		const float s1 = glide ? g->side_lock + s_move : g->side_lock;
+		g->side_lock = fabsf(s_cap) < fabsf(s1) ? s_cap : s1;
 	}
+	g->d_live_prev = d_live;
+	g->side_live_prev = side_dev;
 	const float d = g->d_lock;
 	/* Sideways damping only engages as the gaze drops towards the notes, so looking around at lens
 	 * height (at the other person) stays untouched. */
@@ -1473,8 +1950,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float max_step = EASE_STEP_PX * (float)(dt * 30.0);
 	for (int i = 0; i < 2; i++) {
 		const float w = (float)g->rx[i].value;
-		float a = d * w * g->factor;
-		float h = -READ_DAMP * g->side_lock * w * g->factor * engage;
+		float a = d * w * g->factor * g->lock_f;
+		float h = -READ_DAMP * g->side_lock * w * g->factor * g->lock_f * engage;
 		if (g->ease) {
 			converged &= fabsf(a - g->amount_unit[i]) <= max_step && fabsf(h - g->hshift_unit[i]) <= max_step;
 			a = g->amount_unit[i] + clampf(a - g->amount_unit[i], -max_step, max_step);
@@ -1528,7 +2005,7 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 	out->blinking = g->blink;
 	out->glance = g->down.ready ? (float)g->down.value : 0.0f;
 	/* What is actually being corrected: nothing while looking into the lens. */
-	out->factor = (g->down.ready && g->down.value > 0) ? g->factor : 0.0f; /* includes looking away */
+	out->factor = (g->down.ready && g->down.value > 0) ? g->factor * g->lock_f : 0.0f; /* includes looking away */
 }
 
 /* ---- Iris centre refinement
