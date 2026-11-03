@@ -1599,7 +1599,7 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 #define RP_FILLCAP1 0.90f    /* ... by here, so lashes past the iris are never reached */
 #define RP_CLEAR0 0.75f      /* an edge point needs this much bright sclera just beyond it ... */
 #define RP_CLEAR1 0.95f      /* ... to count fully */
-#define RP_MAXPTS 256        /* edge points */
+#define RP_MAXPTS 512        /* edge points */
 #define RP_TAU 0.06          /* circle refit: points this far off the circle (R units) count half */
 #define RP_SIG0 0.06f        /* circle fit's nominal error (R units): trusted fully below this ... */
 #define RP_SIG1 0.15f        /* ... not at all above */
@@ -1685,78 +1685,10 @@ static int rp_circle(const float *px, const float *py, const float *om, int n, f
 	return ok;
 }
 
-cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, const cf_pt *eye, int count,
-		      cf_pt guess)
+static cf_pt rp_refine_s(const uint8_t *grey, int stride, int width, int height, const rp_frame *ep, float w,
+			 float conf, cf_pt guess, int s_in)
 {
-	if (!grey || !eye || count < 4 || count > CF_MAX_EYE_POINTS || width <= 0 || height <= 0 || stride < width)
-		return guess;
-
-	/* 1. Frame and lids. Corners: the farthest pair of outline points. */
-	int ia = 0, ib = 1;
-	float best = -1;
-	for (int i = 0; i < count; i++)
-		for (int j = i + 1; j < count; j++) {
-			const float dx = eye[j].x - eye[i].x, dy = eye[j].y - eye[i].y;
-			const float d = dx * dx + dy * dy;
-			if (d > best) {
-				best = d;
-				ia = i;
-				ib = j;
-			}
-		}
-	const float w = sqrtf(best);
-	if (!(w >= 8 && w < 4096))
-		return guess;
-	rp_frame e;
-	e.ux = (eye[ib].x - eye[ia].x) / w;
-	e.uy = (eye[ib].y - eye[ia].y) / w;
-	if (e.ux < 0) {
-		e.ux = -e.ux;
-		e.uy = -e.uy;
-	}
-	e.nx = -e.uy;
-	e.ny = e.ux;
-	e.ihw = 2 / w;
-	e.c0x = 0.5f * (eye[ia].x + eye[ib].x);
-	e.c0y = 0.5f * (eye[ia].y + eye[ib].y);
-	/* Least squares for each lid's two coefficients from the points on its side. */
-	double M[2][5] = {{0}};
-	int nside[2] = {0, 0};
-	float lo = 0, hi = 0;
-	for (int k = 0; k < count; k++) {
-		const float dx = eye[k].x - e.c0x, dy = eye[k].y - e.c0y;
-		const float t = (dx * e.ux + dy * e.uy) * e.ihw, b = dx * e.nx + dy * e.ny;
-		lo = fminf(lo, b);
-		hi = fmaxf(hi, b);
-		if (k == ia || k == ib || !(fabsf(t) < 0.97f) || b == 0)
-			continue;
-		const int z = b > 0;
-		const double f0 = 1.0 - (double)t * t, f1 = f0 * t, bb = fabs((double)b);
-		M[z][0] += f0 * f0;
-		M[z][1] += f0 * f1;
-		M[z][2] += f1 * f1;
-		M[z][3] += f0 * bb;
-		M[z][4] += f1 * bb;
-		nside[z]++;
-	}
-	if (!nside[0] || !nside[1])
-		return guess;
-	float *coef[2] = {e.up, e.lo};
-	for (int z = 0; z < 2; z++) {
-		const double det = M[z][0] * M[z][2] - M[z][1] * M[z][1];
-		if (nside[z] >= 2 && det > 1e-3 * M[z][0] * M[z][2]) {
-			coef[z][0] = (float)((M[z][3] * M[z][2] - M[z][4] * M[z][1]) / det);
-			coef[z][1] = (float)((M[z][4] * M[z][0] - M[z][3] * M[z][1]) / det);
-		} else {
-			coef[z][0] = (float)(M[z][3] / M[z][0]);
-			coef[z][1] = 0;
-		}
-	}
-	/* Nearly closed: Vision's point, faded in (a switch would be a jump). */
-	float conf = smoothstepf(RP_OPEN0, RP_OPEN1, (hi - lo) / w);
-	if (!(conf > 0))
-		return guess;
-
+	const rp_frame e = *ep;
 	/* Grid: the lids' bounding box in s x s pixel blocks (block means: a big eye is low-passed, not
 	 * aliased; blocks aligned to multiples of s, so they don't move with the eye). */
 	float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
@@ -1775,7 +1707,7 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 	if (!(maxx > 0 && maxy > 0 && minx < (float)width && miny < (float)height && maxx - minx < 2 * w &&
 	      maxy - miny < 2 * w))
 		return guess;
-	int s = 1 + (int)(w / RP_CELLS_W), x0, y0, gw, gh;
+	int s = s_in, x0, y0, gw, gh;
 	for (;;) {
 		x0 = (int)fmaxf(minx - 1, 0) / s * s;
 		y0 = (int)fmaxf(miny - 1, 0) / s * s;
@@ -1818,7 +1750,7 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 	/* 2. Grey levels: weighted histogram inside the outline, away from the lash line. */
 	const float U0 = RP_UP0 * w, iU = 1 / ((RP_UP1 - RP_UP0) * w);
 	const float B0 = RP_LO0 * w, iB = 1 / ((RP_LO1 - RP_LO0) * w);
-	float hist[RP_NB] = {0}, qsum = 0;
+	float hist[RP_NB] = {0}, qsum = 0, msum = 0;
 	for (int j = 0; j < gh; j++) {
 		const float dy = gy0 + (float)j * fs;
 		for (int i = 0; i < gw; i++) {
@@ -1829,7 +1761,9 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 				if (m > 0)
 					q = m * rp_ss(U0, iU, du) * rp_ss(B0, iB, dl);
 			}
+			q *= 1 - smoothstepf(220.0f, 240.0f, val[c]);
 			qw[c] = q;
+			msum += m;
 			if (m <= 0)
 				val[c] = -1; /* outside the outline */
 			if (q <= 0)
@@ -1849,7 +1783,14 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 		}
 	}
 	const float R = RP_IRIS_R * w;
-	if (!(qsum * fs * fs >= 0.3f * R * R))
+	{
+		const float area = (4.0f / 3.0f) * 0.5f * w * (e.up[0] + e.lo[0]); /* integral of the opening */
+		conf *= smoothstepf(0.8f, 0.95f, area > 0 ? msum * fs * fs / area : 0); /* eye cut by the image edge */
+		if (!(conf > 0))
+			return guess;
+	}
+	conf *= smoothstepf(0.3f, 0.36f, qsum * fs * fs / (R * R)); /* too little of the eye between the lash lines */
+	if (!(conf > 0))
 		return guess;
 	float lev[2];
 	const float pct[2] = {RP_P_IRIS, RP_P_SCLERA};
@@ -1944,7 +1885,9 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 		const int ic = (int)floorf(pc), icx = (int)floorf(pc + 0.5f);
 		const float fr = pc - (float)ic;
 		const float pw = Hc * ifs, pn = 0.1f * R * ifs, pf = 0.4f * R * ifs; /* window, clearance */
-		const int nf = (int)ceilf(RP_FILL_R * R * ifs);                      /* bridging reach, cells */
+		const float nff = RP_FILL_R * R * ifs;
+		const int nf = (int)ceilf(nff);                                      /* bridging reach, cells */
+		const float nfl = nff - (float)(nf - 1);                             /* weight of the last one */
 		const int nwin = (int)ceilf(pw + pf) + nf + 3;
 		const int lo_i = ic - nwin < 0 ? 0 : ic - nwin, hi_i = ic + 1 + nwin > gw - 1 ? gw - 1 : ic + 1 + nwin;
 		const float EU0 = RP_EUP0 * w, iEU = 1 / ((RP_EUP1 - RP_EUP0) * w);
@@ -1963,8 +1906,16 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 		}
 		float ptx[RP_MAXPTS], pty[RP_MAXPTS], ptw[RP_MAXPTS];
 		int npt = 0;
-		for (int j = 0; ic >= 0 && ic + 1 < gw && j < gh; j++) {
-			const float Yj = (float)(y0 + j * s) + 0.5f * fs, dy = Yj - e.c0y;
+		/* Edge rows: every pixel row (blocks only along the row), so the vertical sampling does not
+		 * change with the block size. */
+		const int rpitch = (s + 1) / 2;
+		const int yend = y0 + gh * s < height ? y0 + gh * s : height;
+		int pya = (int)floorf((Y0 - 1.25f * R - 1) / (float)rpitch) * rpitch, pyb = (int)ceilf(Y0 + 1.25f * R) + 1;
+		while (pya < y0) /* rows on a fixed image grid, so they don't move with the eye */
+			pya += rpitch;
+		pyb = pyb > yend - 1 ? yend - 1 : pyb;
+		for (int py = pya; ic >= 0 && ic + 1 < gw && py <= pyb; py += rpitch) {
+			const float Yj = (float)py + 0.5f, dy = Yj - e.c0y;
 			float du, dl;
 			/* The row must cross the iris itself: not far from the centre so far, and its centre
 			 * column clear of the lid bands (lashes are dark too) ... */
@@ -1972,20 +1923,30 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 			core *= rp_lids(&e, X0 - e.c0x, dy, &du, &dl) ? rp_ss(EU0, iEU, du) * rp_ss(EL0, iEL, dl) : 0;
 			if (core <= 0)
 				continue;
-			const float *src = val + j * gw;
+			const uint8_t *grow = grey + (size_t)py * (size_t)stride;
 			float row[RP_MAXROW], mr[RP_MAXROW];
 			for (int i = lo_i; i <= hi_i; i++) {
-				mr[i] = rp_lids(&e, gx0 + (float)i * fs, dy, &du, &dl) ? rp_mask(du, dl, ifs) : 0;
-				row[i] = src[i] * mr[i];
+				mr[i] = rp_lids(&e, gx0 + (float)i * fs, dy, &du, &dl) ? rp_mask(du, dl, 1.0f) : 0;
+				if (mr[i] > 0) {
+					const int px0 = x0 + i * s, px1 = px0 + s > width ? width : px0 + s;
+					unsigned sum = 0;
+					for (int x = px0; x < px1; x++)
+						sum += grow[x];
+					const float gv = (float)sum / (float)(px1 - px0);
+					row[i] = (1 - clampf((gv - th0) * ith, 0, 1)) * mr[i];
+				} else {
+					row[i] = 0;
+				}
 			}
 			/* ... and be dark at the centre column, bright patches there bridged (dark both sides). */
 			{
 				float ml = row[ic], mg = row[ic + 1];
 				for (int k = 1; k <= nf; k++) {
-					if (ic - k >= lo_i && row[ic - k] > ml)
-						ml = row[ic - k];
-					if (ic + 1 + k <= hi_i && row[ic + 1 + k] > mg)
-						mg = row[ic + 1 + k];
+					const float wk = k == nf ? nfl : 1;
+					if (ic - k >= lo_i && row[ic - k] * wk > ml)
+						ml = row[ic - k] * wk;
+					if (ic + 1 + k <= hi_i && row[ic + 1 + k] * wk > mg)
+						mg = row[ic + 1 + k] * wk;
 				}
 				core *= smoothstepf(0.5f, 0.85f, fmaxf(row[ic] * (1 - fr) + row[ic + 1] * fr, fminf(ml, mg)));
 			}
@@ -2011,7 +1972,7 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 					if (fz[i] > 0) {
 						float m = d;
 						for (int k = 1, ii = i + step; k <= nf && ii >= lo_i && ii <= hi_i; k++, ii += step)
-							m = fmaxf(m, row[ii] * fc[ii]);
+							m = fmaxf(m, row[ii] * fc[ii] * (k == nf ? nfl : 1));
 						d += fz[i] * (m - d);
 					}
 					const float de = 1 - cov * (1 - d);
@@ -2041,7 +2002,7 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 					continue;
 				ptx[npt] = (float)step * Wpx * iR; /* R units around (X0, Y0) */
 				pty[npt] = (Yj - Y0) * iR;
-				ptw[npt++] = om;
+				ptw[npt++] = om * (float)rpitch * ifs;
 			}
 		}
 		float fcx, fcy, fw, sig;
@@ -2064,3 +2025,91 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 	res.y = guess.y + conf * (res.y - guess.y);
 	return res;
 }
+
+cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, const cf_pt *eye, int count,
+		      cf_pt guess)
+{
+	if (!grey || !eye || count < 4 || count > CF_MAX_EYE_POINTS || width <= 0 || height <= 0 || stride < width ||
+	    !isfinite(guess.x) || !isfinite(guess.y))
+		return guess;
+
+	/* 1. Frame and lids. Corners: the farthest pair of outline points. */
+	int ia = 0, ib = 1;
+	float best = -1;
+	for (int i = 0; i < count; i++)
+		for (int j = i + 1; j < count; j++) {
+			const float dx = eye[j].x - eye[i].x, dy = eye[j].y - eye[i].y;
+			const float d = dx * dx + dy * dy;
+			if (d > best) {
+				best = d;
+				ia = i;
+				ib = j;
+			}
+		}
+	const float w = sqrtf(best);
+	if (!(w >= 8 && w < 4096))
+		return guess;
+	rp_frame e;
+	e.ux = (eye[ib].x - eye[ia].x) / w;
+	e.uy = (eye[ib].y - eye[ia].y) / w;
+	if (e.ux < 0) {
+		e.ux = -e.ux;
+		e.uy = -e.uy;
+	}
+	e.nx = -e.uy;
+	e.ny = e.ux;
+	e.ihw = 2 / w;
+	e.c0x = 0.5f * (eye[ia].x + eye[ib].x);
+	e.c0y = 0.5f * (eye[ia].y + eye[ib].y);
+	/* Least squares for each lid's two coefficients from the points on its side. */
+	double M[2][5] = {{0}};
+	int nside[2] = {0, 0};
+	float lo = 0, hi = 0;
+	for (int k = 0; k < count; k++) {
+		const float dx = eye[k].x - e.c0x, dy = eye[k].y - e.c0y;
+		const float t = (dx * e.ux + dy * e.uy) * e.ihw, b = dx * e.nx + dy * e.ny;
+		lo = fminf(lo, b);
+		hi = fmaxf(hi, b);
+		if (k == ia || k == ib || !(fabsf(t) < 0.97f) || b == 0)
+			continue;
+		const int z = b > 0;
+		const double f0 = 1.0 - (double)t * t, f1 = f0 * t, bb = fabs((double)b);
+		M[z][0] += f0 * f0;
+		M[z][1] += f0 * f1;
+		M[z][2] += f1 * f1;
+		M[z][3] += f0 * bb;
+		M[z][4] += f1 * bb;
+		nside[z]++;
+	}
+	if (!nside[0] || !nside[1])
+		return guess;
+	float *coef[2] = {e.up, e.lo};
+	for (int z = 0; z < 2; z++) {
+		const double det = M[z][0] * M[z][2] - M[z][1] * M[z][1];
+		if (nside[z] >= 2 && det > 1e-3 * M[z][0] * M[z][2]) {
+			coef[z][0] = (float)((M[z][3] * M[z][2] - M[z][4] * M[z][1]) / det);
+			coef[z][1] = (float)((M[z][4] * M[z][0] - M[z][3] * M[z][1]) / det);
+		} else {
+			coef[z][0] = (float)(M[z][3] / M[z][0]);
+			coef[z][1] = 0;
+		}
+	}
+	/* Nearly closed: Vision's point, faded in (a switch would be a jump). */
+	float conf = smoothstepf(RP_OPEN0, RP_OPEN1, (hi - lo) / w);
+	if (!(conf > 0))
+		return guess;
+
+	{
+		const float sf = w / RP_CELLS_W;
+		const int s0 = 1 + (int)sf;
+		const float tb = smoothstepf(0.94f, 1.0f, sf - floorf(sf));
+		const cf_pt r0 = tb < 1 ? rp_refine_s(grey, stride, width, height, &e, w, conf, guess, s0) : guess;
+		if (!(tb > 0))
+			return r0;
+		const cf_pt r1 = rp_refine_s(grey, stride, width, height, &e, w, conf, guess, s0 + 1);
+		if (!(tb < 1) || (r0.x == r1.x && r0.y == r1.y))
+			return r1;
+		return (cf_pt){r0.x + tb * (r1.x - r0.x), r0.y + tb * (r1.y - r0.y)};
+	}
+}
+
