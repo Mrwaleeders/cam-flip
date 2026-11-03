@@ -96,11 +96,41 @@ void cf_gaze_start_calibration(cf_gaze *g)
 {
 	g->calibrating = 1;
 	g->calib_count = 0;
+	g->calib_frames = 0;
 	g->calib_done = 0;
+	g->calib_failed = 0;
+}
+
+static int cmpf(const void *a, const void *b);
+
+static void finish_calibration(cf_gaze *g)
+{
+	qsort(g->calib_samples, (size_t)g->calib_count, sizeof(float), cmpf);
+	g->calib_result = g->calib_samples[g->calib_count / 2];
+	g->calibrating = 0;
+	g->calib_done = 1;
+}
+
+/* Called once per frame while calibrating, whether or not a face was found, so a calibration
+ * started while the user looks away (or is out of frame) can't run forever. */
+static void calibration_tick(cf_gaze *g)
+{
+	if (!g->calibrating || ++g->calib_frames < CF_CALIB_TIMEOUT_FRAMES)
+		return;
+	if (g->calib_count >= CF_CALIB_MIN_SAMPLES) {
+		finish_calibration(g);
+	} else {
+		g->calibrating = 0;
+		g->calib_failed = 1;
+	}
 }
 
 int cf_gaze_take_calibration(cf_gaze *g, float *baseline_out)
 {
+	if (g->calib_failed) {
+		g->calib_failed = 0;
+		return -1;
+	}
 	if (!g->calib_done)
 		return 0;
 	g->calib_done = 0;
@@ -135,6 +165,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 
 	float target = 0;
 
+	calibration_tick(g);
+
 	if (ok) {
 		/* Face "up": perpendicular to the line between the eyes, pointing to the top of the image. */
 		float ax = m[1].center.x - m[0].center.x, ay = m[1].center.y - m[0].center.y;
@@ -165,12 +197,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 
 		if (g->calibrating && !blinking && abs_yaw < 15) {
 			g->calib_samples[g->calib_count++] = offset;
-			if (g->calib_count >= 30) {
-				qsort(g->calib_samples, (size_t)g->calib_count, sizeof(float), cmpf);
-				g->calib_result = g->calib_samples[g->calib_count / 2];
-				g->calibrating = 0;
-				g->calib_done = 1;
-			}
+			if (g->calib_count >= CF_CALIB_SAMPLES)
+				finish_calibration(g);
 		}
 
 		/* Eye geometry: follows the head closely (high beta), so the warp stays on the eyes. */

@@ -65,6 +65,7 @@ struct camflip {
 	uint8_t *bgra;
 	size_t bgra_size;
 	bool vision_needs_bgra;
+	bool vision_grey_ok; /* Vision has accepted a grey frame at least once */
 	bool warned_format;
 	bool warned_vision;
 	unsigned long vision_runs;     /* for diagnostics/tests */
@@ -175,16 +176,20 @@ static void detect_face(struct camflip *f, struct obs_source_frame *frame, const
 		f->vision_runs++;
 		if (!ok) {
 			f->vision_failures++;
-			if (!f->vision_needs_bgra) {
+			/* Only fall back to the slower BGRA path if grey input has never worked. A one-off
+			 * failure after grey frames have been accepted is not a format problem. */
+			if (!f->vision_needs_bgra && !f->vision_grey_ok) {
 				f->vision_needs_bgra = true;
 				blog(LOG_INFO, "[cam-flip] Vision rejected grey frames, switching to BGRA input");
 			} else if (!f->warned_vision) {
 				f->warned_vision = true;
-				blog(LOG_WARNING, "[cam-flip] face tracking failed: %s",
-				     error.localizedDescription.UTF8String);
+				const char *why = error.localizedDescription.UTF8String;
+				blog(LOG_WARNING, "[cam-flip] face tracking failed: %s", why ? why : "unknown error");
 			}
 			return;
 		}
+		if (!f->vision_needs_bgra)
+			f->vision_grey_ok = true;
 
 		VNFaceObservation *best = nil;
 		for (VNFaceObservation *obs in request.results) {
@@ -300,6 +305,8 @@ static bool camflip_calibrate_clicked(obs_properties_t *props, obs_property_t *p
 	(void)props;
 	(void)property;
 	struct camflip *f = data;
+	if (!f)
+		return false;
 	pthread_mutex_lock(&f->lock);
 	f->calibrate_request = true;
 	pthread_mutex_unlock(&f->lock);
@@ -375,11 +382,15 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 		const int n = cf_gaze_update(&f->gaze, &face, &params, t, eyes);
 
 		float baseline;
-		if (cf_gaze_take_calibration(&f->gaze, &baseline)) {
+		const int calibrated = cf_gaze_take_calibration(&f->gaze, &baseline);
+		if (calibrated > 0) {
 			pthread_mutex_lock(&f->lock);
 			f->baseline = baseline;
 			pthread_mutex_unlock(&f->lock);
 			blog(LOG_INFO, "[cam-flip] calibrated (baseline %.3f)", baseline);
+		} else if (calibrated < 0) {
+			blog(LOG_WARNING, "[cam-flip] calibration gave up: no steady, front-facing face seen. "
+					  "Look straight into the camera and click Calibrate again");
 		}
 
 		if (eye_contact && n > 0)

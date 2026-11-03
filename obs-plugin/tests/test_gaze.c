@@ -148,6 +148,17 @@ int main(void)
 	CHECK(got && fabsf(baseline - 0.1f) < 0.01f, "calibration baseline %.3f", baseline);
 	printf("ok: calibration baseline %.3f\n", baseline);
 
+	/* 9b. Calibrating with no usable face gives up instead of running (and keeping Vision busy) forever. */
+	cf_gaze_init(&g);
+	cf_gaze_start_calibration(&g);
+	got = 0;
+	for (int i = 0; i < CF_CALIB_TIMEOUT_FRAMES + 5 && !got; i++, t += dt) {
+		cf_gaze_update(&g, (cf_face[]){face_at(960, 500, -0.1f, 16, 40)}, &p, t, out); /* head turned */
+		got = cf_gaze_take_calibration(&g, &baseline);
+	}
+	CHECK(got == -1 && !g.calibrating, "calibration should time out (got %d, calibrating %d)", got, g.calibrating);
+	printf("ok: calibration times out without a usable face\n");
+
 	/* 10. Noisy landmarks while sitting still (±1.5 px, like real detection): the warp holds steady. */
 	cf_gaze_init(&g);
 	srand(7);

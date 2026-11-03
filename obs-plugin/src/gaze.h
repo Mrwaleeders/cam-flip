@@ -16,6 +16,9 @@ extern "C" {
 #endif
 
 #define CF_MAX_EYE_POINTS 32
+#define CF_CALIB_SAMPLES 30
+#define CF_CALIB_MIN_SAMPLES 10
+#define CF_CALIB_TIMEOUT_FRAMES 300 /* about 10 s at 30 fps */
 
 typedef struct {
 	float x, y; /* image pixels, origin top left */
@@ -56,6 +59,8 @@ typedef struct {
 
 	int calibrating;
 	int calib_count;
+	int calib_frames; /* frames seen since calibration started, for the timeout */
+	int calib_failed;
 	float calib_samples[64];
 	int calib_done;
 	float calib_result;
@@ -67,7 +72,8 @@ void cf_gaze_init(cf_gaze *g);
 int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, double t_seconds, cf_eye out[2]);
 
 void cf_gaze_start_calibration(cf_gaze *g);
-/* Returns 1 once (and clears the flag) when a calibration has just finished. */
+/* Returns 1 once (and clears the flag) when a calibration has just finished, -1 once when it gave
+ * up because no steady, front-facing face was seen for CF_CALIB_TIMEOUT_FRAMES, otherwise 0. */
 int cf_gaze_take_calibration(cf_gaze *g, float *baseline_out);
 
 #ifdef __cplusplus
