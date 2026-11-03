@@ -382,21 +382,35 @@ int main(int argc, char **argv)
 			free(last);
 			is_dup = calloc((size_t)nd + 1, 1);
 			int ndup = 0;
+			/* Which parity repeats: the one with the lower mean difference over the whole clip; it only
+			 * changes (a cadence slip) where a 1 s window shows the other parity clearly lower. While
+			 * the face is still, compression noise makes both parities look alike, so weak windows
+			 * keep the current parity instead of keeping every frame. */
+			double gs[2] = {0, 0};
+			int gc[2] = {0, 0};
 			for (int i = 1; i < nd; i++) {
-				double sp = 0, so = 0;
-				int cp = 0, co = 0;
-				for (int k = i - 30; k <= i + 30; k++) {
-					if (k < 1 || k >= nd)
-						continue;
-					if ((k & 1) == (i & 1)) {
-						sp += diff[k];
-						cp++;
-					} else {
-						so += diff[k];
-						co++;
+				gs[i & 1] += diff[i];
+				gc[i & 1]++;
+			}
+			const double gm0 = gc[0] ? gs[0] / gc[0] : 0, gm1 = gc[1] ? gs[1] / gc[1] : 0;
+			const int cadence = gc[0] && gc[1] && fmin(gm0, gm1) < 0.8 * fmax(gm0, gm1);
+			int cur = gm0 < gm1 ? 0 : 1;
+			for (int i = 1; cadence && i < nd; i++) {
+				double ls[2] = {0, 0};
+				int lc[2] = {0, 0};
+				for (int k = i - 30; k <= i + 30; k++)
+					if (k >= 1 && k < nd) {
+						ls[k & 1] += diff[k];
+						lc[k & 1]++;
 					}
+				if (lc[0] && lc[1]) {
+					const double m0 = ls[0] / lc[0], m1 = ls[1] / lc[1];
+					if (m0 < 0.4 * m1)
+						cur = 0;
+					else if (m1 < 0.4 * m0)
+						cur = 1;
 				}
-				if (cp && co && sp / cp < 0.6 * (so / co)) {
+				if ((i & 1) == cur) {
 					is_dup[i] = 1;
 					ndup++;
 				}
