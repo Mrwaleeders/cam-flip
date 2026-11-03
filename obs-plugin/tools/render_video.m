@@ -13,9 +13,11 @@
  * Options
  *   --lag N            the warp for frame k uses tracking from frame k-N, moved forward by
  *                      cf_gaze_predict (live it is 1: the worker analyses frame k after it is shown)
- *   --dedupe X         skip frames that differ from the previous kept frame by less than X mean grey
- *                      levels (OBS recording at 60 fps from a 30 fps camera repeats frames; default 0.6,
- *                      0 keeps every frame)
+ *   --dedupe MODE      OBS records at 60 fps from a 30 fps camera, so every other frame repeats; the
+ *                      filter never sees the repeats. "cadence" (default) finds them from the alternating
+ *                      frame-to-frame difference (per 1 s window, so a cadence slip is followed); a
+ *                      number X skips frames differing from the last kept one by less than X grey levels
+ *                      (drops real frames while still: avoid); 0 keeps every frame.
  *   --baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P
  *                      calibration, as saved in the filter's settings (OBS scene JSON)
  *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead
@@ -223,13 +225,13 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	int lag = 1, measure = 0, zoom = 3;
-	double dedupe = 0.6, lens[2] = {0, 0}, notes_r[2] = {0, 0};
+	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
 	for (int i = 3; i < argc; i++) {
 		const char *a = argv[i];
 		const char *v = i + 1 < argc ? argv[i + 1] : "0";
 		if (!strcmp(a, "--lag")) { lag = atoi(v); i++; }
-		else if (!strcmp(a, "--dedupe")) { dedupe = atof(v); i++; }
+		else if (!strcmp(a, "--dedupe")) { dedupe = !strcmp(v, "cadence") ? -1 : atof(v); i++; }
 		else if (!strcmp(a, "--baseline")) { p.baseline = (float)atof(v); i++; }
 		else if (!strcmp(a, "--baseline-open")) { p.baseline_open = (float)atof(v); i++; }
 		else if (!strcmp(a, "--notes-offset")) { p.notes_offset = (float)atof(v); p.has_notes = 1; i++; }
@@ -330,6 +332,79 @@ int main(int argc, char **argv)
 		printf("params: strength %.2f baseline %.4f open %.4f notes %d offset %.4f side %.4f open %.4f, lag %d\n",
 		       p.strength, p.baseline, p.baseline_open, p.has_notes, p.notes_offset, p.notes_side, p.notes_open, lag);
 
+		/* Repeated frames, by cadence: frame-to-frame differences alternate small (repeat) / large
+		 * (new camera frame). Per frame, look at a 1 s window: if one parity's mean difference is well
+		 * below the other's, frames of that parity are repeats. */
+		int nd = 0;
+		unsigned char *is_dup = NULL;
+		if (dedupe < 0) {
+			NSError *e0 = nil;
+			AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:asset error:&e0];
+			AVAssetReaderTrackOutput *o = [AVAssetReaderTrackOutput
+				assetReaderTrackOutputWithTrack:tracks[0]
+						 outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:
+									@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
+			[rd addOutput:o];
+			[rd startReading];
+			size_t dcap = 4096;
+			double *diff = calloc(dcap, sizeof(double));
+			uint8_t *last = NULL;
+			int lw = 0, lh = 0;
+			CMSampleBufferRef sb0;
+			while ((sb0 = [o copyNextSampleBuffer])) {
+				CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb0);
+				CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+				const int w = (int)CVPixelBufferGetWidthOfPlane(pb, 0), h = (int)CVPixelBufferGetHeightOfPlane(pb, 0);
+				const size_t st = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+				const uint8_t *py = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+				if (!last) {
+					lw = w;
+					lh = h;
+					last = calloc((size_t)((w + 3) / 4) * ((h + 3) / 4), 1);
+				}
+				double sad = 0;
+				long cnt = 0;
+				for (int y = 0; y < lh && y < h; y += 4)
+					for (int x = 0; x < lw && x < w; x += 4, cnt++) {
+						const size_t li = (size_t)(y / 4) * ((lw + 3) / 4) + (size_t)(x / 4);
+						sad += abs((int)py[(size_t)y * st + x] - (int)last[li]);
+						last[li] = py[(size_t)y * st + x];
+					}
+				CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+				CFRelease(sb0);
+				if ((size_t)nd == dcap) {
+					dcap *= 2;
+					diff = realloc(diff, dcap * sizeof(double));
+				}
+				diff[nd] = nd == 0 ? 1e9 : sad / (double)(cnt ? cnt : 1);
+				nd++;
+			}
+			free(last);
+			is_dup = calloc((size_t)nd + 1, 1);
+			int ndup = 0;
+			for (int i = 1; i < nd; i++) {
+				double sp = 0, so = 0;
+				int cp = 0, co = 0;
+				for (int k = i - 30; k <= i + 30; k++) {
+					if (k < 1 || k >= nd)
+						continue;
+					if ((k & 1) == (i & 1)) {
+						sp += diff[k];
+						cp++;
+					} else {
+						so += diff[k];
+						co++;
+					}
+				}
+				if (cp && co && sp / cp < 0.6 * (so / co)) {
+					is_dup[i] = 1;
+					ndup++;
+				}
+			}
+			free(diff);
+			printf("cadence: %d of %d frames are repeats\n", ndup, nd);
+		}
+
 		NSError *err = nil;
 		AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
 		AVAssetReaderTrackOutput *out = [AVAssetReaderTrackOutput
@@ -378,8 +453,11 @@ int main(int argc, char **argv)
 
 				/* Duplicate frames (60 fps recording of a 30 fps camera): the filter never sees them. */
 				bool dup = false;
+				const int fi = frames - 1;
 				if (!prev)
 					prev = malloc((size_t)w * h);
+				else if (dedupe < 0)
+					dup = is_dup && fi < nd && is_dup[fi];
 				else if (dedupe > 0) {
 					double sad = 0;
 					long cnt = 0;
@@ -587,28 +665,39 @@ int main(int argc, char **argv)
 			buf[9][i] = m[i].in_x[0];
 		}
 		{
-			int *dk = calloc((size_t)nn + 1, sizeof(int));
+			int *dk = calloc((size_t)nn + 1, sizeof(int)), *dko = calloc((size_t)nn + 1, sizeof(int));
 			double *din = calloc((size_t)nn + 1, sizeof(double)), *dout = calloc((size_t)nn + 1, sizeof(double)),
 			       *dadd = calloc((size_t)nn + 1, sizeof(double)), *dadd1 = calloc((size_t)nn + 1, sizeof(double));
-			double mean_add = 0;
-			int cnt = 0;
 			for (int i = 0; i < nn; i++) {
-				dk[i] = m[i].dok;
+				dko[i] = m[i].dok;
 				din[i] = m[i].dark_in[0];
 				dout[i] = m[i].dark_out[0];
-				dadd[i] = m[i].dark_out[0] - m[i].dark_in[0];
-				dadd1[i] = m[i].dark_out[1] - m[i].dark_in[1];
-				if (dk[i]) {
-					mean_add += dadd[i];
-					cnt++;
+				dadd[i] = m[i].shift_y[0];
+				dadd1[i] = m[i].shift_y[1];
+				dk[i] = m[i].ok && m[i].shift_y[0] != 0; /* warped frames */
+			}
+			printf("IRIS (dark-pixel centroid, independent of the plugin), y px: frame-to-frame RMS step original %.2f\n",
+			       step_rms(din, dko, nn));
+			/* The original iris moves smoothly, so the visible shake is the frame-to-frame change of the
+			 * applied shift. Whole clip, and the worst 1 s window (shaking comes in bursts). */
+			double worst = 0, worst_t = 0;
+			for (int a = 0; a < nn; a++) {
+				int b = a;
+				while (b < nn && m[b].t < m[a].t + 1.0)
+					b++;
+				if (b - a >= 8) {
+					const double r = step_rms(dadd + a, dk + a, b - a);
+					if (r > worst) {
+						worst = r;
+						worst_t = m[a].t;
+					}
 				}
 			}
-			printf("IRIS (dark-pixel centroid, independent of the plugin), y px: frame-to-frame RMS step original %.2f, "
-			       "corrected %.2f\n", step_rms(din, dk, nn), step_rms(dout, dk, nn));
-			printf("ADDED by the warp (corrected - original): mean %.2f px, frame-to-frame RMS step L %.2f R %.2f, "
-			       "5-frame shake L %.2f  <- the visible shake; lower is better\n",
-			       cnt ? mean_add / cnt : 0, step_rms(dadd, dk, nn), step_rms(dadd1, dk, nn), shake5(dadd, dk, nn));
+			printf("SHAKE = frame-to-frame RMS change of the applied vertical shift (px, lower is better): "
+			       "whole clip L %.2f R %.2f, worst 1 s window %.2f at %.1f s\n",
+			       step_rms(dadd, dk, nn), step_rms(dadd1, dk, nn), worst, worst_t);
 			free(dk);
+			free(dko);
 			free(din);
 			free(dout);
 			free(dadd);
