@@ -15,6 +15,11 @@ if [ ! -d "$OBS_SRC/libobs" ]; then
     https://github.com/obsproject/obs-studio.git "$OBS_SRC"
   git -C "$OBS_SRC" sparse-checkout set libobs
 fi
+# OBS's headers use SIMDe (header-only) for SSE intrinsics on Apple Silicon.
+SIMDE_SRC="build/simde"
+if [ ! -d "$SIMDE_SRC/simde" ]; then
+  git clone -q --depth 1 --branch v0.8.2 https://github.com/simd-everywhere/simde.git "$SIMDE_SRC"
+fi
 
 OUT="build/cam-flip.plugin"
 rm -rf "$OUT"
@@ -22,7 +27,7 @@ mkdir -p "$OUT/Contents/MacOS"
 
 clang -bundle -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 -O2 -Wall \
   -fobjc-arc -fvisibility=hidden \
-  -I"$OBS_SRC/libobs" -Isrc \
+  -I"$OBS_SRC/libobs" -I"$SIMDE_SRC" -Isrc \
   -DCAMFLIP_VERSION="\"$VERSION\"" \
   src/plugin.m src/gaze.c src/warp.c \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
