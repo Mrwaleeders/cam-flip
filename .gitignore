@@ -5,3 +5,4 @@ DerivedData/
 xcuserdata/
 standalone-app/Config/Local.xcconfig
 obs-plugin/build_test_*
+.claude/
