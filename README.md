@@ -16,9 +16,10 @@ Teams, Zoom and Meet mirror only your **own preview**. They always send the unfl
 * **Eye contact:** Apple's Vision framework finds your eyes and pupils. When you glance down at notes placed just under the camera, Cam Flip moves your irises back up toward the lens, so the other person shouldn't be able to tell you're reading.
 * **Looks natural when you move:**
   * Eye tracking runs in the background, a little behind the video, and Cam Flip predicts where your eyes are in each frame it corrects. So the correction stays on your eyes during normal head movement. Very fast, sudden movements can briefly show it a few pixels off before tracking catches up.
-  * When you turn your head, look far down (for example at the keyboard) or to the side, the correction fades out smoothly instead of forcing a stare. When you look back, it fades in again over about a third of a second. It never switches suddenly.
+  * When you turn your head, look far down (for example at the keyboard) or to the side, the correction fades out smoothly instead of forcing a stare. When you glance back, it takes over again during the eye's own quick jump, where nobody can see it. When you turn or drift back slowly, it fades in over about half a second. It never switches suddenly.
   * Head turns and tilts are measured on every frame from your eye corners and nose, against how your head sits when you look into the camera (step 1). Turning or tilting your head more than about 15° either way starts the fade, and by about 25 to 30° the correction is gone. The exact angles vary a little from face to face.
-  * When you blink, the correction is held steady through the blink, so your eyes don't flicker. If your eyes stay closed for longer, it fades out.
+  * The corrected eyes stay still while you read. Tracking noise, and stray readings such as a lid catching the pupil or one eye misread for a frame, don't show as shaking. A real glance between the camera and your notes still lands within a frame or two, at 15 fps as well as 30 fps.
+  * When you blink, the correction is held steady through the blink, so your eyes don't flicker. If you glance during a blink, the correction follows as your lids open. If your eyes stay closed for longer, it fades out, and comes back about as quickly as your lids open.
   * Automated tests check these behaviours on every build. See `obs-plugin/tests/test_gaze.c`.
 * **Image quality:**
   * Cam Flip works on the camera's frames in their native format (NV12, UYVY, BGRA and others). It never converts, scales or compresses them. (For cameras 2560 pixels wide or more, face tracking looks at a reduced-size copy to stay fast. The pupils are still located on the full-size frame, and the video itself is never scaled.)
@@ -62,7 +63,8 @@ In **OBS › Settings › Video**:
    1. Click **1. Click, then look into the camera**. Then look straight into the camera lens until the status says it's done (a second or two).
    2. Click **2. Click, then look at your notes**. Then look at the **middle of the line you usually read** in your notes, with your head still, until the status says it's done.
 
-   The status text in the filter's settings shows when each step is done. With both steps done, Cam Flip knows exactly where your notes are, and how open your eyes are while you read them, so it fully cancels that glance, tells reading apart from blinking, and fades out for anything further away (like your keyboard).
+   The status text in the filter's settings shows when each step is done. With both steps done, Cam Flip knows exactly where your notes are, and how open your eyes are while you read them, so it fully cancels that glance, tells reading apart from blinking, and fades out for anything further away (like your keyboard). It also learns how much of a glance Vision's own pupil points show for your eyes, which keeps the correction steadiest. If you calibrated with an older version, do both steps again once to get this.
+   If your eyes or lids moved while you calibrated, or your notes read barely below the camera, the status shows a warning after the step. The calibration is still used, but redo the step it names if the effect looks off.
    Redo both steps if you move your screen, notes or chair. If you redo only step 1 and your notes no longer sit below the new camera position, the status says **Notes calibration no longer matches: please redo step 2**. Until you do, Cam Flip uses the "Correct glances up to" slider instead.
 
 ### 5. Use it in calls
@@ -99,6 +101,8 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 * **Status says "Notes calibration failed":** step 2 measured a gaze that wasn't below the camera. Look at the middle of your notes under the camera (not at the screen or the camera) and try again. If it keeps failing, redo step 1 first.
 * **Status says "Notes calibration no longer matches: please redo step 2":** a newer step 1 put the camera level with or below your saved notes position. Do step 2 again.
 * **Status says "Redo step 1 so head turns and tilts are measured for your face":** step 1 was done by an older version (or your nose wasn't in view). Until you redo it, Cam Flip assumes a typical face: turning your head still fades the correction, a little later than it should, but tilting your head up or down doesn't.
+* **Status says "your eyes moved while calibrating":** the step was taken, but your gaze or lids moved during it, so it may be a little off. If the effect looks wrong, redo that step, keeping your gaze still on the lens (step 1) or on the middle of your notes (step 2).
+* **Status says "they read barely below the camera":** step 2 measured only a very small glance. If your notes are further down than that, step 1 was probably taken while looking slightly below the lens (at the screen). Redo step 1 looking straight into the lens, then step 2.
 * **Others see you un-mirrored:** check the filter is on the camera source, and the call app uses **OBS Virtual Camera**.
 
 ## Repo layout

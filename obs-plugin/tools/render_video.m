@@ -378,6 +378,7 @@ int main(int argc, char **argv)
 			f_out->test_clock = true;
 
 		/* Pass 1 (only if calibrating from time ranges): run the calibration like the buttons do. */
+		int vis_cal = 0; /* Vision's point given at step 1 (bit 1) and step 2 (bit 2), as in plugin.m */
 		for (int step = 0; step < 2; step++) {
 			const double *r = step == 0 ? lens : notes_r;
 			if (!(r[1] > r[0]))
@@ -429,6 +430,9 @@ int main(int argc, char **argv)
 				p.baseline = res.offset;
 				p.baseline_open = res.openness;
 				p.head_ref = res.head;
+			vis_cal = res.has_vis ? (vis_cal | 1) : (vis_cal & ~1);
+			p.vis_baseline = res.vis_offset;
+			p.has_vis_calib = vis_cal == 3 && p.has_notes;
 				printf("lens calibration: baseline %.4f open %.4f; head %s: side %.4f vert %.4f eyes %.4f tilt "
 				       "%.4f\n",
 				       res.offset, res.openness, res.head.ok ? "learnt" : "not learnt", res.head.side,
@@ -438,6 +442,9 @@ int main(int argc, char **argv)
 				p.notes_offset = res.offset;
 				p.notes_side = res.side;
 				p.notes_open = res.openness;
+			vis_cal = res.has_vis ? (vis_cal | 2) : (vis_cal & ~2);
+			p.vis_notes = res.vis_offset;
+			p.has_vis_calib = vis_cal == 3;
 				printf("notes calibration: offset %.4f side %.4f open %.4f\n", res.offset, res.side, res.openness);
 			} else {
 				printf("%s calibration failed (%d)\n", step == 0 ? "lens" : "notes", got);
