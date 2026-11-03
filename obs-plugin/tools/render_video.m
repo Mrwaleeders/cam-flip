@@ -13,11 +13,11 @@
  * Options
  *   --lag N            the warp for frame k uses tracking from frame k-N, moved forward by
  *                      cf_gaze_predict (live it is 1: the worker analyses frame k after it is shown)
- *   --dedupe MODE      OBS records at 60 fps from a 30 fps camera, so every other frame repeats; the
- *                      filter never sees the repeats. "cadence" (default) finds them from the alternating
- *                      frame-to-frame difference (per 1 s window, so a cadence slip is followed); a
- *                      number X skips frames differing from the last kept one by less than X grey levels
- *                      (drops real frames while still: avoid); 0 keeps every frame.
+ *   --dedupe MODE      OBS records at 60 fps from a 25 or 30 fps camera, so some frames repeat; the
+ *                      filter never sees the repeats. "cadence" (default) finds the camera rate and phase
+ *                      from the frame-to-frame differences; a number X skips frames differing from the last
+ *                      kept one by less than X grey levels (drops real frames while still: avoid); 0 keeps
+ *                      every frame.
  *   --baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P
  *                      calibration, as saved in the filter's settings (OBS scene JSON)
  *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead
@@ -148,6 +148,104 @@ static double step_rms(const double *x, const int *ok, int n)
 			c++;
 		}
 	return c ? sqrt(s / c) : NAN;
+}
+
+/* Finds which recorded frames repeat an earlier camera frame (OBS records at 60 fps from a 25 or
+ * 30 fps camera). Model: recorded frame i shows camera frame floor((t_i - t_0) * f + phase); it is
+ * new when that index changes. Searches the camera rate f (common rates, with a little clock drift)
+ * and the phase for the labelling where new frames differ from their predecessor most clearly more
+ * than repeats do. Returns 1 and fills is_dup when a cadence is clear (ratio >= 1.5), else 0. */
+static int find_cadence(const double *diff, const double *t, int n, unsigned char *is_dup, double *fps_out,
+			double *ratio_out)
+{
+	static const double rates[] = {30.0, 29.97, 25.0, 24.0, 20.0, 15.0, 12.0, 10.0};
+	double best = 0, best_f = 0, best_ph = 0;
+	if (n < 10)
+		return 0;
+	const double rec_fps = (n - 1) / fmax(t[n - 1] - t[0], 1e-6);
+	for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+		if (rates[r] > rec_fps * 0.95)
+			continue;
+		for (int d = -15; d <= 15; d++) {
+			const double f = rates[r] * (1.0 + d * 0.0002);
+			for (int p = 0; p < 80; p++) {
+				const double ph = p / 80.0;
+				double sn = 0, sr = 0;
+				int cn = 0, cr = 0;
+				long prev = (long)floor((t[0] - t[0]) * f + ph);
+				for (int i = 1; i < n; i++) {
+					const long idx = (long)floor((t[i] - t[0]) * f + ph);
+					if (idx != prev) {
+						sn += diff[i];
+						cn++;
+					} else {
+						sr += diff[i];
+						cr++;
+					}
+					prev = idx;
+				}
+				if (!cn || !cr)
+					continue;
+				const double ratio = (sn / cn) / fmax(sr / cr, 1e-3);
+				if (ratio > best) {
+					best = ratio;
+					best_f = f;
+					best_ph = ph;
+				}
+			}
+		}
+	}
+	*fps_out = best_f;
+	*ratio_out = best;
+	if (best < 1.5)
+		return 0;
+	long prev = (long)floor(best_ph);
+	is_dup[0] = 0;
+	for (int i = 1; i < n; i++) {
+		const long idx = (long)floor((t[i] - t[0]) * best_f + best_ph);
+		is_dup[i] = idx == prev;
+		prev = idx;
+	}
+	return 1;
+}
+
+/* Openness and gaze offsets of one eye, the way the gaze model measures them: relative to the line
+ * through the two outline points farthest apart (the corners), in eye widths, positive = up. */
+static void eye_metrics(const cf_pt *eye, int n, cf_pt refined, cf_pt vision, double *open, double *off_r, double *off_v)
+{
+	*open = *off_r = *off_v = NAN;
+	if (n < 4)
+		return;
+	int a = 0, b = 1;
+	float best = -1;
+	for (int i = 0; i < n; i++)
+		for (int j = i + 1; j < n; j++) {
+			const float dx = eye[j].x - eye[i].x, dy = eye[j].y - eye[i].y;
+			if (dx * dx + dy * dy > best) {
+				best = dx * dx + dy * dy;
+				a = i;
+				b = j;
+			}
+		}
+	if (eye[a].x > eye[b].x) {
+		const int tmp = a;
+		a = b;
+		b = tmp;
+	}
+	const double w = sqrt(best);
+	if (!(w > 2))
+		return;
+	const double ux = (eye[b].x - eye[a].x) / w, uy = (eye[b].y - eye[a].y) / w;
+	const double nx = uy, ny = -ux; /* up (image y grows downwards) */
+	double lo = 0, hi = 0;
+	for (int i = 0; i < n; i++) {
+		const double v = (eye[i].x - eye[a].x) * nx + (eye[i].y - eye[a].y) * ny;
+		lo = fmin(lo, v);
+		hi = fmax(hi, v);
+	}
+	*open = (hi - lo) / w;
+	*off_r = ((refined.x - eye[a].x) * nx + (refined.y - eye[a].y) * ny) / w;
+	*off_v = ((vision.x - eye[a].x) * nx + (vision.y - eye[a].y) * ny) / w;
 }
 
 static AVAssetWriter *make_writer(NSString *path, int w, int h, double bitrate, AVAssetWriterInput **in_out,
@@ -350,7 +448,7 @@ int main(int argc, char **argv)
 			[rd addOutput:o];
 			[rd startReading];
 			size_t dcap = 4096;
-			double *diff = calloc(dcap, sizeof(double));
+			double *diff = calloc(dcap, sizeof(double)), *tsv = calloc(dcap, sizeof(double));
 			uint8_t *last = NULL;
 			int lw = 0, lh = 0;
 			CMSampleBufferRef sb0;
@@ -374,51 +472,30 @@ int main(int argc, char **argv)
 						last[li] = py[(size_t)y * st + x];
 					}
 				CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+				const double ts0 = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb0));
 				CFRelease(sb0);
 				if ((size_t)nd == dcap) {
 					dcap *= 2;
 					diff = realloc(diff, dcap * sizeof(double));
+					tsv = realloc(tsv, dcap * sizeof(double));
 				}
+				tsv[nd] = ts0;
 				diff[nd] = nd == 0 ? 1e9 : sad / (double)(cnt ? cnt : 1);
 				nd++;
 			}
 			free(last);
 			is_dup = calloc((size_t)nd + 1, 1);
+			double cam_fps = 0, ratio = 0;
+			const int found = find_cadence(diff, tsv, nd, is_dup, &cam_fps, &ratio);
 			int ndup = 0;
-			/* Which parity repeats: the one with the lower mean difference over the whole clip; it only
-			 * changes (a cadence slip) where a 1 s window shows the other parity clearly lower. While
-			 * the face is still, compression noise makes both parities look alike, so weak windows
-			 * keep the current parity instead of keeping every frame. */
-			double gs[2] = {0, 0};
-			int gc[2] = {0, 0};
-			for (int i = 1; i < nd; i++) {
-				gs[i & 1] += diff[i];
-				gc[i & 1]++;
-			}
-			const double gm0 = gc[0] ? gs[0] / gc[0] : 0, gm1 = gc[1] ? gs[1] / gc[1] : 0;
-			const int cadence = gc[0] && gc[1] && fmin(gm0, gm1) < 0.8 * fmax(gm0, gm1);
-			int cur = gm0 < gm1 ? 0 : 1;
-			for (int i = 1; cadence && i < nd; i++) {
-				double ls[2] = {0, 0};
-				int lc[2] = {0, 0};
-				for (int k = i - 30; k <= i + 30; k++)
-					if (k >= 1 && k < nd) {
-						ls[k & 1] += diff[k];
-						lc[k & 1]++;
-					}
-				if (lc[0] && lc[1]) {
-					const double m0 = ls[0] / lc[0], m1 = ls[1] / lc[1];
-					if (m0 < 0.4 * m1)
-						cur = 0;
-					else if (m1 < 0.4 * m0)
-						cur = 1;
-				}
-				if ((i & 1) == cur) {
-					is_dup[i] = 1;
-					ndup++;
-				}
-			}
+			for (int i = 0; i < nd; i++)
+				ndup += is_dup[i];
 			free(diff);
+			free(tsv);
+			if (found)
+				printf("cadence: camera %.2f fps (new frames differ %.1fx more than repeats)\n", cam_fps, ratio);
+			else
+				printf("cadence: no repeat pattern found (best ratio %.2f): keeping every frame\n", ratio);
 			printf("cadence: %d of %d frames are repeats\n", ndup, nd);
 		}
 
@@ -445,7 +522,10 @@ int main(int argc, char **argv)
 		AVAssetWriterInput *ifull = nil, *icmp = nil;
 		AVAssetWriterInputPixelBufferAdaptor *afull = nil, *acmp = nil;
 		FILE *csv = fopen([[dir stringByAppendingPathComponent:@"frames.csv"] UTF8String], "w");
-		fprintf(csv, "t,n,factor,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,in_ly,in_ry,out_ly,out_ry\n");
+		/* in_*: refined pupil y minus outline centroid (px). l/r_open, l/r_ref, l/r_vis: openness and
+		 * the refined and Vision pupil offsets (eye widths, + = up) the gaze model saw on this frame. */
+		fprintf(csv, "t,n,factor,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,in_ly,in_ry,out_ly,out_ry,"
+			     "l_open,l_ref,l_vis,r_open,r_ref,r_vis,yaw,pitch\n");
 
 		size_t cap = 4096, nm = 0;
 		meas_t *m = calloc(cap, sizeof(meas_t));
@@ -594,9 +674,17 @@ int main(int argc, char **argv)
 						mm->dark_out[1] = d2.y;
 					}
 				}
-				fprintf(csv, "%.4f,%d,%.3f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", t, n,
-					st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
-					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1]);
+				double em[2][3];
+				eye_metrics(face.left_eye, face.left_count, face.left_pupil, face.left_pupil_vision, &em[0][0],
+					    &em[0][1], &em[0][2]);
+				eye_metrics(face.right_eye, face.right_count, face.right_pupil, face.right_pupil_vision,
+					    &em[1][0], &em[1][1], &em[1][2]);
+				fprintf(csv,
+					"%.4f,%d,%.3f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+					"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f\n",
+					t, n, st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
+					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1], em[0][0],
+					em[0][1], em[0][2], em[1][0], em[1][1], em[1][2], face.yaw_deg, face.pitch_deg);
 
 				/* Writers, sized on the first frame. The close-up crop is fixed from the first face. */
 				if (!wfull) {
