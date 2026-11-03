@@ -68,6 +68,7 @@ struct camflip {
 	bool vision_grey_ok; /* Vision has accepted a grey frame at least once */
 	bool warned_format;
 	bool warned_vision;
+	bool warned_flip;
 	unsigned long vision_runs;     /* for diagnostics/tests */
 	unsigned long vision_failures;
 };
@@ -248,7 +249,52 @@ static void camflip_update(void *data, obs_data_t *settings)
 	f->eye_contact = obs_data_get_bool(settings, S_EYE_CONTACT);
 	f->strength = (float)obs_data_get_double(settings, S_STRENGTH) / 100.0f;
 	f->max_glance = (float)obs_data_get_double(settings, S_MAX_GLANCE) / 100.0f;
+	/* The calibration result lives in the settings too (see store_baseline), so a saved value
+	 * comes back on load and the Defaults button resets it. */
+	f->baseline = (float)obs_data_get_double(settings, S_BASELINE);
 	pthread_mutex_unlock(&f->lock);
+}
+
+/* A calibration result on its way from the video thread to the source's settings. */
+struct baseline_task {
+	obs_weak_source_t *source;
+	struct camflip *f;
+	float baseline;
+};
+
+/* Runs on the UI thread, where settings are normally edited, so it never races the properties
+ * window. Writing into the settings means the value survives a crash (OBS saves settings with
+ * the scene collection) without needing a .save callback. */
+static void store_baseline_task(void *param)
+{
+	struct baseline_task *t = param;
+	obs_source_t *source = obs_weak_source_get_source(t->source);
+	if (source) {
+		obs_data_t *settings = obs_source_get_settings(source);
+		obs_data_set_double(settings, S_BASELINE, t->baseline);
+		obs_data_release(settings);
+
+		/* An update that ran between calibrating and now read the old value from the settings.
+		 * Holding a reference to the source keeps the filter (and f) alive here. */
+		pthread_mutex_lock(&t->f->lock);
+		t->f->baseline = t->baseline;
+		pthread_mutex_unlock(&t->f->lock);
+		obs_source_release(source);
+	}
+	obs_weak_source_release(t->source);
+	bfree(t);
+}
+
+/* Called on the video thread when a calibration finishes. */
+static void store_baseline(struct camflip *f, float baseline)
+{
+	if (!f->context) /* no real source, e.g. in tests */
+		return;
+	struct baseline_task *t = bzalloc(sizeof(*t));
+	t->source = obs_source_get_weak_source(f->context);
+	t->f = f;
+	t->baseline = baseline;
+	obs_queue_task(OBS_TASK_UI, store_baseline_task, t, false);
 }
 
 static void *camflip_create(obs_data_t *settings, obs_source_t *source)
@@ -257,7 +303,6 @@ static void *camflip_create(obs_data_t *settings, obs_source_t *source)
 	f->context = source;
 	pthread_mutex_init(&f->lock, NULL);
 	cf_gaze_init(&f->gaze);
-	f->baseline = (float)obs_data_get_double(settings, S_BASELINE);
 
 	@autoreleasepool {
 		VNDetectFaceLandmarksRequest *request = [[VNDetectFaceLandmarksRequest alloc] init];
@@ -281,14 +326,6 @@ static void camflip_destroy(void *data)
 	free(f->bgra);
 	pthread_mutex_destroy(&f->lock);
 	bfree(f);
-}
-
-static void camflip_save(void *data, obs_data_t *settings)
-{
-	struct camflip *f = data;
-	pthread_mutex_lock(&f->lock);
-	obs_data_set_double(settings, S_BASELINE, f->baseline);
-	pthread_mutex_unlock(&f->lock);
 }
 
 static void camflip_defaults(obs_data_t *settings)
@@ -370,8 +407,22 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 		return frame;
 	}
 
-	if (calibrate)
+	if (frame->flip) {
+		/* Upside-down (bottom-up) frames: face tracking and the eye warp assume top-down rows, so
+		 * eye contact is skipped. Say so once, and don't leave a calibration silently pending. */
+		if (eye_contact && !f->warned_flip) {
+			f->warned_flip = true;
+			blog(LOG_WARNING, "[cam-flip] eye contact is unavailable: this camera delivers upside-down "
+					  "frames. Mirroring still works");
+		}
+		if (calibrate || f->gaze.calibrating) {
+			cf_gaze_init(&f->gaze);
+			blog(LOG_WARNING, "[cam-flip] calibration cancelled: this camera delivers upside-down frames, "
+					  "so eye contact is unavailable");
+		}
+	} else if (calibrate) {
 		cf_gaze_start_calibration(&f->gaze);
+	}
 
 	/* Eye contact first (on the camera's original orientation), then mirror. */
 	if ((eye_contact || f->gaze.calibrating) && !frame->flip) {
@@ -387,6 +438,7 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 			pthread_mutex_lock(&f->lock);
 			f->baseline = baseline;
 			pthread_mutex_unlock(&f->lock);
+			store_baseline(f, baseline);
 			blog(LOG_INFO, "[cam-flip] calibrated (baseline %.3f)", baseline);
 		} else if (calibrated < 0) {
 			blog(LOG_WARNING, "[cam-flip] calibration gave up: no steady, front-facing face seen. "
@@ -411,7 +463,6 @@ static struct obs_source_info camflip_filter = {
 	.create = camflip_create,
 	.destroy = camflip_destroy,
 	.update = camflip_update,
-	.save = camflip_save,
 	.get_defaults = camflip_defaults,
 	.get_properties = camflip_properties,
 	.filter_video = camflip_filter_video,
