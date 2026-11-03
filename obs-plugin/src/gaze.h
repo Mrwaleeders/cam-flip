@@ -19,6 +19,7 @@ extern "C" {
 #define CF_CALIB_SAMPLES 30
 #define CF_CALIB_MIN_SAMPLES 10
 #define CF_CALIB_TIMEOUT_FRAMES 300 /* about 10 s at 30 fps */
+#define CF_LOST_GRACE_S 0.1 /* a face missing for less than this is a detection dropout: hold the warp */
 
 typedef struct {
 	float x, y; /* image pixels, origin top left */
@@ -51,10 +52,12 @@ typedef struct {
 typedef struct {
 	cf_one_euro cx[2], cy[2], rx[2], ry[2], eye_h[2];
 	cf_one_euro down;
-	float factor;      /* current, smoothed 0..1 */
+	cf_one_euro roll;  /* head roll (angle of the line between the eyes), smoothed */
+	float factor;     /* current, smoothed 0..1 */
 	float last_target; /* for diagnostics */
 	cf_pt up;          /* smoothed face "up" direction */
 	double last_t;
+	double lost_time;  /* how long the face has been missing, in seconds (0 while it's found) */
 	int have_geometry;
 
 	int calibrating;

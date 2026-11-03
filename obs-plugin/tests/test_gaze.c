@@ -48,9 +48,38 @@ static cf_face face_at(float x, float y, float pupil_down, float eye_h, float ya
 	return f;
 }
 
+/* The same face with the head tilted (rolled) by roll_deg, clockwise on screen, about (x, y). */
+static cf_face face_rolled(float x, float y, float pupil_down, float eye_h, float roll_deg)
+{
+	cf_face f = face_at(x, y, pupil_down, eye_h, 0);
+	const float c = cosf(roll_deg * 0.017453293f), s = sinf(roll_deg * 0.017453293f);
+	cf_pt *all[2] = {f.left_eye, f.right_eye};
+	cf_pt *pupils[2] = {&f.left_pupil, &f.right_pupil};
+	for (int e = 0; e < 2; e++) {
+		for (int i = 0; i <= 8; i++) {
+			cf_pt *q = i < 8 ? &all[e][i] : pupils[e];
+			const float dx = q->x - x, dy = q->y - y;
+			q->x = x + c * dx - s * dy;
+			q->y = y + s * dx + c * dy;
+		}
+	}
+	return f;
+}
+
+static float noise(float amp)
+{
+	return ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * amp;
+}
+
 static float shift_px(const cf_eye *e)
 {
 	return sqrtf(e->sx * e->sx + e->sy * e->sy);
+}
+
+/* Direction of the warp's push, in degrees (0 = straight up, positive = towards the right). */
+static float shift_angle_deg(const cf_eye *e)
+{
+	return atan2f(e->sx, -e->sy) * 57.29578f;
 }
 
 int main(void)
@@ -185,6 +214,75 @@ int main(void)
 	float ssd = (float)sqrt(fmax(ssum2 / count - (ssum / count) * (ssum / count), 0));
 	CHECK(sd < 0.5f && ssd < 0.3f, "jitter too high: position %.2f px, shift %.2f px", sd, ssd);
 	printf("ok: steady when still (position jitter %.2f px, shift jitter %.2f px)\n", sd, ssd);
+
+	/* 11. Noisy landmarks on both eyes while sitting still: the push keeps a steady direction
+	 * (straight up), instead of wobbling with every frame's landmark noise. */
+	cf_gaze_init(&g);
+	srand(11);
+	double asum = 0, asum2 = 0;
+	float aworst = 0;
+	count = 0;
+	for (int i = 0; i < 150; i++, t += dt) {
+		cf_face f = face_at(960, 500, 0.25f, 16, 0);
+		for (int k = 0; k < 8; k++) {
+			f.left_eye[k].x += noise(2);
+			f.left_eye[k].y += noise(2);
+			f.right_eye[k].x += noise(2);
+			f.right_eye[k].y += noise(2);
+		}
+		n = cf_gaze_update(&g, &f, &p, t, out);
+		if (i >= 60 && n) {
+			const float a = shift_angle_deg(&out[0]);
+			asum += a;
+			asum2 += a * a;
+			aworst = fmaxf(aworst, fabsf(a));
+			count++;
+		}
+	}
+	const float asd = (float)sqrt(fmax(asum2 / count - (asum / count) * (asum / count), 0));
+	CHECK(count > 80 && asd < 0.25f && aworst < 0.8f, "push direction wobbles: sd %.2f deg, worst %.2f deg", asd, aworst);
+	printf("ok: steady push direction when still (sd %.2f deg, worst %.2f deg)\n", asd, aworst);
+
+	/* 12. A real head tilt (15 degrees) is still followed within a few frames. */
+	for (int i = 0; i < 6; i++, t += dt)
+		n = cf_gaze_update(&g, (cf_face[]){face_rolled(960, 500, 0.25f, 16, 15)}, &p, t, out);
+	float roll_err = n ? fabsf(shift_angle_deg(&out[0]) - 15.0f) : 99;
+	CHECK(roll_err < 3.0f, "push direction lags a head tilt by %.1f deg after 0.2 s", roll_err);
+	for (int i = 0; i < 24; i++, t += dt)
+		n = cf_gaze_update(&g, (cf_face[]){face_rolled(960, 500, 0.25f, 16, 15)}, &p, t, out);
+	roll_err = n ? fabsf(shift_angle_deg(&out[0]) - 15.0f) : 99;
+	CHECK(roll_err < 0.5f, "push direction should settle on the tilt (%.2f deg off)", roll_err);
+	CHECK(n == 2 && shift_px(&out[0]) > 3.0f, "a tilted head should still be corrected");
+	printf("ok: head tilt followed (%.2f deg off after 1 s)\n", roll_err);
+
+	/* 13. A one-frame detection dropout: the warp holds, no flicker. */
+	cf_gaze_init(&g);
+	for (int i = 0; i < 60; i++, t += dt)
+		n = cf_gaze_update(&g, (cf_face[]){face_at(960, 500, 0.25f, 16, 0)}, &p, t, out);
+	const float before = shift_px(&out[0]);
+	n = cf_gaze_update(&g, &(cf_face){0}, &p, t, out);
+	t += dt;
+	const float during = n ? shift_px(&out[0]) : 0;
+	n = cf_gaze_update(&g, (cf_face[]){face_at(960, 500, 0.25f, 16, 0)}, &p, t, out);
+	t += dt;
+	const float after = n ? shift_px(&out[0]) : 0;
+	CHECK(fabsf(during - before) < 0.1f && fabsf(after - before) < 0.2f,
+	      "1-frame dropout changed the warp: %.2f -> %.2f -> %.2f px", before, during, after);
+	printf("ok: 1-frame dropout holds the warp (%.2f -> %.2f -> %.2f px)\n", before, during, after);
+
+	/* 14. The face really gone (say the person moved quickly): the warp is over within 0.2 s, so
+	 * it doesn't linger over a spot where the eyes no longer are. */
+	for (int i = 0; i < 30; i++, t += dt)
+		n = cf_gaze_update(&g, (cf_face[]){face_at(960, 500, 0.25f, 16, 0)}, &p, t, out);
+	int frames_to_stop = -1;
+	for (int i = 1; i <= 30 && frames_to_stop < 0; i++, t += dt) {
+		n = cf_gaze_update(&g, &(cf_face){0}, &p, t, out);
+		if (n == 0)
+			frames_to_stop = i;
+	}
+	CHECK(frames_to_stop > 0 && frames_to_stop * dt <= 0.2 + 1e-6, "warp lingered %d frames after losing the face",
+	      frames_to_stop);
+	printf("ok: lost face stops the warp after %.0f ms\n", frames_to_stop * dt * 1000);
 
 	if (failures) {
 		printf("%d FAILED\n", failures);
