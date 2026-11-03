@@ -151,7 +151,7 @@ int main(void)
 	/* 10. Noisy landmarks while sitting still (±1.5 px, like real detection): the warp holds steady. */
 	cf_gaze_init(&g);
 	srand(7);
-	float sum = 0, sum2 = 0, ssum = 0, ssum2 = 0;
+	double sum = 0, sum2 = 0, ssum = 0, ssum2 = 0;
 	int count = 0;
 	for (int i = 0; i < 120; i++, t += dt) {
 		cf_face f = face_at(960, 500, 0.25f, 16, 0);
@@ -162,16 +162,16 @@ int main(void)
 		f.left_pupil.y += ((float)rand() / (float)RAND_MAX - 0.5f) * 3;
 		n = cf_gaze_update(&g, &f, &p, t, out);
 		if (i >= 60 && n) {
-			sum += out[0].cx;
-			sum2 += out[0].cx * out[0].cx;
+			sum += out[0].cx - 900.0;
+			sum2 += (out[0].cx - 900.0) * (out[0].cx - 900.0);
 			float s = shift_px(&out[0]);
 			ssum += s;
 			ssum2 += s * s;
 			count++;
 		}
 	}
-	float sd = sqrtf(fmaxf(sum2 / count - (sum / count) * (sum / count), 0));
-	float ssd = sqrtf(fmaxf(ssum2 / count - (ssum / count) * (ssum / count), 0));
+	float sd = (float)sqrt(fmax(sum2 / count - (sum / count) * (sum / count), 0));
+	float ssd = (float)sqrt(fmax(ssum2 / count - (ssum / count) * (ssum / count), 0));
 	CHECK(sd < 0.5f && ssd < 0.3f, "jitter too high: position %.2f px, shift %.2f px", sd, ssd);
 	printf("ok: steady when still (position jitter %.2f px, shift jitter %.2f px)\n", sd, ssd);
 

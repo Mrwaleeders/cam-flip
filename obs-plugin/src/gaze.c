@@ -70,8 +70,15 @@ static int measure(const cf_pt *pts, int count, cf_pt pupil, eye_measure *m)
 		miny = fminf(miny, pts[i].y);
 		maxy = fmaxf(maxy, pts[i].y);
 	}
-	m->center.x = (minx + maxx) / 2;
-	m->center.y = (miny + maxy) / 2;
+	/* Centre = average of the contour points: steadier than the bounding box, because noise
+	 * on individual landmarks averages out. */
+	float sx = 0, sy = 0;
+	for (int i = 0; i < count; i++) {
+		sx += pts[i].x;
+		sy += pts[i].y;
+	}
+	m->center.x = sx / (float)count;
+	m->center.y = sy / (float)count;
 	m->width = maxx - minx;
 	m->height = maxy - miny;
 	m->pupil = pupil;
