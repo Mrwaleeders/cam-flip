@@ -41,11 +41,18 @@ typedef struct {
 	int is_luma;    /* 1 for the channel that carries brightness (or a colour channel in RGB) */
 } cf_channel;
 
+#define CF_MAX_APERTURE 32
+
 /* One eye region, in full-resolution image pixels with the origin at the top left. */
 typedef struct {
-	float cx, cy; /* centre */
-	float rx, ry; /* ellipse radii */
-	float sx, sy; /* displacement applied at the centre (negative sy moves content up) */
+	float cx, cy; /* centre of the region that may change */
+	float rx, ry; /* ellipse radii: nothing outside this ellipse is ever changed */
+	float sx, sy; /* iris displacement (negative sy moves content up) */
+	float lid_sx, lid_sy; /* upper eyelid displacement, usually about a third of the iris one */
+	/* Outline of the eye opening (lid edges), in order around the eye, image pixels.
+	 * aperture_count 0 means "no outline": the whole ellipse moves by (sx, sy). */
+	int aperture_count;
+	float aperture[CF_MAX_APERTURE][2];
 } cf_eye;
 
 /* Splits a frame into channels. Returns the number of channels (0 if unsupported). */
