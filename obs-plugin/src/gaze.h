@@ -132,6 +132,7 @@ typedef struct {
 		double t, down;
 		float far;
 		int ready;
+		int suspect; /* that frame's lids were moving and its pupil move didn't look like a glance */
 	} hist[CF_HIST];
 	int hist_n;
 	float r_slow;           /* relative openness, lightly smoothed (two-frame mean, then ~0.08 s) */

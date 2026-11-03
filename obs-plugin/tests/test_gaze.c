@@ -1117,14 +1117,14 @@ int main(void)
 		/* 23b. Rolling the head continuously (30 deg/s, 15 -> -15 -> 15 degrees) while reading: the
 		 * push direction trails only slightly, and the roll never reads as a glance (the correction's
 		 * size stays put, since the measurement uses each frame's own eye axis). */
-		const float steady = shift_px(&out[0]);
+		const float roll_steady = shift_px(&out[0]);
 		float worst_dir = 0, worst_size = 0;
 		for (int i = 0; i < 60; i++, t += dt) {
 			const float deg = i < 30 ? 15.0f - (float)i : -15.0f + (float)(i - 30);
 			n = update(&g, face_rolled(960, 500, 0.25f, 16, deg), &p, t, out);
 			if (n) {
 				worst_dir = fmaxf(worst_dir, fabsf(shift_angle_deg(&out[0]) - deg));
-				worst_size = fmaxf(worst_size, fabsf(shift_px(&out[0]) - steady));
+				worst_size = fmaxf(worst_size, fabsf(shift_px(&out[0]) - roll_steady));
 			} else {
 				worst_size = 99;
 			}
@@ -1174,6 +1174,77 @@ int main(void)
 		CHECK(frames_to_stop > 0 && frames_to_stop * dt <= 0.3 + 1e-6, "warp lingered %d frames after losing the face",
 		      frames_to_stop);
 		printf("ok: lost face held for 0.2 s, then the warp stops (after %.0f ms)\n", frames_to_stop * dt * 1000);
+	}
+
+	/* 26. Glance from the lens to the notes, then a blink 0, 1 or 2 frames later (full blink or half
+	 * blink, pupil point sliding 0 or 1 px with the closing lids; lids steady during the glance, or
+	 * following it down by 2 px). The glance itself was seen with steady lids: the blink must keep
+	 * it, not undo it. No frame below 90% of the notes correction after the glance, no jump back. */
+	{
+		const float gl = 0.04f, gpx = gl * 40.0f;
+		const cf_gaze_params pg = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		float worst_lo = 1e9f, worst_hi = 0, worst_jump = 0;
+		for (int follow = 0; follow < 2; follow++)
+			for (int half = 0; half < 2; half++)
+				for (int slide = 0; slide < 2; slide++)
+					for (int gap = 0; gap <= 2; gap++) {
+						const float base = follow ? 14.0f : 16.0f; /* lids at the notes */
+						const float full[] = {9, 2, 2, 9, base}, part[] = {10, 6.7f, 6.7f, 6.7f, 10};
+						const float *lids = half ? part : full;
+						cf_gaze_init(&g);
+						settle(&g, face_px(960, 500, 0, 0, 16, 0, 0), &pg, &t, 45, out);
+						float lo = 1e9f, hi = 0, after_lo = 1e9f, after_hi = 0;
+						for (int i = 0; i < 1 + gap + 5 + 25; i++, t += dt) {
+							const int kb = i - 1 - gap; /* blink frames 0..4 */
+							const float h = (kb >= 0 && kb < 5) ? lids[kb] : base;
+							const float pd = gpx + (h < base ? (float)slide * (base - h) / (base - 2) : 0);
+							n = update(&g, face_px(960, 500, 0, pd, h, 0, 0), &pg, t, out);
+							const float sv = n ? shift_px(&out[0]) : 0;
+							lo = fminf(lo, sv);
+							hi = fmaxf(hi, sv);
+							if (kb >= 5) {
+								after_lo = fminf(after_lo, sv);
+								after_hi = fmaxf(after_hi, sv);
+							}
+						}
+						CHECK(lo > 0.9f * gpx && hi < 1.1f * gpx && after_hi - after_lo < 0.1f,
+						      "glance then %s blink %d frames later (lids %s, slide %d): %.2f..%.2f px (notes "
+						      "%.2f), after the blink %.2f..%.2f",
+						      half ? "half" : "full", gap, follow ? "following" : "steady", slide, lo, hi, gpx,
+						      after_lo, after_hi);
+						worst_lo = fminf(worst_lo, lo / gpx);
+						worst_hi = fmaxf(worst_hi, hi / gpx);
+						worst_jump = fmaxf(worst_jump, after_hi - after_lo);
+					}
+		printf("ok: glance then blink 0-2 frames later (full/half, slide 0/1, lids steady/following): %.0f%%..%.0f%% "
+		       "of the notes correction, %.2f px change after the blink\n",
+		       100 * worst_lo, 100 * worst_hi, worst_jump);
+	}
+
+	/* 27. Keyboard glance over a few frames with the lids dropping to r 0.5: the correction lets go and
+	 * stays off; it must not come back for a frame while the eye only moves down. */
+	{
+		const float gl = 0.04f, gpx = gl * 40.0f;
+		const cf_gaze_params pk = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		const float pupil[][3] = {{4.0f, 6.5f, 8.0f}, {5.87f, 6.54f, 8.0f}, {3.0f, 5.0f, 7.0f}};
+		const float lid[][3] = {{12, 10, 8}, {11, 9.5f, 8}, {13, 11, 9}};
+		float back = 0;
+		for (int c = 0; c < 3; c++) {
+			cf_gaze_init(&g);
+			settle(&g, face_px(960, 500, 0, gpx, 14, 0, 0), &pk, &t, 60, out);
+			float prev_vis = gpx - shift_px(&out[0]);
+			for (int i = 0; i < 20; i++, t += dt) {
+				const float pd = pupil[c][i < 3 ? i : 2], h = lid[c][i < 3 ? i : 2];
+				n = update(&g, face_px(960, 500, 0, pd, h, 0, 0), &pk, t, out);
+				const float vis = pd - (n ? shift_px(&out[0]) : 0); /* visible eye below the lens */
+				back = fmaxf(back, prev_vis - vis);
+				prev_vis = vis;
+			}
+		}
+		CHECK(back < 0.3f, "keyboard glance: the visible eye moved back up %.2f px mid-glance", back);
+		printf("ok: keyboard glance with dropping lids only moves down (%.2f px back up at most)\n", back);
 	}
 
 	if (failures) {

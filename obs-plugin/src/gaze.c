@@ -66,7 +66,11 @@
 #define LID_STEADY_STEP 0.05f /* relative openness per frame: lids moving more than this are not steady */
 #define LID_STEADY_TIME 0.10  /* s: the lid cue needs the lids steady this long */
 #define LID_STEADY_MAX 0.08f  /* ... the steadiness threshold widens with lid noise up to this, no further */
-#define ROLLBACK_WIN 0.15     /* s: a blink or half blink undoes glance changes made this shortly before it */
+#define ROLLBACK_WIN 0.15     /* s: a blink or half blink undoes glance changes made this shortly before it ... */
+#define ROLLBACK_PUPIL 0.03f  /* eye widths: ... and by more than a dragged pupil point (~1 px) moves */
+#define ROLLBACK_SLIDE_MAX 0.08f /* eye widths: the pupil now this much past the rolled-back state is a real glance */
+#define ROLLBACK_GLANCE 0.6f  /* ... by frames whose lids moved, unless the pupil moved at least this fraction
+			       * of the lid move (the lid following a glance): a glance seen is kept */
 #define EASE_STEP_PX 0.3f     /* px per 1/30 s: largest output change after a half-blink hold times out */
 #define EASE_MIN 0.15         /* s: ... kept up at least this long (covers the lid cue waking up) */
 #define LID_GATE 1.05f        /* lid cue only once the pupil already reads past the limit (x this) */
@@ -600,6 +604,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	g->hist[g->hist_n - 1].down = g->down.value;
 	g->hist[g->hist_n - 1].ready = g->down.ready;
 	g->hist[g->hist_n - 1].far = g->far_fade;
+	g->hist[g->hist_n - 1].suspect = 0; /* set below, once this frame's lids and pupil are known */
 	const float step = g->have_rel_open ? g->last_rel_open - r : 0.0f;
 	/* Lid noise, learned while nothing is held (blinks are not noise). */
 	if (g->have_rel_open && !holding(g, t))
@@ -638,13 +643,22 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * before the lids started to move. */
 	const int held_now = g->blink || g->half;
 	if (held_now && !was_held) {
-		for (int k = 0; k < g->hist_n; k++)
-			if (t - g->hist[k].t <= ROLLBACK_WIN) {
-				if (g->hist[k].ready && g->down.ready)
-					g->down.value = g->hist[k].down;
-				g->far_fade = g->hist[k].far;
-				break;
-			}
+		/* Walk back over the run of suspect frames just before this one (the lids already moving,
+		 * the pupil point dragged along) and restore the state from before the first of them. A
+		 * frame with steady lids, or whose pupil moved like a glance, ends the walk: what it saw is
+		 * kept. (The newest entry is this frame's own, which has changed nothing yet.) */
+		int from = -1;
+		for (int k = g->hist_n - 2; k >= 0 && t - g->hist[k].t <= ROLLBACK_WIN && g->hist[k].suspect; k--)
+			from = k;
+		/* Never undo a glance the pupil is still clearly showing, more than a lid could drag it (a
+		 * keyboard glance with the lids dropping): the correction would come back mid-glance. */
+		if (from >= 0 && g->hist[from].ready && down_raw - (float)g->hist[from].down > ROLLBACK_SLIDE_MAX)
+			from = -1;
+		if (from >= 0) {
+			if (g->hist[from].ready && g->down.ready)
+				g->down.value = g->hist[from].down;
+			g->far_fade = g->hist[from].far;
+		}
 		g->ease = 0;
 	}
 	const int hold = holding(g, t);
@@ -654,6 +668,27 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	    slow_drop > fmaxf(LID_STEADY_STEP, 1.4f * g->lid_noise)) /* just fell (seen through the noise) */
 		g->lid_move_t = t;
 	const int lids_steady = t - g->lid_move_t >= LID_STEADY_TIME;
+	int glance_trusted; /* this frame's change may be kept by a rollback; finished once far_fade is known */
+	int lids_clear;     /* ... because the lids were clearly steady (not just a glance-like pupil move) */
+	float glance_step;
+	{
+		/* Is what this frame is about to change trustworthy (see the rollback above)? Yes if the lids
+		 * were clearly steady, or the pupil clearly moved like a glance (at least ROLLBACK_GLANCE of the
+		 * lid drop, and well above the pupil noise). Anything unclear (noisy lids that may be starting
+		 * to close) is suspect, so a blink caught late still undoes it. */
+		/* Lids falling this frame, eye widths: the raw step or twice the two-frame-mean drop, whichever
+		 * is larger (two noisy estimates; erring towards "the lids moved"). */
+		const float lid_fall = fmaxf(fmaxf(step, 2.0f * slow_drop), 0.0f); /* relative openness */
+		const float lid_step = lid_fall * fmaxf(ref, 0.05f);
+		const float pupil_step = down_raw - g->last_down_raw;
+		const int clearly_steady = !g->closing && !held_now && fabsf(step) < LID_STEADY_STEP &&
+					   lid_fall < LID_STEADY_STEP;
+		const int clearly_glance = pupil_step > fmaxf(ROLLBACK_PUPIL, 3.0f * g->down_noise) &&
+					   pupil_step >= ROLLBACK_GLANCE * lid_step + 3.0f * g->down_noise;
+		glance_trusted = clearly_steady || clearly_glance;
+		lids_clear = clearly_steady;
+		glance_step = pupil_step;
+	}
 	/* Landmark noise: mean frame-to-frame change of the raw glance while the lids are steady. Clipped
 	 * so the occasional real saccade barely moves it. */
 	if (!hold && g->have_down_raw) {
@@ -799,6 +834,13 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	if (!g->blink && !g->closing && !g->half)
 		g->far_fade = 1.0f - smoothstepf(limit, limit + band, far);
 	const float f_far = g->far_fade;
+	/* A glance-like move with the lids moving that also switched the correction off (past the notes) is
+	 * only trusted when it is far bigger than a dragged pupil point: a noisy reading of a slide can look
+	 * like a small glance, but not like a keyboard glance. */
+	if (glance_trusted && !lids_clear && g->far_fade < g->hist[g->hist_n - 1].far - 0.3f &&
+	    glance_step < GLANCE_BIG + 2.0f * g->down_noise)
+		glance_trusted = 0;
+	g->hist[g->hist_n - 1].suspect = !glance_trusted;
 	float f_size = smoothstepf(0.05f, 0.09f, face->face_width / fmaxf((float)face->image_width, 1.0f));
 	f_size = isfinite(f_size) ? f_size : 0;
 	/* No "down <= 0 -> off" here: the shift is already 0 at the lens (it is proportional to the
