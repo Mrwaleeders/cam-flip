@@ -36,6 +36,8 @@ typedef struct {
 	int ok;
 	double in_y[2], out_y[2], in_x[2], out_x[2]; /* pupil minus eye-outline centroid */
 	double shift_y[2], cx[2], cy[2];
+	int dok;
+	double dark_in[2], dark_out[2]; /* dark_centroid y, original and corrected frame */
 } meas_t;
 
 static double shake5(const double *x, const int *ok, int n)
@@ -64,6 +66,86 @@ static cf_pt centroid_of(const cf_pt *p, int n)
 		c.y /= (float)n;
 	}
 	return c;
+}
+
+/* Independent iris measure for the summary (not the plugin's refiner): darkness-weighted centroid
+ * of the pixels inside the eye outline, relative to the outline's centroid. Biased by the lids, but
+ * smooth, so the frame-to-frame change of (corrected - original) is the shake the warp adds. */
+static int cmp_u8(const void *a, const void *b)
+{
+	return (int)*(const uint8_t *)a - (int)*(const uint8_t *)b;
+}
+
+static int dark_centroid(const uint8_t *img, size_t stride, int w, int h, const cf_pt *eye, int n, cf_pt *out)
+{
+	if (n < 4)
+		return 0;
+	float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+	for (int i = 0; i < n; i++) {
+		x0 = fminf(x0, eye[i].x);
+		x1 = fmaxf(x1, eye[i].x);
+		y0 = fminf(y0, eye[i].y);
+		y1 = fmaxf(y1, eye[i].y);
+	}
+	const int ix0 = (int)fmaxf(0, floorf(x0)), ix1 = (int)fminf((float)w - 1, ceilf(x1));
+	const int iy0 = (int)fmaxf(0, floorf(y0)), iy1 = (int)fminf((float)h - 1, ceilf(y1));
+	if (ix1 - ix0 < 8 || iy1 - iy0 < 3 || (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > 400 * 200)
+		return 0;
+	static uint8_t vals[400 * 200];
+	static float xs[400 * 200], ys[400 * 200];
+	int m = 0;
+	for (int y = iy0; y <= iy1; y++)
+		for (int x = ix0; x <= ix1; x++) {
+			const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+			int inside = 0;
+			for (int k = 0, j = n - 1; k < n; j = k++)
+				if ((eye[k].y > py) != (eye[j].y > py) &&
+				    px < (eye[j].x - eye[k].x) * (py - eye[k].y) / (eye[j].y - eye[k].y) + eye[k].x)
+					inside = !inside;
+			if (!inside)
+				continue;
+			vals[m] = img[(size_t)y * stride + x];
+			xs[m] = px;
+			ys[m] = py;
+			m++;
+		}
+	if (m < 30)
+		return 0;
+	static uint8_t sorted[400 * 200];
+	memcpy(sorted, vals, (size_t)m);
+	qsort(sorted, (size_t)m, 1, cmp_u8);
+	const float lo = sorted[m / 20], hi = sorted[m * 7 / 10];
+	const float thr = lo + 0.5f * (hi - lo);
+	if (!(thr > lo + 2))
+		return 0;
+	double sw = 0, sx = 0, sy = 0;
+	for (int i = 0; i < m; i++) {
+		float wt = (thr - (float)vals[i]) / (thr - lo);
+		wt = wt < 0 ? 0 : (wt > 1 ? 1 : wt);
+		wt *= wt;
+		sw += wt;
+		sx += wt * xs[i];
+		sy += wt * ys[i];
+	}
+	if (sw < 1)
+		return 0;
+	const cf_pt c = centroid_of(eye, n);
+	out->x = (float)(sx / sw) - c.x;
+	out->y = (float)(sy / sw) - c.y;
+	return 1;
+}
+
+/* RMS of the frame-to-frame change, over consecutive pairs where both are ok. */
+static double step_rms(const double *x, const int *ok, int n)
+{
+	double s = 0;
+	int c = 0;
+	for (int i = 1; i < n; i++)
+		if (ok[i] && ok[i - 1]) {
+			s += (x[i] - x[i - 1]) * (x[i] - x[i - 1]);
+			c++;
+		}
+	return c ? sqrt(s / c) : NAN;
 }
 
 static AVAssetWriter *make_writer(NSString *path, int w, int h, double bitrate, AVAssetWriterInput **in_out,
@@ -404,6 +486,19 @@ int main(int argc, char **argv)
 					mm->cx[e] = n > e ? eyes[e].cx : c.x;
 					mm->cy[e] = n > e ? eyes[e].cy : c.y;
 				}
+				{
+					cf_pt a, b, c2, d2;
+					mm->dok = face.found && dark_centroid(sy, sys, w, h, face.left_eye, face.left_count, &a) &&
+						  dark_centroid(dy, dys, w, h, face.left_eye, face.left_count, &b) &&
+						  dark_centroid(sy, sys, w, h, face.right_eye, face.right_count, &c2) &&
+						  dark_centroid(dy, dys, w, h, face.right_eye, face.right_count, &d2);
+					if (mm->dok) {
+						mm->dark_in[0] = a.y;
+						mm->dark_out[0] = b.y;
+						mm->dark_in[1] = c2.y;
+						mm->dark_out[1] = d2.y;
+					}
+				}
 				fprintf(csv, "%.4f,%d,%.3f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", t, n,
 					st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
 					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1]);
@@ -490,6 +585,34 @@ int main(int argc, char **argv)
 			buf[7][i] = m[i].cy[0];
 			buf[8][i] = m[i].out_x[0];
 			buf[9][i] = m[i].in_x[0];
+		}
+		{
+			int *dk = calloc((size_t)nn + 1, sizeof(int));
+			double *din = calloc((size_t)nn + 1, sizeof(double)), *dout = calloc((size_t)nn + 1, sizeof(double)),
+			       *dadd = calloc((size_t)nn + 1, sizeof(double)), *dadd1 = calloc((size_t)nn + 1, sizeof(double));
+			double mean_add = 0;
+			int cnt = 0;
+			for (int i = 0; i < nn; i++) {
+				dk[i] = m[i].dok;
+				din[i] = m[i].dark_in[0];
+				dout[i] = m[i].dark_out[0];
+				dadd[i] = m[i].dark_out[0] - m[i].dark_in[0];
+				dadd1[i] = m[i].dark_out[1] - m[i].dark_in[1];
+				if (dk[i]) {
+					mean_add += dadd[i];
+					cnt++;
+				}
+			}
+			printf("IRIS (dark-pixel centroid, independent of the plugin), y px: frame-to-frame RMS step original %.2f, "
+			       "corrected %.2f\n", step_rms(din, dk, nn), step_rms(dout, dk, nn));
+			printf("ADDED by the warp (corrected - original): mean %.2f px, frame-to-frame RMS step L %.2f R %.2f, "
+			       "5-frame shake L %.2f  <- the visible shake; lower is better\n",
+			       cnt ? mean_add / cnt : 0, step_rms(dadd, dk, nn), step_rms(dadd1, dk, nn), shake5(dadd, dk, nn));
+			free(dk);
+			free(din);
+			free(dout);
+			free(dadd);
+			free(dadd1);
 		}
 		printf("frames %d read, %d kept (camera frames), %d warped, mean tracking %.1f ms\n", frames, kept, warped,
 		       kept ? track_ms / kept : 0);
