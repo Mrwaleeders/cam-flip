@@ -120,6 +120,25 @@
 #define DOWN_OUT_CUTOFF 1.5   /* Hz: second low-pass stage on what the output shows, vertical ... */
 #define SIDE_OUT_CUTOFF 2.0   /* ... and sideways (see slew()) */
 
+/* ---- Tuning: head and lids (see head_lids()) */
+#define EYE_K 0.41f           /* eyeball radius / eye width (12 mm / 29 mm): an eye turning by a moves the iris
+			       * EYE_K sin(a) eye widths against its corners */
+#define HEAD_PITCH_MAX 18.0f  /* deg: a head tilted down is made up for up to here (CF_PITCH_FADE_LO) */
+#define HEAD_YAW_K 0.5f       /* share of the head's turn made up for sideways */
+#define HEAD_YAW_MAX 15.0f    /* deg: ... up to here (CF_YAW_FADE_LO) */
+#define HEAD_MIN_CUTOFF 0.5   /* Hz: One Euro smoothing of the head's angles while it is still ... */
+#define HEAD_BETA 0.2         /* ... and how much quicker per deg/s it moves (head_angles()) */
+#define HEAD_SLEW_PX 0.4f     /* px per 1/30 s: fastest a head term moves the iris */
+#define LID_TAU 0.15          /* s: smoothing of the lid heights, each of two stages */
+#define LID_SLEW_PX 0.12f     /* px per 1/30 s: fastest the lid restoration moves a lid */
+#define LID_DEAD 0.002f       /* eye widths: lid changes this small are landmark noise, not restored */
+#define UP_DROP_MAX 0.035f    /* eye widths: the most upper-lid drop restored (~2.6 px on a 75 px eye) ... */
+#define LO_RISE_MAX 0.025f    /* ... and lower-lid rise */
+#define VOR_TAU 0.5           /* s: how long the head's move can explain a catch-up of the glance ... */
+#define VOR_GLIDE_PX 0.2f     /* ... px per 1/30 s it is glided in at (glide_catch_up()) ... */
+#define VOR_RAW_TAU 0.03      /* s: ... and smoothing of the raw glance it is checked against */
+#define READ_SPAN_HI 1.8f     /* the reading area reaches this x the calibrated notes glance (reading_limit()) */
+
 /* ---- One Euro filter (Casiez et al.): adaptive low-pass, little jitter and little lag. */
 
 static double oe_alpha(double cutoff, double dt)
@@ -636,6 +655,7 @@ typedef struct {
 	float offset;    /* pupil above the corner line, eye widths (positive = up) */
 	float side;      /* pupil along the corner line from the corner midpoint, eye widths */
 	float openness;  /* height / width */
+	float upper, lower; /* upper lid above, lower lid below the corner line, eye widths (upper + lower = openness) */
 	int has_v;       /* Vision's own pupil point given (and finite): */
 	float v_offset, v_side; /* ... the same two measures from it */
 } eye_measure;
@@ -688,6 +708,8 @@ static int measure(const cf_pt *pts, int count, cf_pt pupil, const cf_pt *vpupil
 	m->width = w;
 	m->height = hi - lo;
 	m->openness = m->height / w;
+	m->upper = hi / w;
+	m->lower = -lo / w;
 	const float px = pupil.x - mid.x, py = pupil.y - mid.y;
 	m->offset = (px * nx + py * ny) / w;
 	m->side = (px * ux + py * uy) / w;
@@ -804,7 +826,12 @@ static float finite_or(float v, float fallback)
 static cf_gaze_params sanitize(const cf_gaze_params *in)
 {
 	cf_gaze_params p = *in;
-	p.strength = clampf(finite_or(p.strength, 0.0f), 0.0f, 1.0f);
+	p.strength = clampf(finite_or(p.strength, 0.0f), 0.0f, CF_STRENGTH_MAX);
+	/* Lid heights at the lens: both known and plausible, or neither (lids then not restored). */
+	p.baseline_upper = finite_or(p.baseline_upper, 0.0f);
+	p.baseline_lower = finite_or(p.baseline_lower, 0.0f);
+	if (!(p.baseline_upper > 0.0f && p.baseline_upper < 1.0f && p.baseline_lower > 0.0f && p.baseline_lower < 1.0f))
+		p.baseline_upper = p.baseline_lower = 0.0f;
 	p.max_glance = finite_or(p.max_glance, 0.15f);
 	p.baseline = finite_or(p.baseline, 0.0f);
 	p.baseline_open = finite_or(p.baseline_open, 0.0f);
@@ -847,6 +874,8 @@ static void finish_calibration(cf_gaze *g)
 	g->calib_result = median(g->calib_samples, g->calib_count);
 	g->calib_open_result = median(g->calib_open, g->calib_count);
 	g->calib_side_result = median(g->calib_side, g->calib_count);
+	g->calib_upper_result = median(g->calib_upper, g->calib_count); /* head and lids */
+	g->calib_lower_result = median(g->calib_lower, g->calib_count);
 	g->calib_head_result = cf_head_reference(g->calib_head, g->calib_head_n);
 	g->calibrating = 0;
 	g->calib_done = 1;
@@ -884,6 +913,8 @@ int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out)
 	out->openness = g->calib_open_result;
 	out->side = g->calib_side_result;
 	out->head = g->calib_head_result;
+	out->upper = g->calib_upper_result; /* head and lids */
+	out->lower = g->calib_lower_result;
 	return 1;
 }
 
@@ -984,13 +1015,179 @@ static int holding(const cf_gaze *g, double t)
 	return g->blink || g->closing || g->half || t < g->settle_until;
 }
 
+/* ---- Head and lids
+ *
+ * What the viewer reads as gaze is where the head points plus where the eyes point in the head. The glance
+ * (g->down, g->side) measures only the second, against the lens calibration. While reading notes under the
+ * camera the head tilts down as well (on the user's clips ~6 deg, IQR 3, up to 19, against ~1.5 px of iris
+ * movement in a 75 px eye), so cancelling the eyes alone left them looking that far below the lens. An eye
+ * turning by an angle a moves the iris EYE_K sin(a) eye widths against its corners, so a head tilted down by p
+ * is made up for by EYE_K sin(p) more lift: the total is how far the eyes would have to turn up in the head
+ * to meet the lens. It is summed with the glance before clamping at 0, so a head tilted down while the eyes
+ * look into the lens (the glance then reads up by just as much) gets no correction. Only down, and only up
+ * to HEAD_PITCH_MAX: a head tilted further looks elsewhere, and the pitch fade lets go there.
+ *
+ * The head's turn is made up for sideways in the same way, but only HEAD_YAW_K of it: with typical face
+ * depths the turn reads 0.9-1.7x the true angle across faces (tests/test_pose.c), the sideways correction
+ * itself damps only READ_DAMP of the eyes' scanning, and a head following a line while the eyes stay on the
+ * viewer is what eye contact looks like anyway; half keeps the eyes nearer the lens when the head turns with
+ * the text, and can never swing them past it.
+ *
+ * Lids: reading lowers the upper lid and raises the lower one (~0.01 eye widths each on the user's clips), and
+ * a narrower opening alone reads as looking down. Against the lens calibration's lid heights the drop and
+ * the rise are restored while correcting: the upper lid is lifted by its drop where that is more than it
+ * already follows the iris (LID_SHIFT of the glance's lift, see emit()), the lower lid lowered by its rise.
+ *
+ * All terms are smoothed (head_angles(), LID_TAU) and move by at most HEAD_SLEW_PX / LID_SLEW_PX a frame,
+ * are frozen while a blink is held (the lids are meaningless then), and reach the eyes only through the
+ * eased factor, so they never snap.
+ */
+
+static float med3f(float a, float b, float c)
+{
+	return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+}
+
+/* The head's angles for the head terms, degrees, against the lens calibration (0 without one, as pose.c).
+ * The pose's own angles are smoothed for a fade and run ~4 frames behind a moving head, while the eyes
+ * turning against it to hold a spot show at once, so the lift would run ahead of the head and lag back.
+ * These are the median of the pose's last three measures (a one-frame glitch never shows), through a One
+ * Euro filter: smoothed harder than the pose's while the head is still, a frame or two behind it while it
+ * moves. (Landmark noise still passes more than it does into the glance: see the report in test 40.) */
+static void head_angles(cf_gaze *g, const cf_gaze_params *p, double t, float *yaw, float *pitch)
+{
+	const cf_pose *ps = &g->pose;
+	*yaw = *pitch = 0;
+	if (!ps->ready || ps->hist_n < 1 || ps->hist_n > 3)
+		return;
+	cf_head md = ps->hist[ps->hist_n - 1];
+	if (ps->hist_n == 3) {
+		const cf_head *h = ps->hist;
+		md.side = med3f(h[0].side, h[1].side, h[2].side);
+		md.vert = med3f(h[0].vert, h[1].vert, h[2].vert);
+		md.eyes = med3f(h[0].eyes, h[1].eyes, h[2].eyes);
+		md.tilt = med3f(h[0].tilt, h[1].tilt, h[2].tilt);
+	}
+	float y = 0, pt = 0;
+	cf_head_angles(&md, &p->head_ref, &y, &pt);
+	if (!isfinite(y) || !isfinite(pt))
+		return;
+	*yaw = (float)oe_filter(&g->head_yf, y, t, HEAD_MIN_CUTOFF, HEAD_BETA);
+	*pitch = (float)oe_filter(&g->head_pf, pt, t, HEAD_MIN_CUTOFF, HEAD_BETA);
+}
+
+static void head_lids(cf_gaze *g, const cf_gaze_params *p, const eye_measure m[2], int hold, double t, double dt)
+{
+	if (hold)
+		return; /* blink, half blink, closing or settling: everything stays where it was */
+	const float w = fmaxf(0.5f * (float)(g->rx[0].value + g->rx[1].value), 1.0f);
+	const float k30 = (float)fmin(dt * 30.0, 1.0); /* per frame at 30 fps or slower */
+	const float deg = (float)(M_PI / 180.0);
+
+	/* The head (a glitch that got past the median still moves the terms only so fast). */
+	float yaw, pitch;
+	head_angles(g, p, t, &yaw, &pitch);
+	const float hv = EYE_K * sinf(clampf(pitch, 0.0f, HEAD_PITCH_MAX) * deg);
+	const float hh = HEAD_YAW_K * EYE_K * sinf(clampf(yaw, -HEAD_YAW_MAX, HEAD_YAW_MAX) * deg);
+	const float sh = HEAD_SLEW_PX * k30 / w;
+	g->head_v += clampf(hv - g->head_v, -sh, sh);
+	g->head_h += clampf(hh - g->head_h, -sh, sh);
+
+	/* The lids, both eyes' mean. */
+	const float up = 0.5f * (m[0].upper + m[1].upper), lo = 0.5f * (m[0].lower + m[1].lower);
+	if (!g->have_lids) {
+		g->lid_up = g->lid_up1 = up;
+		g->lid_lo = g->lid_lo1 = lo;
+		g->have_lids = 1;
+	} else {
+		/* Two stages: the lid heights come from the outline's extreme points, as noisy as single landmarks,
+		 * and one stage of the same lag would pass several times more of that into each frame's step. */
+		const float al = (float)(1.0 - exp(-dt / LID_TAU));
+		g->lid_up1 += al * (up - g->lid_up1);
+		g->lid_lo1 += al * (lo - g->lid_lo1);
+		g->lid_up += al * (g->lid_up1 - g->lid_up);
+		g->lid_lo += al * (g->lid_lo1 - g->lid_lo);
+	}
+	float ud = 0, lr = 0;
+	if (p->baseline_upper > 0 && p->baseline_lower > 0) { /* sanitize(): both calibrated, or neither */
+		ud = clampf(p->baseline_upper - g->lid_up - LID_DEAD, 0.0f, UP_DROP_MAX);
+		lr = clampf(p->baseline_lower - g->lid_lo - LID_DEAD, 0.0f, LO_RISE_MAX);
+	}
+	const float sl = LID_SLEW_PX * k30 / w;
+	g->up_drop += clampf(ud - g->up_drop, -sl, sl);
+	g->lo_rise += clampf(lr - g->lo_rise, -sl, sl);
+}
+
+/* The glance catching up after the head moved. Eyes holding a spot while the head tilts turn the other way in
+ * the head by as much, so the glance and the head term change alike in opposite directions and the lift stays
+ * put. But the glance passes the gate, which keeps a slow drift like that back as noise until it has grown
+ * past the noise band and then takes it in one frame, while the head term follows at once: the lift would
+ * ramp with the head and then jump back by a pixel or two. So a jump of the lift back against the way the
+ * head just moved it is glided in at VOR_GLIDE_PX a frame instead, as far as all three agree: the head moved
+ * the lift that far (within the last VOR_TAU), and the raw glance had already moved that far ahead of the
+ * accepted one. The rest of a jump (a saccade) still shows at once. Returns the offset still to glide in
+ * (eye widths), held through blinks. */
+static float glide_catch_up(cf_gaze *g, float down_raw, int hold, double t, double dt)
+{
+	if (hold || !isfinite(down_raw))
+		return g->vor_off;
+	const float w = fmaxf(0.5f * (float)(g->rx[0].value + g->rx[1].value), 1.0f);
+	if (g->have_vor && !(t - g->vor_t <= 0.5)) { /* the face lost, or a long hold: what moved meanwhile is unknown */
+		g->have_vor = 0;
+		g->vor_acc = 0;
+	}
+	if (!g->have_vor) {
+		g->vor_raw = down_raw;
+	} else {
+		const float dh = g->head_v_lock - g->vor_h, dd = (g->d_lock - g->vor_d) + dh;
+		g->vor_acc = g->vor_acc * (float)exp(-(t - g->vor_t) / VOR_TAU) + dh;
+		if (dd * g->vor_acc < 0) { /* back against the head's move: the glance catching up, as far as due */
+			const float due = fmaxf(g->vor_gap * (dd > 0 ? 1.0f : -1.0f), 0.0f);
+			const float take = copysignf(fminf(fminf(fabsf(dd), fabsf(g->vor_acc)), due), dd);
+			g->vor_acc += take;
+			g->vor_off -= take;
+		}
+		g->vor_raw += (float)(1.0 - exp(-dt / VOR_RAW_TAU)) * (down_raw - g->vor_raw);
+	}
+	const float step = VOR_GLIDE_PX * (float)fmin(dt * 30.0, 1.0) / w;
+	g->vor_off -= clampf(g->vor_off, -step, step);
+	g->vor_gap = g->vor_raw - g->d_lock;
+	g->vor_d = g->d_lock;
+	g->vor_h = g->head_v_lock;
+	g->vor_t = t;
+	g->have_vor = 1;
+	return g->vor_off;
+}
+
+/* The reading area: the calibrated notes point is its middle, and reading the lines above and below it (with
+ * the eyes' own scanning) spans about 0.5x to READ_SPAN_HI x that glance, plus the measurement's noise band
+ * (the glance's own, as the gate sees it). The far fade (looking past the notes, at the keyboard) starts
+ * only past all of it: at 1.4x a small notes glance it used to start inside it and switch the correction off
+ * while reading the lower lines. */
+static float reading_limit(float notes_glance, float noise_band)
+{
+	return READ_SPAN_HI * notes_glance + noise_band;
+}
+
+/* ... and the fade past it is as wide as it always was (half of the old 1.4x limit, at least 0.04 eye
+ * widths): only its start moved, so a keyboard glance (~3x the notes glance) is still let go fully. */
+static float reading_band(float notes_glance)
+{
+	return fmaxf(0.7f * notes_glance, 0.04f);
+}
+
 /* ---- Output */
 
 /* Fills out[] from the filtered state. The shifts before strength are in g->amount_unit
- * (vertical, along face up) and g->hshift_unit (sideways, along the eye axis). */
+ * (vertical, along face up), g->hshift_unit (sideways, along the eye axis), and the lid terms
+ * g->lid_unit (upper lid, beyond following the iris) and g->low_unit (lower lid, down). */
 static void emit(const cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 {
-	const float strength = clampf(p->strength, 0.0f, 1.0f);
+	const float strength = clampf(p->strength, 0.0f, CF_STRENGTH_MAX);
+	/* The lids are restored at most to the lens calibration's opening: an overshooting strength (over 1,
+	 * making up for a pupil reading that under-reads) lifts the iris, and the upper lid with it, further,
+	 * but never opens the eyes wider than they are when looking into the lens. */
+	const float lid_strength = fminf(strength, 1.0f);
 	for (int i = 0; i < 2; i++) {
 		cf_eye *e = &out[i];
 		memset(e, 0, sizeof(*e));
@@ -1014,16 +1211,22 @@ static void emit(const cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 		e->ry = fmaxf(fmaxf(1.6f * h, 0.5f * w), ext_y + 1.1f * h);
 
 		float amount = g->amount_unit[i] * strength;
-		amount = fminf(amount, fminf(AMOUNT_MAX_RY * e->ry, 0.5f * (e->ry - ext_y)));
+		const float cap = fminf(AMOUNT_MAX_RY * e->ry, 0.5f * (e->ry - ext_y));
+		amount = fminf(amount, cap);
 		amount = fmaxf(amount, 0.0f);
 		float hs = g->hshift_unit[i] * strength;
 		hs = clampf(hs, -HSHIFT_MAX_RX * e->rx, HSHIFT_MAX_RX * e->rx);
 
 		e->sx = g->up.x * amount + g->axis.x * hs;
 		e->sy = g->up.y * amount + g->axis.y * hs;
-		/* The upper lid follows vertical eye movement, not sideways movement. */
-		e->lid_sx = g->up.x * amount * LID_SHIFT;
-		e->lid_sy = g->up.y * amount * LID_SHIFT;
+		/* The upper lid follows vertical eye movement, not sideways movement; plus what is left of its
+		 * reading drop (head and lids). The lower lid moves down by its reading rise. */
+		const float lid = amount * LID_SHIFT + clampf(g->lid_unit[i] * lid_strength, 0.0f, 0.5f * cap);
+		const float low = clampf(g->low_unit[i] * lid_strength, 0.0f, 0.25f * cap);
+		e->lid_sx = g->up.x * lid;
+		e->lid_sy = g->up.y * lid;
+		e->low_sx = -g->up.x * low;
+		e->low_sy = -g->up.y * low;
 	}
 }
 
@@ -1032,7 +1235,9 @@ static int finish_output(cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 	emit(g, p, out);
 	int n = g->factor < 0.005f ? 0 : 2;
 	if (n && fabsf(g->amount_unit[0]) + fabsf(g->amount_unit[1]) + fabsf(g->hshift_unit[0]) +
-			     fabsf(g->hshift_unit[1]) < 0.01f)
+			     fabsf(g->hshift_unit[1]) + fabsf(g->lid_unit[0]) + fabsf(g->lid_unit[1]) +
+			     fabsf(g->low_unit[0]) + fabsf(g->low_unit[1]) <
+		     0.01f)
 		n = 0; /* nothing to move (looking into the lens): skip the warp */
 	g->last_n = n;
 	g->last_out[0] = out[0];
@@ -1098,6 +1303,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		for (int i = 0; i < 2; i++) {
 			g->amount_unit[i] *= ratio;
 			g->hshift_unit[i] *= ratio;
+			g->lid_unit[i] *= ratio; /* head and lids */
+			g->low_unit[i] *= ratio;
 		}
 		return finish_output(g, p, out);
 	}
@@ -1276,6 +1483,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		g->calib_samples[g->calib_count] = offset;
 		g->calib_open[g->calib_count] = openness;
 		g->calib_side[g->calib_count] = side;
+		g->calib_upper[g->calib_count] = 0.5f * (m[0].upper + m[1].upper); /* head and lids */
+		g->calib_lower[g->calib_count] = 0.5f * (m[0].lower + m[1].lower);
 		g->calib_count++;
 		if (face->has_head_geom && g->calib_head_n < 64)
 			g->calib_head[g->calib_head_n++] = face->head;
@@ -1402,8 +1611,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	/* Glance limit: just past the notes when calibrated, else the manual setting. */
 	const int notes = p->has_notes; /* sanitize() cleared it if the notes aren't below the lens */
 	const float notes_glance = p->baseline - p->notes_offset;
-	const float limit = notes ? 1.4f * notes_glance : p->max_glance;
-	const float band = fmaxf(0.5f * limit, 0.04f);
+	const float limit = notes ? reading_limit(notes_glance, down_lo) : p->max_glance;
+	const float band = notes ? reading_band(notes_glance) : fmaxf(0.5f * limit, 0.04f);
 	/* Second cue: lids drop when looking down. When the pupil already reads close to the limit, a big
 	 * lid drop means a far glance (keyboard) even if the pupil landmark under-reads it. It can only
 	 * switch the effect off, never add correction. Measured against the lids at the notes when that is
@@ -1467,16 +1676,27 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	}
 	g->last_target = target;
 
-	const float d_live = (float)(down > 0 ? down : 0);
+	/* The head's tilt and turn, and the lids (see head_lids()), held through blinks like the glance. */
+	head_lids(g, p, m, hold, t, dt);
 	if (lock >= 0.999f || !g->have_lock) {
-		g->d_lock = d_live;
+		g->d_lock = (float)down; /* (not clamped here: a head tilted down may make up for an eye looking up) */
 		g->side_lock = side_dev;
+		g->head_v_lock = g->head_v;
+		g->head_h_lock = g->head_h;
+		g->up_drop_lock = g->up_drop;
+		g->lo_rise_lock = g->lo_rise;
 		g->have_lock = 1;
 	}
-	const float d = g->d_lock;
+	/* How far the eyes must turn up to meet the lens: their glance plus the head's tilt down (with the glance's
+	 * catch-up after a head move glided in, see glide_catch_up()). */
+	const float d = fmaxf(g->d_lock + g->head_v_lock + glide_catch_up(g, down_raw, hold, t, dt), 0.0f);
 	/* Sideways damping only engages as the gaze drops towards the notes, so looking around at lens
-	 * height (at the other person) stays untouched. */
+	 * height (at the other person) stays untouched. The lids are restored only then too. */
 	const float engage = smoothstepf(0.0f, fmaxf(0.35f * limit, 0.01f), d);
+	/* Upper lid: beyond following the iris lift by LID_SHIFT (emit()), lifted by what is left of its drop
+	 * after the share of the glance's own lift (the share it dropped with); lower lid: by its rise. */
+	const float lid_up_x = fmaxf(g->up_drop_lock - LID_SHIFT * fmaxf(g->d_lock, 0.0f), 0.0f) * engage;
+	const float lid_lo_x = g->lo_rise_lock * engage;
 	/* After a half-blink hold timed out the eyes are still, but the measurement taking over (and the
 	 * lid cue waking up 0.1 s later) can differ from the held output: move there at most EASE_STEP_PX
 	 * per frame instead of in one jump. A real saccade ends it (that change is shown at once): the pupil
@@ -1488,14 +1708,20 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	for (int i = 0; i < 2; i++) {
 		const float w = (float)g->rx[i].value;
 		float a = d * w * g->factor;
-		float h = -READ_DAMP * g->side_lock * w * g->factor * engage;
+		float h = -READ_DAMP * (g->side_lock + g->head_h_lock) * w * g->factor * engage;
+		float l = lid_up_x * w * g->factor, b = lid_lo_x * w * g->factor;
 		if (g->ease) {
-			converged &= fabsf(a - g->amount_unit[i]) <= max_step && fabsf(h - g->hshift_unit[i]) <= max_step;
+			converged &= fabsf(a - g->amount_unit[i]) <= max_step && fabsf(h - g->hshift_unit[i]) <= max_step &&
+				     fabsf(l - g->lid_unit[i]) <= max_step && fabsf(b - g->low_unit[i]) <= max_step;
 			a = g->amount_unit[i] + clampf(a - g->amount_unit[i], -max_step, max_step);
 			h = g->hshift_unit[i] + clampf(h - g->hshift_unit[i], -max_step, max_step);
+			l = g->lid_unit[i] + clampf(l - g->lid_unit[i], -max_step, max_step);
+			b = g->low_unit[i] + clampf(b - g->low_unit[i], -max_step, max_step);
 		}
 		g->amount_unit[i] = a;
 		g->hshift_unit[i] = h;
+		g->lid_unit[i] = l;
+		g->low_unit[i] = b;
 	}
 	if (g->ease && converged && t >= g->ease_min_until)
 		g->ease = 0;

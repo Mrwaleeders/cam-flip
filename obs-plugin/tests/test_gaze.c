@@ -590,6 +590,506 @@ static void real_look_away(const real_noise *rn, real_gaze away, unsigned seed, 
 
 #include "test_pose.c"
 
+/* ---- Head and lids (checks 32-40)
+ *
+ * The user's case: a MacBook camera at 0.5-0.7 m, eyes ~75 px wide and ~23 px open, notes 5-15 cm under the
+ * camera. Reading, the eyes move only ~1.5 px against their corners, the head tilts down ~6 deg (up to
+ * 19), the upper lid drops ~0.01 eye widths and the lower one rises ~0.01. The faces below carry real head
+ * landmarks (test_pose.c's typical 3D face at 60 cm, so the pose reads tilts ~1.1x like a real one). */
+#define HW 75.0f
+#define HH 23.0f
+#define HL_EYE_K 0.41f    /* gaze.c's EYE_K */
+#define HL_LID_SHIFT 0.45f /* gaze.c's LID_SHIFT */
+#define HL_HEAD_SLEW_PX 0.4f /* gaze.c's HEAD_SLEW_PX */
+typedef struct {
+	float glance;           /* the eyes' drop in the head, eye widths (negative: up) */
+	float side;             /* the eyes sideways in the head, eye widths */
+	float pitch, yaw;       /* the head, degrees (down / towards the image's right positive) */
+	float up_drop, lo_rise; /* the lids against looking into the lens, eye widths */
+	float shut;             /* 0..1: the lids closing (a blink) */
+} hl_state;
+
+static float hl_head_noise = 0.5f; /* head landmarks' noise, x the eye landmarks' */
+
+static cf_face face_hl(hl_state s, float noise_px)
+{
+	static const synth_face sf = {0, 9, 0, 0, 2, 6};
+	cf_face f;
+	memset(&f, 0, sizeof(f));
+	f.found = 1;
+	f.image_width = 1920;
+	f.image_height = 1080;
+	f.face_width = 380;
+	const float cx[2] = {960 - 1.5f * HW, 960 + 1.5f * HW};
+	const float gpx = s.glance * HW, spx = s.side * HW;
+	for (int e = 0; e < 2; e++) {
+		cf_pt *pts = e == 0 ? f.left_eye : f.right_eye;
+		for (int i = 0; i < 16; i++) {
+			const float a = (float)i / 16.0f * 6.2831853f, sn = sinf(a);
+			float y = 0.5f * HH * sn;
+			if (sn < -1e-3f) /* upper lid */
+				y += s.up_drop * HW * -sn;
+			else if (sn > 1e-3f) /* lower lid */
+				y -= s.lo_rise * HW * sn;
+			pts[i].x = cx[e] + 0.5f * HW * cosf(a) + (noise_px > 0 ? gauss(noise_px) : 0.0f);
+			pts[i].y = 500 + y * (1.0f - s.shut) + (noise_px > 0 ? gauss(noise_px) : 0.0f);
+		}
+		const cf_pt pupil = {cx[e] + spx + (noise_px > 0 ? gauss(noise_px) : 0.0f),
+				     500 + gpx + (noise_px > 0 ? gauss(noise_px) : 0.0f)};
+		const cf_pt vp = {cx[e] + 0.6f * spx, 500 + 0.6f * gpx};
+		if (e == 0) {
+			f.left_count = 16;
+			f.left_pupil = pupil;
+			f.left_pupil_vision = vp;
+		} else {
+			f.right_count = 16;
+			f.right_pupil = pupil;
+			f.right_pupil_vision = vp;
+		}
+	}
+	f.has_vision_pupils = 1;
+	synth_lm lm;
+	synth_project(&sf, s.yaw, s.pitch, 0, SF_FOCAL, 960, 480, &lm);
+	if (noise_px > 0)
+		synth_noise(&lm, hl_head_noise * noise_px);
+	f.has_head_geom = synth_measure(&lm, &f.head);
+	return f;
+}
+
+/* Calibrates both steps through the API like the plugin does: into the lens (head straight, lids open),
+ * then the notes 0.02 eye widths down with the head still (the user's finder reads ~1.5 px). */
+static cf_gaze_params hl_params(cf_calib_result *lens_out)
+{
+	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
+	cf_gaze g;
+	cf_gaze_init(&g);
+	cf_eye out[2];
+	double t = 50.0;
+	cf_calib_result lens = {0}, notes = {0};
+	int got = 0;
+	cf_gaze_start_calibration(&g, CF_CALIB_LENS);
+	for (int i = 0; i < 120 && got <= 0; i++, t += 1.0 / 30.0) {
+		const hl_state s = {0};
+		cf_face f = face_hl(s, 0);
+		cf_gaze_update(&g, &f, &p, t, out);
+		got = cf_gaze_take_calibration(&g, &lens);
+	}
+	p.baseline = lens.offset;
+	p.baseline_open = lens.openness;
+	p.head_ref = lens.head;
+	p.baseline_upper = lens.upper;
+	p.baseline_lower = lens.lower;
+	got = 0;
+	cf_gaze_start_calibration(&g, CF_CALIB_NOTES);
+	for (int i = 0; i < 120 && got <= 0; i++, t += 1.0 / 30.0) {
+		const hl_state s = {.glance = 0.02f, .up_drop = 0.01f, .lo_rise = 0.01f};
+		cf_face f = face_hl(s, 0);
+		cf_gaze_update(&g, &f, &p, t, out);
+		got = cf_gaze_take_calibration(&g, &notes);
+	}
+	p.has_notes = 1;
+	p.notes_offset = notes.offset;
+	p.notes_side = notes.side;
+	p.notes_open = notes.openness;
+	if (lens_out)
+		*lens_out = lens;
+	return p;
+}
+
+/* The applied shifts along the face's up direction (the synthetic face is level): iris lift, upper-lid
+ * lift and lower-lid drop, px; and the iris' sideways shift. */
+typedef struct {
+	float iris, lid, low, side;
+} hl_out;
+static hl_out hl_read(int n, const cf_eye *e)
+{
+	const hl_out o = {n ? -e->sy : 0, n ? -e->lid_sy : 0, n ? e->low_sy : 0, n ? e->sx : 0};
+	return o;
+}
+
+static float hl_lerp(float a, float b, float k)
+{
+	return a + (b - a) * k;
+}
+
+static void test_head_lids(void)
+{
+	cf_calib_result lens;
+	const cf_gaze_params p = hl_params(&lens);
+	cf_gaze g;
+	cf_eye out[2];
+	const double dt = 1.0 / 30.0;
+
+	/* 32. Step 1 learns the lids: upper above and lower below the corner line, eye widths. */
+	CHECK(fabsf(lens.upper - 0.5f * HH / HW) < 0.003f && fabsf(lens.lower - 0.5f * HH / HW) < 0.003f && lens.head.ok,
+	      "lens calibration: lids %.4f / %.4f (expected %.4f), head %d", lens.upper, lens.lower, 0.5f * HH / HW,
+	      lens.head.ok);
+	CHECK(p.has_notes && fabsf((p.baseline - p.notes_offset) - 0.02f) < 0.003f, "notes calibration %.4f",
+	      p.baseline - p.notes_offset);
+	printf("ok: step 1 learns the lids (upper %.4f, lower %.4f eye widths), step 2 the notes at %.4f\n", lens.upper,
+	       lens.lower, p.baseline - p.notes_offset);
+
+	/* 33. Reading with the head tilted down 0-10 deg: the iris is lifted by the eyes' drop plus
+	 * EYE_K sin(tilt) (the tilt as measured), the upper lid by LID_SHIFT of that plus what is left of its
+	 * drop, the lower lid by its rise: the opening is restored to the lens one within 20%. */
+	const float pitches[5] = {0, 3, 6, 10, 15};
+	float lift6 = 0;
+	for (int k = 0; k < 5; k++) {
+		cf_gaze_init(&g);
+		double t = 100.0;
+		int n = 0;
+		for (int i = 0; i < 45; i++, t += dt) {
+			const hl_state s = {0};
+			n = update(&g, face_hl(s, 0), &p, t, out);
+		}
+		hl_out o = {0, 0, 0, 0};
+		double sum_i = 0, sum_l = 0, sum_b = 0;
+		for (int i = 0; i < 90; i++, t += dt) {
+			const hl_state s = {.glance = 0.02f, .pitch = pitches[k], .up_drop = 0.01f, .lo_rise = 0.01f};
+			n = update(&g, face_hl(s, 0), &p, t, out);
+			o = hl_read(n, &out[0]);
+			if (i >= 75) {
+				sum_i += o.iris / 15;
+				sum_l += o.lid / 15;
+				sum_b += o.low / 15;
+			}
+		}
+		const float w = (float)g.rx[0].value, meas = g.pose.pitch;
+		const float want = (HL_EYE_K * sinf(fminf(fmaxf(meas, 0), 18.0f) * 0.017453293f) + 0.02f) * w;
+		const float head_px = HL_EYE_K * sinf(fmaxf(meas, 0) * 0.017453293f) * w;
+		const float up_restore = (float)sum_l - HL_LID_SHIFT * head_px; /* beyond following the head's lift */
+		const float opening = up_restore + (float)sum_b, narrowing = 0.02f * w;
+		printf("    head %4.1f deg down (reads %4.1f): iris lifted %.2f px (want %.2f), upper lid %.2f (%.2f beyond the "
+		       "head's share), lower lid %.2f: opening restored %.2f of %.2f px\n",
+		       pitches[k], meas, sum_i, want, sum_l, up_restore, sum_b, opening, narrowing);
+		CHECK(fabsf(meas - pitches[k]) <= 0.25f * pitches[k] + 0.3f, "head %.0f deg reads %.1f", pitches[k], meas);
+		CHECK(fabsf((float)sum_i - want) < 0.06f * want + 0.1f, "head %.0f deg: iris lifted %.2f px, want %.2f",
+		      pitches[k], sum_i, want);
+		CHECK(fabsf(opening - narrowing) < 0.2f * narrowing && fabsf(up_restore - 0.01f * w) < 0.25f * 0.01f * w &&
+			      fabsf((float)sum_b - 0.01f * w) < 0.25f * 0.01f * w,
+		      "head %.0f deg: lids restore %.2f + %.2f px of %.2f + %.2f", pitches[k], up_restore, sum_b, 0.01f * w,
+		      0.01f * w);
+		if (k == 2)
+			lift6 = (float)sum_i;
+	}
+	printf("ok: head tilt and lids: the iris is lifted by the eyes' drop plus 0.41 sin(tilt), the opening restored\n");
+
+	/* 34. The head tilted down while the eyes look into the lens (the eyes then turn up in the head by just
+	 * as much): nothing to correct. And without a lens calibration of the head (a typical face, whose
+	 * tilt is not measured) the head adds nothing. */
+	{
+		float worst = 0;
+		for (int k = 1; k < 4; k++) {
+			cf_gaze_init(&g);
+			double t = 200.0;
+			int n = 0;
+			for (int i = 0; i < 90; i++, t += dt) {
+				const float pk = pitches[k] * fminf(1.0f, (float)i / 30.0f);
+				const hl_state s = {.glance = -HL_EYE_K * sinf(1.1f * pk * 0.017453293f), .pitch = pk};
+				n = update(&g, face_hl(s, 0), &p, t, out);
+				if (i >= 60)
+					worst = fmaxf(worst, fabsf(hl_read(n, &out[0]).iris));
+			}
+		}
+		cf_gaze_params pu = p;
+		pu.head_ref.ok = 0;
+		cf_gaze_init(&g);
+		double t = 300.0;
+		hl_out o = {0, 0, 0, 0};
+		for (int i = 0; i < 90; i++, t += dt) {
+			const hl_state s = {.glance = 0.02f, .pitch = 8, .up_drop = 0.01f, .lo_rise = 0.01f};
+			o = hl_read(update(&g, face_hl(s, 0), &pu, t, out), &out[0]);
+		}
+		printf("    head down 3-10 deg, eyes on the lens: %.2f px at most; uncalibrated head, reading: iris %.2f px\n",
+		       worst, o.iris);
+		CHECK(worst < 0.3f, "head down with the eyes on the lens corrected by %.2f px", worst);
+		CHECK(fabsf(o.iris - 0.02f * HW) < 0.2f, "uncalibrated head added to the correction (%.2f px)", o.iris);
+		printf("ok: a head tilted down with the eyes on the lens is left alone\n");
+	}
+
+	/* 35. Smooth: lens -> notes (saccade) with the head following down to 8 deg and the lids narrowing over
+	 * 0.3 s; reading lines (the eyes sweep sideways, then a return saccade) with the head nodding; back to
+	 * the lens, the head following up while the eyes hold the lens (turning down in the head as it comes up,
+	 * which the gate takes in steps: glide_catch_up()). With the head moving as while reading (down over
+	 * 1 s, nodding 1.5 deg) no vertical shift (iris, either lid) changes by more than 0.3 px a frame outside
+	 * the saccades. With a quick head (down in 0.5 s, 0.8 deg a frame) the shifts follow it as fast as it
+	 * moves (up to HEAD_SLEW_PX), but never jump: no frame's change differs from the last one's by 0.3 px.
+	 * Back at the lens, the head still coming up, the eyes are lifted less than 1 px past it. (With no
+	 * head turn the sideways shift here is the side gate's alone, unchanged by the head and lid terms:
+	 * only printed.) */
+	for (int quick = 0; quick < 2; quick++) {
+		const int down_n = quick ? 15 : 30, up_n = quick ? 12 : 24;
+		const float nod = quick ? 2.0f : 1.5f;
+		cf_gaze_init(&g);
+		double t = 400.0;
+		hl_out prev = {0, 0, 0, 0};
+		float prev_d = 0, worst = 0, worst_jerk = 0, worst_sacc = 0, peak = 0, worst_side = 0, over = 0;
+		int sacc_left = 0, have_d = 0;
+		const int N = 300;
+		for (int i = 0; i < N; i++, t += dt) {
+			hl_state s = {0};
+			float sacc = 0;
+			if (i >= 30 && i < 240) { /* reading */
+				const float k = fminf((float)(i - 30) / (float)down_n, 1.0f),
+					    kl = fminf((float)(i - 30) / 9.0f, 1.0f);
+				s.glance = 0.02f;
+				s.pitch = 8.0f * k * k * (3 - 2 * k) + nod * sinf((float)(i - 30) * 0.105f) * k;
+				s.up_drop = 0.01f * kl;
+				s.lo_rise = 0.01f * kl;
+				const int line = (i - 30) % 50; /* 1.5 s along a line, then back */
+				s.side = -0.1f + 0.2f * (float)line / 49.0f;
+				if (i == 30 || line == 0)
+					sacc = 1;
+			} else if (i >= 240) { /* back to the lens, the head following */
+				const float k = fminf((float)(i - 240) / (float)up_n, 1.0f);
+				s.pitch = 8.0f * (1 - k * k * (3 - 2 * k));
+				s.glance = -HL_EYE_K * sinf(1.1f * s.pitch * 0.017453293f);
+				if (i == 240)
+					sacc = 1;
+			}
+			if (sacc)
+				sacc_left = 5;
+			const hl_out o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+			const float di = o.iris - prev.iris, dl = o.lid - prev.lid, db = o.low - prev.low;
+			const float d = fmaxf(fmaxf(fabsf(di), fabsf(dl)), fabsf(db));
+			if (sacc_left > 0) {
+				worst_sacc = fmaxf(worst_sacc, d);
+				have_d = 0;
+			} else {
+				worst = fmaxf(worst, d);
+				worst_side = fmaxf(worst_side, fabsf(o.side - prev.side));
+				if (have_d)
+					worst_jerk = fmaxf(worst_jerk, fabsf(di - prev_d));
+				prev_d = di;
+				have_d = 1;
+				if (i > 240)
+					over = fmaxf(over, o.iris);
+			}
+			sacc_left--;
+			peak = fmaxf(peak, o.iris);
+			prev = o;
+		}
+		printf("    lens -> reading (head to 8 deg in %.1f s, nodding %.1f deg, scanning lines) -> lens: largest "
+		       "vertical change %.3f px a frame (%.2f in the saccades), change of change %.3f, iris lifted up to "
+		       "%.2f px, %.2f px past the lens on the way back, %.2f left; sideways (side gate) %.2f\n",
+		       (float)down_n / 30.0f, nod, worst, worst_sacc, worst_jerk, peak, over, prev.iris, worst_side);
+		if (quick)
+			CHECK(worst < HL_HEAD_SLEW_PX + 0.05f && worst_jerk < 0.3f,
+			      "quick head: shifts changed by %.3f px a frame, jumped %.3f px", worst, worst_jerk);
+		else
+			CHECK(worst < 0.3f, "head and lids made a step of %.3f px outside the saccades", worst);
+		CHECK(over < 1.0f && prev.iris < 0.3f && fabsf(prev.lid) < 0.3f && fabsf(prev.low) < 0.3f,
+		      "back at the lens %.2f px past it, %.2f / %.2f / %.2f px left", over, prev.iris, prev.lid, prev.low);
+	}
+	printf("ok: head and lid terms ease in and out (no step over 0.3 px outside saccades)\n");
+
+	/* 36. Letting go still works. To the keyboard with the head (eyes far down, head 25 deg, lids
+	 * dropping): the correction fades out. The head alone tilted far down (35 deg): the pitch fade lets go.
+	 * Either way the eyes as the viewer sees them (the glance plus the head's tilt, less the lift) only
+	 * ever move down with the real gaze, never back up against it. Reading with the head tilted down 15
+	 * deg (well inside the measured range): kept. */
+	{
+		const struct {
+			const char *name;
+			hl_state away;
+			int keep;
+		} cases[3] = {
+			{"keyboard with head and eyes", {0.15f, 0, 25, 0, 0.04f, 0.0f, 0}, 0},
+			{"head tilted far down", {0.02f, 0, 35, 0, 0.01f, 0.01f, 0}, 0},
+			{"reading, head 15 deg down", {0.02f, 0, 15, 0, 0.01f, 0.01f, 0}, 1},
+		};
+		for (int c = 0; c < 3; c++) {
+			cf_gaze_init(&g);
+			double t = 500.0;
+			hl_out o = {0, 0, 0, 0};
+			for (int i = 0; i < 60; i++, t += dt) {
+				const hl_state s = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+			}
+			const hl_out before = o;
+			float against = 0, prev_seen = 0;
+			for (int i = 0; i < 45; i++, t += dt) {
+				const float k = fminf((float)i / 8.0f, 1.0f);
+				const hl_state a = cases[c].away;
+				const hl_state s = {hl_lerp(0.02f, a.glance, k), 0, hl_lerp(6, a.pitch, k), 0,
+						    hl_lerp(0.01f, a.up_drop, k), hl_lerp(0.01f, a.lo_rise, k), 0};
+				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+				/* how far down the eyes look as the viewer sees them, px of iris */
+				const float seen = (s.glance + HL_EYE_K * sinf(s.pitch * 0.017453293f)) * HW - o.iris;
+				if (i > 0)
+					against = fmaxf(against, prev_seen - seen);
+				prev_seen = seen;
+			}
+			printf("    %s: %.2f px -> %.2f px after 1.5 s (lids %.2f / %.2f), seen moving up against the gaze "
+			       "%.3f px\n",
+			       cases[c].name, before.iris, o.iris, o.lid, o.low, against);
+			if (cases[c].keep)
+				CHECK(o.iris > 0.9f * (HL_EYE_K * sinf(16.5f * 0.017453293f) + 0.02f) * HW,
+				      "%s: correction dropped to %.2f px", cases[c].name, o.iris);
+			else
+				CHECK(o.iris < 0.2f && fabsf(o.lid) < 0.2f && fabsf(o.low) < 0.2f && against < 0.12f,
+				      "%s: %.2f px left (lids %.2f / %.2f), %.3f px against the gaze", cases[c].name, o.iris, o.lid,
+				      o.low, against);
+		}
+		printf("ok: keyboard and far head tilts still let go, reading with the head down is kept\n");
+	}
+
+	/* 37. A blink while reading with the head down holds everything: iris, upper and lower lid. */
+	{
+		cf_gaze_init(&g);
+		double t = 600.0;
+		hl_out o = {0, 0, 0, 0};
+		const hl_state rd = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+		for (int i = 0; i < 75; i++, t += dt)
+			o = hl_read(update(&g, face_hl(rd, 0), &p, t, out), &out[0]);
+		const hl_out before = o;
+		const float shut[7] = {0.5f, 0.95f, 0.95f, 0.95f, 0.5f, 0.0f, 0.0f};
+		float dev = 0;
+		for (int i = 0; i < 7 + 15; i++, t += dt) {
+			hl_state s = rd;
+			if (i < 7) {
+				s.shut = shut[i];
+				s.glance = 0.0f; /* the pupil point is unreliable while the lids close */
+			}
+			o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+			dev = fmaxf(dev, fmaxf(fmaxf(fabsf(o.iris - before.iris), fabsf(o.lid - before.lid)),
+					       fabsf(o.low - before.low)));
+		}
+		printf("    blink while reading: iris %.2f, lids %.2f / %.2f px; through it and after, %.3f px off at most\n",
+		       before.iris, before.lid, before.low, dev);
+		CHECK(dev < 0.15f, "a blink moved the held correction by %.2f px", dev);
+		printf("ok: a blink holds the head and lid terms too\n");
+	}
+
+	/* 38. Strength over 100%: the iris (and the upper lid that follows it) is lifted proportionally more,
+	 * the lids are restored no further than the lens opening, and the warp's cap still holds. */
+	{
+		float iris[2], lid_x[2], low[2];
+		for (int k = 0; k < 2; k++) {
+			cf_gaze_params ps = p;
+			ps.strength = k ? 2.0f : 1.0f;
+			cf_gaze_init(&g);
+			double t = 700.0;
+			hl_out o = {0, 0, 0, 0};
+			for (int i = 0; i < 90; i++, t += dt) {
+				const hl_state s = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+				o = hl_read(update(&g, face_hl(s, 0), &ps, t, out), &out[0]);
+			}
+			iris[k] = o.iris;
+			lid_x[k] = o.lid - HL_LID_SHIFT * o.iris;
+			low[k] = o.low;
+		}
+		cf_gaze_params ps = p;
+		ps.strength = 5.0f; /* clamped to 2 */
+		cf_gaze_init(&g);
+		double t = 800.0;
+		int n = 0;
+		for (int i = 0; i < 90; i++, t += dt) {
+			const hl_state s = {.glance = 0.04f, .pitch = 18, .up_drop = 0.02f, .lo_rise = 0.01f};
+			n = update(&g, face_hl(s, 0), &ps, t, out);
+		}
+		float ext_y = 0;
+		for (int k = 0; k < out[0].aperture_count; k++)
+			ext_y = fmaxf(ext_y, fabsf(out[0].aperture[k][1] - out[0].cy));
+		const float cap = fminf(0.38f * out[0].ry, 0.5f * (out[0].ry - ext_y)), big = hl_read(n, &out[0]).iris;
+		printf("    strength 100%% -> 200%%: iris %.2f -> %.2f px, lid restore %.2f -> %.2f, lower lid %.2f -> %.2f; "
+		       "500%% far down: %.2f px (cap %.2f)\n",
+		       iris[0], iris[1], lid_x[0], lid_x[1], low[0], low[1], big, cap);
+		CHECK(fabsf(iris[1] - 2.0f * iris[0]) < 0.05f * iris[0] && fabsf(lid_x[1] - lid_x[0]) < 0.05f &&
+			      fabsf(low[1] - low[0]) < 0.05f,
+		      "strength 200%%: iris %.2f vs %.2f, lids %.2f vs %.2f, %.2f vs %.2f", iris[1], iris[0], lid_x[1], lid_x[0],
+		      low[1], low[0]);
+		CHECK(big <= cap + 1e-3f && big > 0.95f * cap, "strength 500%%: %.2f px (cap %.2f)", big, cap);
+		printf("ok: strength up to 200%% overshoots the iris, never the lids, within the warp's cap\n");
+		(void)lift6;
+	}
+
+	/* 39. The head turned while reading, the eyes turning back in the head to the notes: half of the turn is
+	 * made up for sideways (the sideways damping acts on the eyes plus half the head). Eyes alone scanning
+	 * a line are damped exactly as before. */
+	{
+		const float yaw = 8.0f;
+		float h[2];
+		for (int k = 0; k < 2; k++) {
+			cf_gaze_init(&g);
+			double t = 900.0;
+			hl_out o = {0, 0, 0, 0};
+			float meas = 0;
+			for (int i = 0; i < 90; i++, t += dt) {
+				const float yk = k ? yaw * fminf(1.0f, (float)i / 20.0f) : 0.0f;
+				const hl_state s = {.glance = 0.02f, .side = k ? -HL_EYE_K * sinf(1.2f * yk * 0.017453293f) : 0.08f,
+						    .yaw = yk, .up_drop = 0.01f, .lo_rise = 0.01f};
+				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+				meas = g.pose.yaw;
+			}
+			h[k] = o.side;
+			if (k) {
+				const float eyes = -HL_EYE_K * sinf(1.2f * yaw * 0.017453293f);
+				const float want = -0.65f * (eyes + 0.5f * HL_EYE_K * sinf(meas * 0.017453293f)) * HW;
+				printf("    head turned %.0f deg (reads %.1f), eyes back on the notes: sideways shift %.2f px (%.2f "
+				       "expected, %.2f without the head)\n",
+				       yaw, meas, h[1], want, -0.65f * eyes * HW);
+				CHECK(fabsf(h[1] - want) < 0.15f + 0.05f * fabsf(want), "head turn: sideways %.2f px, want %.2f", h[1],
+				      want);
+			} else {
+				printf("    eyes 0.08 sideways on a line: sideways shift %.2f px (%.2f expected)\n", h[0],
+				       -0.65f * 0.08f * HW);
+				CHECK(fabsf(h[0] + 0.65f * 0.08f * HW) < 0.15f, "eyes scanning: sideways %.2f px", h[0]);
+			}
+		}
+		printf("ok: half the head's turn is made up for sideways, the eyes' scanning damped as before\n");
+	}
+
+	/* 40. Real-camera noise while reading with the head down (eye landmarks 0.4 px; head landmarks 0.2 px,
+	 * and a noisier 0.6 px as test_pose.c's): what the head and lid terms add to the jitter of what the eyes
+	 * show (RMS frame-to-frame change of the iris and of both lids, and the iris' spread, against a twin run
+	 * without head and lid calibration). At 0.2 px it is a few hundredths of a pixel. The head term carries
+	 * the pose's noise, so with noisy head landmarks it grows: only reported (and kept under 0.15 px a
+	 * frame), it is what a quicker head term costs. */
+	for (int hn = 0; hn < 2; hn++) {
+		float rms[2], rms_l[2], sd[2];
+		hl_head_noise = hn ? 1.5f : 0.5f;
+		for (int k = 0; k < 2; k++) {
+			cf_gaze_params pn = p;
+			if (!k) {
+				pn.head_ref.ok = 0;
+				pn.baseline_upper = pn.baseline_lower = 0;
+			}
+			cf_gaze_init(&g);
+			rng_seed(77);
+			double t = 1000.0, s2 = 0, s2l = 0, s1 = 0, sq = 0;
+			hl_out prev = {0, 0, 0, 0};
+			int c = 0;
+			for (int i = 0; i < 300; i++, t += dt) {
+				const hl_state s = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+				const hl_out o = hl_read(update(&g, face_hl(s, 0.4f), &pn, t, out), &out[0]);
+				if (i > 90) {
+					s2 += (double)(o.iris - prev.iris) * (o.iris - prev.iris);
+					s2l += (double)(o.lid - prev.lid) * (o.lid - prev.lid) + (double)(o.low - prev.low) * (o.low - prev.low);
+					s1 += o.iris;
+					sq += (double)o.iris * o.iris;
+					c++;
+				}
+				prev = o;
+			}
+			rms[k] = (float)sqrt(s2 / c);
+			rms_l[k] = (float)sqrt(s2l / c);
+			sd[k] = (float)sqrt(fmax(sq / c - (s1 / c) * (s1 / c), 0.0));
+		}
+		printf("    noisy reading, head landmarks %.1f px: RMS step iris %.3f px (%.3f without head and lids), lids %.3f "
+		       "(%.3f); iris spread %.3f px (%.3f)\n",
+		       0.4f * hl_head_noise, rms[1], rms[0], rms_l[1], rms_l[0], sd[1], sd[0]);
+		if (!hn)
+			CHECK(rms[1] < rms[0] + 0.03f && rms_l[1] < rms_l[0] + 0.03f,
+			      "head and lids add jitter: %.3f vs %.3f, %.3f vs %.3f", rms[1], rms[0], rms_l[1], rms_l[0]);
+		else
+			CHECK(rms[1] < 0.15f && rms_l[1] < 0.15f, "noisy head landmarks: jitter %.3f / %.3f px a frame", rms[1],
+			      rms_l[1]);
+	}
+	hl_head_noise = 0.5f;
+	printf("ok: head and lid terms add no visible jitter\n");
+}
+
 int main(void)
 {
 	const cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f};
@@ -825,8 +1325,10 @@ int main(void)
 		CHECK(fabsf(-out[0].sy - glance_px) < 0.25f && fabsf(corrected_y - (500 - 1.0f)) < 0.25f,
 		      "notes glance %.2f px, corrected by %.2f px (pupil at %.2f, lens %.2f)", glance_px, -out[0].sy,
 		      corrected_y, 500 - 1.0f);
-		const float far = settle(&g, face_px(960, 500, 1.2f, 1.0f + 2.2f * glance_px, 16, 0, 4), &pc, &t, 45, out);
-		CHECK(far < 0.2f, "glance at 2.2x the notes should be left alone (%.2f px)", far);
+		/* (Changed from 2.2x: the reading area now reaches 1.8x the notes glance plus the noise band, and the
+		 * fade past it is 0.7x the notes glance wide: well past the notes is from ~2.6x on.) */
+		const float far = settle(&g, face_px(960, 500, 1.2f, 1.0f + 2.8f * glance_px, 16, 0, 4), &pc, &t, 45, out);
+		CHECK(far < 0.2f, "glance at 2.8x the notes should be left alone (%.2f px)", far);
 		printf("ok: two-point calibration cancels the notes glance (%.2f px of %.2f), ignores far glances\n",
 		       notes_shift, glance_px);
 	}
@@ -1120,22 +1622,28 @@ int main(void)
 			printf("ok: squint while reading keeps the correction (notes openness %s, min %.2f of %.2f px)\n",
 			       known ? "known" : "unknown", lo, gpx);
 		}
+		/* (Notes 0.06 eye widths under the lens here, was 0.08 like above: the reading area now reaches 1.8x
+		 * the notes glance plus the noise band and the fade is 0.7x it wide, so the lids at 8 px, which
+		 * read as 0.06 + 0.11 eye widths, must be clearly past 2.5x the notes glance, as they were past
+		 * the old 2.1x with 0.08.) */
+		const float glf = 0.06f;
 		const cf_gaze_params pq = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
-					   .notes_offset = -gl, .notes_open = 0.35f};
+					   .notes_offset = -glf, .notes_open = 0.35f};
 		cf_gaze_init(&g);
-		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pq, &t, 45, out);
-		/* Pupil reads 0.12 eye widths, just past the 0.112 limit (alone that would keep ~94% of the
+		settle(&g, face_px(960, 500, 0, glf * 40.0f, 16, 0, 2.0f), &pq, &t, 45, out);
+		/* Pupil reads 0.13 eye widths, just past the 0.118 limit (alone that would keep ~80% of the
 		 * correction), but the lids are down to 8 px: a keyboard glance the pupil under-reads.
 		 * (Changed from 0.10: the lid cue now only starts past 1.05 x the limit, see 15b.)
+		 * (Changed from 0.12 past the old 1.4x limit, see above.)
 		 * (Settles over 2 s instead of 1 s: lids dropping fast to r 0.5 with the pupil barely moving
 		 * look exactly like a half blink, so they are held for 0.5 s and then eased off, see 19/20.) */
-		const float s = settle(&g, face_px(960, 500, 0, 4.8f, 16, 0, 8.0f), &pq, &t, 60, out);
+		const float s = settle(&g, face_px(960, 500, 0, 5.2f, 16, 0, 8.0f), &pq, &t, 60, out);
 		CHECK(s < 0.2f, "far glance with the lids well down should be left alone (%.2f px)", s);
 		printf("ok: far glance read from the lids is released (%.2f px)\n", s);
 	}
 
-	/* 15b. Smiling while reading a line a quarter below the notes point (1.25 x the notes glance,
-	 * 0.9 x the limit): the lids drop a lot, the correction must stay. */
+	/* 15b. Smiling while reading a line a quarter below the notes point (1.25 x the notes glance, inside
+	 * the reading area): the lids drop a lot, the correction must stay. */
 	{
 		const float gl = 0.08f, lpx = 1.25f * gl * 40.0f;
 		for (int known = 0; known < 2; known++) {
@@ -2087,6 +2595,7 @@ int main(void)
 	}
 
 	test_pose();
+	test_head_lids();
 
 	if (failures) {
 		printf("%d FAILED\n", failures);

@@ -25,7 +25,7 @@
  *                      after a camera calibration by an older version)
  *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead (--lens
  *                      also learns the head looking into the camera)
- *   --strength S       0..1 (default 1)
+ *   --strength S       0..2 (default 1; over 1 overshoots, like the 200% slider)
  *   --measure          also track the corrected output and report how much the iris seen by the
  *                      viewer shakes (RMS of value minus its centred 5-frame mean, pixels)
  *   --zoom Z           compare.mov enlargement (default 3)
@@ -429,6 +429,8 @@ int main(int argc, char **argv)
 				p.baseline = res.offset;
 				p.baseline_open = res.openness;
 				p.head_ref = res.head;
+				p.baseline_upper = res.upper;
+				p.baseline_lower = res.lower;
 				printf("lens calibration: baseline %.4f open %.4f; head %s: side %.4f vert %.4f eyes %.4f tilt "
 				       "%.4f\n",
 				       res.offset, res.openness, res.head.ok ? "learnt" : "not learnt", res.head.side,

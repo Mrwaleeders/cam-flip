@@ -94,9 +94,14 @@ static inline int clampi(int v, int lo, int hi)
  *                starting a little below the upper outline so the iris shift doesn't spill
  *                onto the lashes;
  *   lid weight:  1 on a band above the upper outline (the upper lid and its lashes);
- * both are smoothed with a double box blur whose radius grows with the shift (that bounds their
+ *   low weight:  (only with a lower-lid shift B) 1 on a band from a little inside the lower outline
+ *                down over the lower lid and its lashes;
+ * all are smoothed with a double box blur whose radius grows with the shift (that bounds their
  * slope), renormalised so the middle of the iris gets the full shift, and combined as
- * S * iris + L * lid * (1 - iris). Then the corners and the outer ellipse are pinned: with
+ * S * iris + L * lid * (1 - iris) + B * low * (1 - iris - that lid share), so the shares never add up
+ * to more than 1 and the lower lid only takes what neither the iris nor the upper lid claims (a
+ * lifted iris leaves the bottom of the opening, so the lid can move down there without the two
+ * pulling on the same pixels). Then the corners and the outer ellipse are pinned: with
  * "room" = distance to the nearest pinned place, the displacement is softly limited to
  * CF_BUILD_SLOPE * room, which brings it to exactly zero there along the gentlest possible
  * ramp, however large the shift. Last, the field's steepest slope is measured; if it is still
@@ -120,6 +125,7 @@ typedef struct {
 	int cs;        /* node spacing, image pixels */
 	int gw, gh;    /* nodes per row, rows */
 	float *dx, *dy;
+	float *wb;       /* lower-lid mask while building (its own grid, after the scratch) */
 	float maxd;      /* largest |d| component, image pixels */
 	float max_slope; /* steepest |partial derivative| of the final field */
 	float scale;     /* < 1 when the slope limit kicked in */
@@ -210,13 +216,15 @@ static int field_alloc(cf_field *f, const cf_eye *e, float smax)
 	 * under half the opening, so under the grid size) while building; afterwards the row ranges
 	 * (2 gh) and warp_apply's two interpolated rows (2 gw). */
 	const size_t scratch = (size_t)f->gw * 7 + (size_t)f->gh * 3 + 4;
-	const size_t bytes = (cells * 2 + scratch) * sizeof(float) + f->snap_size;
+	/* plus two more grids for the lower lid (field_aperture: its mask, then its part of the field) */
+	const size_t bytes = (cells * 4 + scratch) * sizeof(float) + f->snap_size;
 	f->mem = malloc(bytes);
 	if (!f->mem)
 		return 0;
 	f->dx = (float *)f->mem;
 	f->dy = f->dx + cells;
-	f->snap = (uint8_t *)(f->dy + cells + scratch);
+	f->wb = f->dy + cells + scratch;
+	f->snap = (uint8_t *)(f->wb + 2 * cells);
 	return 1;
 }
 
@@ -263,6 +271,70 @@ static inline float span_cov(float v, float t, float b, float ics)
 {
 	const float d = (v - t) < (b - v) ? (v - t) : (b - v);
 	return clamp01(0.5f + d * ics) * clamp01((b - t) * ics);
+}
+
+/* How much of a displacement of size tm (largest component) may stay with `room` pixels to the nearest
+ * pinned place: soft min(1, x) with x = CF_BUILD_SLOPE room / tm, x / (1 + x^4)^(1/4), whose slope never
+ * exceeds 1. */
+static inline float pin_gain(float room, float tm)
+{
+	if (!(tm > 1e-9f))
+		return 1.0f;
+	const float x = CF_BUILD_SLOPE * room / tm, x2 = x * x;
+	return x > 64.0f ? 1.0f : x / sqrtf(sqrtf(1.0f + x2 * x2));
+}
+
+/*
+ * The lower lid's part of the field (bx, by: the field with it minus the field without it) is added as
+ * far as the slope allows: all of it when the result stays within CF_LOW_SLOPE (or within the field's own
+ * steepest slope, if that is already steeper), else the largest share that does. So restoring the lower
+ * lid never makes the slope limit in field_build scale the whole field down: the iris is delivered
+ * exactly as without it, and a lifted iris with little room under it simply gets less lower-lid help.
+ * The share is the exact largest one (a minimum over node pairs, no search), so it changes continuously
+ * with the eye and the shifts. The budget is just under the hard limit CF_MAX_SLOPE (where the mapping
+ * still never folds: the Jacobian stays >= 0.6^2 - 0.4^2 > 0), as the lower lid has to share the strip
+ * under a lifted iris: in a 75 x 23 eye it gets 75-95% of a 0.75-1.5 px request with the iris lifted up to
+ * 3 px, about 0.4 px with 5 px, and nothing with 6 px (tests/test_warp.c).
+ */
+#define CF_LOW_SLOPE 0.395f
+static void blend_low(const cf_field *f, float *fx, float *fy, const float *bx, const float *by)
+{
+	const int gw = f->gw, gh = f->gh;
+	const size_t cells = (size_t)gw * gh;
+	/* Neighbour differences, as field_build measures the slope: along rows (+1) and columns (+gw). */
+	float s0 = 0;
+	for (int j = 0; j < gh; j++)
+		for (int i = 0; i < gw; i++) {
+			const size_t k = (size_t)j * gw + i;
+			if (i + 1 < gw)
+				s0 = fmaxf(s0, fmaxf(fabsf(fx[k + 1] - fx[k]), fabsf(fy[k + 1] - fy[k])));
+			if (j + 1 < gh)
+				s0 = fmaxf(s0, fmaxf(fabsf(fx[k + gw] - fx[k]), fabsf(fy[k + gw] - fy[k])));
+		}
+	/* Allowed difference between neighbouring nodes (cs pixels apart). */
+	const float lim = fmaxf(s0, CF_LOW_SLOPE * (float)f->cs);
+	float beta = 1.0f;
+	for (int j = 0; j < gh; j++)
+		for (int i = 0; i < gw; i++) {
+			const size_t k = (size_t)j * gw + i;
+			for (int n = 0; n < 2; n++) {
+				const size_t k2 = n == 0 ? k + 1 : k + (size_t)gw;
+				if (n == 0 ? i + 1 >= gw : j + 1 >= gh)
+					continue;
+				const float a[2] = {fx[k2] - fx[k], fy[k2] - fy[k]};
+				const float d[2] = {bx[k2] - bx[k], by[k2] - by[k]};
+				for (int c = 0; c < 2; c++) /* |a + beta d| <= lim, with |a| <= lim */
+					if (d[c] > 1e-9f)
+						beta = fminf(beta, (lim - a[c]) / d[c]);
+					else if (d[c] < -1e-9f)
+						beta = fminf(beta, (lim + a[c]) / -d[c]);
+			}
+		}
+	beta = beta > 0.0f ? beta : 0.0f;
+	for (size_t k = 0; k < cells; k++) {
+		fx[k] += beta * bx[k];
+		fy[k] += beta * by[k];
+	}
 }
 
 static int field_aperture(cf_field *f, const cf_eye *e)
@@ -317,20 +389,32 @@ static int field_aperture(cf_field *f, const cf_eye *e)
 	 * don't drag the lids along. */
 	const float smax = fmaxf(fabsf(e->sx), fabsf(e->sy));
 	const float lmax = fmaxf(fabsf(e->lid_sx), fabsf(e->lid_sy));
+	/* Lower lid (field_build has made a non-finite one 0). Exactly 0 builds exactly the field without it. */
+	const float bsx = e->low_sx, bsy = e->low_sy;
+	const float bmax = fmaxf(fabsf(bsx), fabsf(bsy));
+	const int has_low = bmax > 0.0f;
 	const float rmax = fmaxf(1.0f, 0.5f * w_open);
 	const float r_px = fminf(fmaxf(smax / (2.0f * CF_BUILD_SLOPE), 0.12f * h_open), rmax);
 	const float rl_px = fminf(fmaxf(lmax / (2.0f * CF_BUILD_SLOPE), 0.15f * h_open), rmax);
+	const float rb_px = fminf(fmaxf(bmax / (2.0f * CF_BUILD_SLOPE), 0.15f * h_open), rmax);
 	/* The iris layer starts this far below the upper outline (the lid layer covers that strip), so
 	 * the blurred iris shift doesn't spill onto the lash line: the lid moves by about lid_s, not
 	 * by most of the iris shift. Bounded so that a large shift in a narrow opening keeps an iris
 	 * layer (delivery must grow with the request, never collapse). */
 	const float et = fminf(fminf(r_px, 0.2f * h_open), 0.25f * fmaxf(0.0f, h_open - smax));
 	const float band = 0.6f * h_open;
-	/* Both masks are zero outside the opening's columns and rows (plus the lid band). */
+	/* The lower lid's band: from this far inside the lower outline (its rim and waterline move with it,
+	 * not half way) down over the lid and its lashes. Fixed by the opening, not by the shift, so the
+	 * field is continuous in the lower-lid shift and exactly the old one at 0. */
+	const float eb = 0.15f * h_open, band_lo = 0.5f * h_open;
+	/* All masks are zero outside the opening's columns and rows (plus the lid bands). */
 	memset(wi, 0, cells * sizeof(float));
 	memset(wl, 0, cells * sizeof(float));
+	float *wb = f->wb, *wb2 = f->wb + cells;
+	if (has_low)
+		memset(wb, 0, cells * sizeof(float));
 	const int rj0 = clampi((int)floorf((vmin - band - f->oy) * ics) - 2, 0, gh - 1);
-	const int rj1 = clampi((int)ceilf((vmax - f->oy) * ics) + 2, 0, gh - 1);
+	const int rj1 = clampi((int)ceilf((vmax + (has_low ? band_lo : 0.0f) - f->oy) * ics) + 2, 0, gh - 1);
 	for (int j = rj0; j <= rj1; j++) {
 		const float v = f->oy + (float)j * cs;
 		const float sv = v - e->sy;
@@ -339,20 +423,29 @@ static int field_aperture(cf_field *f, const cf_eye *e)
 			wi[k] = span_cov(v, top[i] + et, bot[i], ics) * span_cov(sv, stop[i], sbot[i], ics);
 			wl[k] = clamp01(0.5f + (top[i] + et - v) * ics) * clamp01(0.5f + (v - top[i] + band) * ics) *
 				clamp01((bot[i] - top[i]) * ics);
+			if (has_low)
+				wb[k] = clamp01(0.5f + (v - bot[i] + eb) * ics) * clamp01(0.5f + (bot[i] + band_lo - v) * ics) *
+					clamp01((bot[i] - top[i]) * ics);
 		}
 	}
 	/* In nodes: a box of radius rn nodes is (2 rn + 1) cs pixels wide, the same as a box of radius
 	 * r_px pixels on the pixel grid, so the field doesn't depend on the grid spacing. */
 	blur2(wi, pre, gw, gh, fmaxf(0.25f, (r_px + 0.5f) * ics - 0.5f), ci0, ci1, rj0, rj1);
 	blur2(wl, pre, gw, gh, fmaxf(0.25f, (rl_px + 0.5f) * ics - 0.5f), ci0, ci1, rj0, rj1);
-	float peak = 0, lpeak = 0;
+	if (has_low)
+		blur2(wb, pre, gw, gh, fmaxf(0.25f, (rb_px + 0.5f) * ics - 0.5f), ci0, ci1, rj0, rj1);
+	float peak = 0, lpeak = 0, bpeak = 0;
 	for (size_t k = 0; k < cells; k++) {
 		peak = wi[k] > peak ? wi[k] : peak;
 		lpeak = wl[k] > lpeak ? wl[k] : lpeak;
 	}
+	if (has_low)
+		for (size_t k = 0; k < cells; k++)
+			bpeak = wb[k] > bpeak ? wb[k] : bpeak;
 	/* Renormalise so the middle of the opening gets the full shift. */
 	const float inv_peak = peak > 0.05f ? 1.0f / peak : 0.0f;
 	const float inv_lpeak = lpeak > 0.05f ? 1.0f / lpeak : 0.0f;
+	const float inv_bpeak = bpeak > 0.05f ? 1.0f / bpeak : 0.0f;
 
 	/* Combine, and pin the corners and the outer ellipse. */
 	const float k0x = ap[c0][0], k0y = ap[c0][1], k1x = ap[c1][0], k1y = ap[c1][1];
@@ -368,7 +461,15 @@ static int field_aperture(cf_field *f, const cf_eye *e)
 			float b = wl[k] * inv_lpeak;
 			b = (b < 1.0f ? b : 1.0f) * (1.0f - a);
 			const float tx = (e->sx * a + e->lid_sx * b) * fade, ty = (e->sy * a + e->lid_sy * b) * fade;
-			const float tm = fabsf(tx) > fabsf(ty) ? fabsf(tx) : fabsf(ty);
+			/* The same with the lower lid (blended in below, as far as the slope allows). */
+			float tx1 = tx, ty1 = ty;
+			if (has_low) {
+				const float c = fminf(wb[k] * inv_bpeak, 1.0f) * fmaxf(1.0f - a - b, 0.0f);
+				tx1 = (e->sx * a + e->lid_sx * b + bsx * c) * fade;
+				ty1 = (e->sy * a + e->lid_sy * b + bsy * c) * fade;
+				wb[k] = wb2[k] = 0;
+			}
+			const float tm = fmaxf(fmaxf(fabsf(tx), fabsf(ty)), fmaxf(fabsf(tx1), fabsf(ty1)));
 			const float px = f->ox + (float)i * cs;
 			const float dxn = (px - e->cx) * irx;
 			const float len2 = dxn * dxn + dyn * dyn;
@@ -390,30 +491,41 @@ static int field_aperture(cf_field *f, const cf_eye *e)
 			const float dc = sqrtf(d0 < d1 ? d0 : d1);
 			const float rc = dc * dc / (dc + 6.0f);
 			room = rc < room ? rc : room;
-			/* Soft min(1, x): x / (1 + x^4)^(1/4), whose slope never exceeds 1. */
-			const float x = CF_BUILD_SLOPE * room / tm, x2 = x * x;
-			const float g = x > 64.0f ? 1.0f : x / sqrtf(sqrtf(1.0f + x2 * x2));
-			wi[k] = tx * g;
-			wl[k] = ty * g;
+			wi[k] = tx * pin_gain(room, fmaxf(fabsf(tx), fabsf(ty)));
+			wl[k] = ty * pin_gain(room, fmaxf(fabsf(tx), fabsf(ty)));
+			if (has_low) { /* the lower lid's part: with it minus without it */
+				const float g1 = pin_gain(room, fmaxf(fabsf(tx1), fabsf(ty1)));
+				wb[k] = tx1 * g1 - wi[k];
+				wb2[k] = ty1 * g1 - wl[k];
+			}
 		}
 	}
+	if (has_low)
+		blend_low(f, wi, wl, wb, wb2);
 	return 1;
 }
 
 /* Builds the field for one eye. Returns 0 when the eye needs no work. */
-static int field_build(cf_field *f, const cf_eye *e)
+static int field_build(cf_field *f, const cf_eye *e_in)
 {
 	/* Never trust the geometry blindly: a NaN would turn into undefined integer conversions. */
-	if (!isfinite(e->cx) || !isfinite(e->cy) || !isfinite(e->sx) || !isfinite(e->sy) || fabsf(e->cx) > 1e6f ||
-	    fabsf(e->cy) > 1e6f)
+	if (!isfinite(e_in->cx) || !isfinite(e_in->cy) || !isfinite(e_in->sx) || !isfinite(e_in->sy) ||
+	    fabsf(e_in->cx) > 1e6f || fabsf(e_in->cy) > 1e6f)
 		return 0;
+	/* A broken lower-lid shift is ignored (the lower lid stays), not allowed to spoil the rest. */
+	cf_eye ec = *e_in;
+	if (!isfinite(ec.low_sx) || !isfinite(ec.low_sy))
+		ec.low_sx = ec.low_sy = 0.0f;
+	const cf_eye *e = &ec;
 	int has_ap = e->aperture_count >= 4 && e->aperture_count <= CF_MAX_APERTURE && isfinite(e->lid_sx) &&
 		     isfinite(e->lid_sy);
 	for (int k = 0; has_ap && k < e->aperture_count; k++)
 		if (!(fabsf(e->aperture[k][0] - e->cx) <= 1e5f) || !(fabsf(e->aperture[k][1] - e->cy) <= 1e5f))
 			has_ap = 0; /* a broken outline (NaN, absurd point): fall back to the plain shift */
 	const float mag = fmaxf(fmaxf(fabsf(e->sx), fabsf(e->sy)),
-				has_ap ? fmaxf(fabsf(e->lid_sx), fabsf(e->lid_sy)) : 0.0f);
+				has_ap ? fmaxf(fmaxf(fabsf(e->lid_sx), fabsf(e->lid_sy)),
+					       fmaxf(fabsf(e->low_sx), fabsf(e->low_sy)))
+				       : 0.0f);
 	/* field_alloc also rejects shifts too large to be meaningful (and to size a snapshot). */
 	if (!(mag >= 0.01f) || !field_alloc(f, e, mag))
 		return 0;
@@ -703,6 +815,26 @@ int cf_warp_debug_field(const cf_eye *e, float x, float y, float *dx, float *dy,
 	field_at(&f, (x - f.ox) / (float)f.cs, (y - f.oy) / (float)f.cs, dx, dy);
 	*max_slope = f.max_slope;
 	*scale = f.scale;
+	field_free(&f);
+	return 1;
+}
+
+/* The same, for a whole lattice at once (one build): image points (x0 + i step, y0 + j step), i < nx,
+ * j < ny, into dx[j * nx + i] and dy[...]. Returns 0 (and zeros) when the eye would not be warped. */
+int cf_warp_debug_grid(const cf_eye *e, float x0, float y0, float step, int nx, int ny, float *dx, float *dy);
+int cf_warp_debug_grid(const cf_eye *e, float x0, float y0, float step, int nx, int ny, float *dx, float *dy)
+{
+	cf_field f;
+	memset(dx, 0, sizeof(float) * (size_t)nx * (size_t)ny);
+	memset(dy, 0, sizeof(float) * (size_t)nx * (size_t)ny);
+	if (!field_build(&f, e))
+		return 0;
+	for (int j = 0; j < ny; j++)
+		for (int i = 0; i < nx; i++) {
+			const float x = x0 + (float)i * step, y = y0 + (float)j * step;
+			field_at(&f, (x - f.ox) / (float)f.cs, (y - f.oy) / (float)f.cs, &dx[(size_t)j * nx + i],
+				 &dy[(size_t)j * nx + i]);
+		}
 	field_free(&f);
 	return 1;
 }

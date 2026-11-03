@@ -486,15 +486,21 @@ static void run_head_reference(struct camflip *f, obs_data_t *restore)
 	lens.offset = 0.01f;
 	lens.openness = 0.3f;
 	lens.head = (cf_head_ref){.ok = 1, .side = 0.03f, .vert = 0.62f, .eyes = -0.02f, .tilt = 0.11f};
+	lens.upper = 0.21f;
+	lens.lower = 0.11f;
 	bool bad = false;
 	obs_data_t *changes = apply_calibration_locked(f, &lens, &bad);
 	const bool learnt = changes && !bad && f->head_ref.ok && params_locked(f).head_ref.ok &&
-			    fabsf(params_locked(f).head_ref.vert - 0.62f) < 1e-6f;
+			    fabsf(params_locked(f).head_ref.vert - 0.62f) < 1e-6f &&
+			    fabsf(params_locked(f).baseline_upper - 0.21f) < 1e-6f &&
+			    fabsf(params_locked(f).baseline_lower - 0.11f) < 1e-6f;
 	pthread_mutex_unlock(&f->lock);
 	const bool saved = changes && obs_data_get_bool(changes, S_HEAD_REF) &&
-			   fabs(obs_data_get_double(changes, S_HEAD_TILT) - 0.11) < 1e-6;
+			   fabs(obs_data_get_double(changes, S_HEAD_TILT) - 0.11) < 1e-6 &&
+			   fabs(obs_data_get_double(changes, S_BASELINE_UPPER) - 0.21) < 1e-6 &&
+			   fabs(obs_data_get_double(changes, S_BASELINE_LOWER) - 0.11) < 1e-6;
 	obs_data_release(changes);
-	check(learnt && saved, "the camera calibration learns and saves the head looking into the camera");
+	check(learnt && saved, "the camera calibration learns and saves the head and the lids looking into the camera");
 
 	char text[700];
 	bool warn = false;
@@ -511,7 +517,8 @@ static void run_head_reference(struct camflip *f, obs_data_t *restore)
 	camflip_update(f, saved_old);
 	pthread_mutex_lock(&f->lock);
 	f->calib_done_msg = NULL;
-	const bool typical = f->lens_done && !f->head_ref.ok && !params_locked(f).head_ref.ok;
+	const bool typical = f->lens_done && !f->head_ref.ok && !params_locked(f).head_ref.ok &&
+			     params_locked(f).baseline_upper == 0.0f && params_locked(f).baseline_lower == 0.0f;
 	pthread_mutex_unlock(&f->lock);
 	status_text(f, text, sizeof(text), &warn);
 	printf("info: status panel says:\n%s\n", text);
@@ -524,12 +531,16 @@ static void run_head_reference(struct camflip *f, obs_data_t *restore)
 	obs_data_set_double(saved_old, S_HEAD_VERT, 0.62);
 	obs_data_set_double(saved_old, S_HEAD_EYES, -0.02);
 	obs_data_set_double(saved_old, S_HEAD_TILT, 0.11);
+	obs_data_set_double(saved_old, S_BASELINE_UPPER, 0.21);
+	obs_data_set_double(saved_old, S_BASELINE_LOWER, 0.11);
 	camflip_update(f, saved_old);
 	pthread_mutex_lock(&f->lock);
 	const bool loaded = f->head_ref.ok && fabsf(f->head_ref.vert - 0.62f) < 1e-6f &&
-			    fabsf(f->head_ref.tilt - 0.11f) < 1e-6f && fabsf(f->head_ref.eyes + 0.02f) < 1e-6f;
+			    fabsf(f->head_ref.tilt - 0.11f) < 1e-6f && fabsf(f->head_ref.eyes + 0.02f) < 1e-6f &&
+			    fabsf(params_locked(f).baseline_upper - 0.21f) < 1e-6f &&
+			    fabsf(params_locked(f).baseline_lower - 0.11f) < 1e-6f;
 	pthread_mutex_unlock(&f->lock);
-	check(loaded, "the head looking into the camera is read back from the settings");
+	check(loaded, "the head and the lids looking into the camera are read back from the settings");
 	obs_data_release(saved_old);
 
 	camflip_update(f, restore);

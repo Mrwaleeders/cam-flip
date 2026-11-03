@@ -2,7 +2,7 @@
  * Replays a landmarks CSV from tools/diag_video.m through the gaze model, the way the plugin runs
  * it live, and measures shaking. Pure C: runs anywhere.
  *
- *   replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength 0..1] [--out per-frame.csv]
+ *   replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength 0..2] [--out per-frame.csv]
  *          [--baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P]
  *          [--head-side S --head-vert V --head-eyes E --head-tilt K]
  *
@@ -221,6 +221,8 @@ int main(int argc, char **argv)
 			p.baseline = res.offset;
 			p.baseline_open = res.openness;
 			p.head_ref = res.head;
+			p.baseline_upper = res.upper;
+			p.baseline_lower = res.lower;
 			printf("lens calibration: baseline %.4f open %.4f; head %s: side %.4f vert %.4f eyes %.4f tilt %.4f\n",
 			       res.offset, res.openness, res.head.ok ? "learnt" : "not learnt", res.head.side, res.head.vert,
 			       res.head.eyes, res.head.tilt);

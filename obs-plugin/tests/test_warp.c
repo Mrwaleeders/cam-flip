@@ -23,6 +23,7 @@
 
 /* Test hook in warp.c (deliberately not in the public header). */
 int cf_warp_debug_field(const cf_eye *e, float x, float y, float *dx, float *dy, float *max_slope, float *scale);
+int cf_warp_debug_grid(const cf_eye *e, float x0, float y0, float step, int nx, int ny, float *dx, float *dy);
 
 static int failures = 0;
 #define CHECK(cond, ...)                         \
@@ -558,6 +559,226 @@ static void test_aperture_slope(void)
 	printf("ok: displacement slope stays below 0.45 (worst %.3f)\n", worst);
 }
 
+/* ---- Lower lid (low_sx, low_sy) ------------------------------------------------------------- */
+
+/* Byte-for-byte: lower-lid shifts (alone, with the iris, with sideways reading damping, huge, broken)
+ * never change a pixel outside the ellipses, in any format. */
+static void test_low_lid_untouched(const fmt_info *f)
+{
+	frame a, b;
+	alloc_frame(f, &a);
+	copy_frame(&a, &b);
+	cf_channel ca[8], cb[8];
+	int n = cf_channels(f->fmt, a.data, a.linesize, W, H, ca);
+	cf_channels(f->fmt, b.data, b.linesize, W, H, cb);
+	cf_eye eyes[5] = {make_eye(100, 120, 60, 22, 0, -6), make_eye(221.3f, 117.6f, 60, 22, 4, -3.5f),
+			  make_eye(6, 5, 50, 18, 0, -5), make_eye(160, 200, 70, 24, 0, 0), make_eye(260, 40, 40, 14, 0, -4)};
+	eyes[0].low_sy = 2.5f;
+	eyes[1].low_sy = 1.5f, eyes[1].low_sx = 0.4f, eyes[1].lid_sy = -2.5f;
+	eyes[2].low_sy = 3.0f; /* hanging over the frame corner */
+	eyes[3].low_sy = 40.0f; /* absurd: limited, never spills */
+	eyes[4].low_sy = NAN;   /* broken: ignored */
+	const int ne = 5;
+	cf_warp_frame(cb, n, eyes, ne);
+	int changed = 0;
+	for (int c = 0; c < n; c++)
+		for (int y = 0; y < ca[c].height; y++)
+			for (int x = 0; x < ca[c].width; x++) {
+				int inside = 0;
+				for (int e = 0; e < ne; e++) {
+					float dx = ((float)x + 0.5f - eyes[e].cx * ca[c].scale_x) / (eyes[e].rx * ca[c].scale_x);
+					float dy = ((float)y + 0.5f - eyes[e].cy * ca[c].scale_y) / (eyes[e].ry * ca[c].scale_y);
+					if (sqrtf(dx * dx + dy * dy) < 1.0f)
+						inside = 1;
+				}
+				size_t off = (size_t)y * ca[c].linesize + (size_t)x * ca[c].step;
+				if (inside) {
+					changed += ca[c].base[off] != cb[c].base[off];
+					continue;
+				}
+				CHECK(ca[c].base[off] == cb[c].base[off], "%s: lower-lid warp changed a pixel outside (ch %d, %d,%d)",
+				      f->name, c, x, y);
+			}
+	CHECK(changed > 500, "%s: lower-lid warp changed almost nothing (%d)", f->name, changed);
+	printf("ok: %s lower-lid warp leaves everything outside the eyes byte-identical\n", f->name);
+	free_frame(&a);
+	free_frame(&b);
+}
+
+/* Zero is identity: an eye with nothing but a zero lower-lid shift needs no work and changes no byte;
+ * a lower-lid shift fading to zero takes the field continuously to the one without it. */
+static void test_low_lid_identity(void)
+{
+	cf_eye e = make_eye(100, 120, 60, 22, 0, 0);
+	float dx, dy, sl, sc;
+	CHECK(!cf_warp_debug_field(&e, 100, 132, &dx, &dy, &sl, &sc), "an eye with no shifts at all builds a field");
+	uint8_t *img = eye_image(&e, 100, 121, 13, 1), *out = malloc(W * H);
+	memcpy(out, img, W * H);
+	warp_y800(out, &e);
+	CHECK(memcmp(img, out, W * H) == 0, "an eye with no shifts changed the image");
+	/* With the iris shifted: the field for low 1e-4 vs 0, everywhere. */
+	cf_eye e0 = make_eye(100, 120, 60, 22, 0, -3.5f), e1 = e0;
+	e1.low_sy = 1e-4f;
+	enum { GX = 120, GY = 90 };
+	static float ax[GX * GY], ay[GX * GY], bx[GX * GY], by[GX * GY];
+	cf_warp_debug_grid(&e0, 60, 90, 0.7f, GX, GY, ax, ay);
+	cf_warp_debug_grid(&e1, 60, 90, 0.7f, GX, GY, bx, by);
+	float worst = 0;
+	for (int k = 0; k < GX * GY; k++)
+		worst = fmaxf(worst, fmaxf(fabsf(ax[k] - bx[k]), fabsf(ay[k] - by[k])));
+	printf("    lower-lid shift 1e-4 px changes the field by at most %.6f px\n", worst);
+	CHECK(worst < 2e-4f, "a 1e-4 px lower-lid shift changed the field by %.5f px", worst);
+	printf("ok: zero lower-lid shift is the identity, and the field is continuous in it\n");
+	free(img);
+	free(out);
+}
+
+/* A dark line just under the lower outline (the lower lid's rim) and the lash line above the upper
+ * one, with an iris: how far each moves for an iris shift sy and a lower-lid shift low. */
+static void low_lid_motion(float w, float h, float sy, float lid_sy, float low, float *rim, float *lash, float *pupil)
+{
+	cf_eye e = make_eye(100, 120, w, h, 0, sy);
+	e.lid_sy = lid_sy;
+	e.low_sy = low;
+	uint8_t *img = eye_image(&e, 100, 120 + 0.05f * w, 0.21f * w, 1), *out = malloc(W * H);
+	const int lo = (int)lrintf(120 + 0.5f * h) + 1; /* 1 px below the lower outline */
+	for (int x = (int)(100 - 0.1f * w); x <= (int)(100 + 0.1f * w); x++)
+		img[lo * W + x] = 30;
+	memcpy(out, img, W * H);
+	warp_y800(out, &e);
+	float ax, ay, bx, by;
+	const int x0 = (int)(100 - 0.12f * w), x1 = (int)(100 + 0.12f * w);
+	/* (thresholds just under the surroundings, the iris' 90 and the skin's 170: a line resampled half way
+	 * between two rows is two rows of ~60) */
+	dark_centroid(img, x0, lo - 3, x1, lo + 6, 80, &ax, &ay);
+	dark_centroid(out, x0, lo - 3, x1, lo + 6, 80, &bx, &by);
+	*rim = by - ay;
+	const int top = (int)lrintf(120 - 0.5f * h);
+	dark_centroid(img, (int)100 - 6, top - 7, (int)100 + 6, top - 1, 120, &ax, &ay);
+	dark_centroid(out, (int)100 - 6, top - 7, (int)100 + 6, top - 1, 120, &bx, &by);
+	*lash = by - ay;
+	const int px0 = (int)(100 - 0.3f * w), px1 = (int)(100 + 0.3f * w);
+	dark_centroid(img, px0, (int)(120 - 0.4f * h), px1, (int)(120 + 0.4f * h), 25, &ax, &ay);
+	dark_centroid(out, px0, (int)(120 - 0.4f * h), px1, (int)(120 + 0.4f * h), 25, &bx, &by);
+	*pupil = by - ay;
+	free(img);
+	free(out);
+}
+
+static void test_low_lid_motion(void)
+{
+	/* Lower lid alone: it moves down by most of the request, the iris and the upper lid stay. */
+	const float lows[3] = {1.0f, 2.0f, 3.0f};
+	for (int k = 0; k < 3; k++) {
+		float rim, lash, pupil;
+		low_lid_motion(70, 24, 0, 0, lows[k], &rim, &lash, &pupil);
+		printf("    70x24 eye, lower lid %.1f px alone: rim moved %.2f px, upper lashes %.2f, pupil %.2f\n", lows[k], rim,
+		       lash, pupil);
+		CHECK(rim >= 0.7f * lows[k] && rim <= 1.1f * lows[k], "lower lid moved %.2f px for %.1f", rim, lows[k]);
+		CHECK(fabsf(lash) < 0.1f, "upper lashes moved %.2f px with only the lower lid", lash);
+		CHECK(fabsf(pupil) < 0.25f * lows[k], "pupil dragged %.2f px by a %.1f px lower-lid shift", pupil, lows[k]);
+	}
+	/* With a reading correction (upper lid at 0.45 of the iris): the iris and the upper lid are delivered
+	 * exactly as without the lower lid (it only takes the slope that is left: never a global scale-down),
+	 * the rim moves down by most of a moderate request under a moderate lift, and by less, but never the
+	 * wrong way, under a big lift (the strip under a lifted iris is already stretched). */
+	const float iris[4] = {-2, -3, -5, -7}, want[4] = {0.75f, 0.6f, 0.2f, 0.0f};
+	for (int k = 0; k < 4; k++) {
+		float rim, lash, pupil, rim0, lash0, pupil0;
+		low_lid_motion(75, 23, iris[k], 0.45f * iris[k], 0.75f, &rim, &lash, &pupil);
+		low_lid_motion(75, 23, iris[k], 0.45f * iris[k], 0.0f, &rim0, &lash0, &pupil0);
+		printf("    75x23 eye, iris %.0f, lower lid 0.75: rim %+.2f px (%+.2f without: %.2f down), pupil %.2f (%.2f), "
+		       "lashes %.2f (%.2f)\n",
+		       iris[k], rim, rim0, rim - rim0, pupil, pupil0, lash, lash0);
+		CHECK(rim - rim0 >= want[k] * 0.75f - 0.02f, "iris %.0f: lower lid moved only %.2f px down for 0.75", iris[k],
+		      rim - rim0);
+		CHECK(fabsf(pupil - pupil0) < 0.1f && fabsf(lash - lash0) < 0.1f,
+		      "iris %.0f: the lower lid changed the iris (%.2f vs %.2f) or the upper lid (%.2f vs %.2f)", iris[k], pupil,
+		      pupil0, lash, lash0);
+	}
+	printf("ok: the lower lid moves down by its own shift, the iris and upper lid as before\n");
+}
+
+/* Never folds: the map p -> p - d(p) keeps a positive Jacobian (no doubled lashes, no tears), every
+ * vertical line through the eye maps monotonically, and the slope stays under the safety limit, for
+ * every mix of iris, upper-lid, lower-lid and sideways shifts up to gaze.c's caps (and beyond). */
+static void test_low_lid_no_fold(void)
+{
+	const float iris[4] = {0, -3.5f, -6, -9}, lowv[4] = {0.5f, 1.5f, 3.0f, 6.0f}, sxs[3] = {0, 4, -6};
+	const float lid_extra[2] = {0, -1.5f};
+	float worst_det = 1e9f, worst_slope = 0;
+	for (int a = 0; a < 4; a++)
+		for (int b = 0; b < 4; b++)
+			for (int s = 0; s < 3; s++)
+				for (int l = 0; l < 2; l++) {
+					cf_eye e = make_eye(160, 120, 75, 23, sxs[s], iris[a]);
+					e.lid_sy = 0.45f * iris[a] + lid_extra[l];
+					e.low_sy = lowv[b];
+					e.low_sx = 0.05f * sxs[s];
+					float dx, dy, slope, scale;
+					if (!cf_warp_debug_field(&e, e.cx, e.cy, &dx, &dy, &slope, &scale))
+						continue;
+					worst_slope = fmaxf(worst_slope, slope);
+					static float gx[130][130], gy[130][130];
+					const int x0 = (int)(e.cx - e.rx) - 1, y0 = (int)(e.cy - e.ry) - 1;
+					int nx = (int)(2 * e.rx) + 3, ny = (int)(2 * e.ry) + 3;
+					nx = nx < 130 ? nx : 130;
+					ny = ny < 130 ? ny : 130;
+					static float fx[130 * 130], fy[130 * 130];
+					cf_warp_debug_grid(&e, (float)x0 + 0.5f, (float)y0 + 0.5f, 1.0f, nx, ny, fx, fy);
+					for (int j = 0; j < ny; j++)
+						for (int i = 0; i < nx; i++) {
+							gx[j][i] = fx[j * nx + i];
+							gy[j][i] = fy[j * nx + i];
+						}
+					for (int j = 1; j < ny - 1; j++)
+						for (int i = 1; i < nx - 1; i++) {
+							const float jxx = 1 - 0.5f * (gx[j][i + 1] - gx[j][i - 1]);
+							const float jxy = -0.5f * (gx[j + 1][i] - gx[j - 1][i]);
+							const float jyx = -0.5f * (gy[j][i + 1] - gy[j][i - 1]);
+							const float jyy = 1 - 0.5f * (gy[j + 1][i] - gy[j - 1][i]);
+							worst_det = fminf(worst_det, jxx * jyy - jxy * jyx);
+							CHECK(jyy > 0.4f, "vertical line folds (iris %.1f, lower lid %.1f, sx %.1f): "
+									  "d(y - dy)/dy = %.3f",
+							      iris[a], lowv[b], sxs[s], jyy);
+						}
+				}
+	printf("    iris 0..-9, lower lid 0.5..6, sideways 0..6 px: smallest Jacobian %.3f, steepest slope %.3f\n",
+	       worst_det, worst_slope);
+	CHECK(worst_det > 0.3f && worst_slope <= 0.4001f, "fold-over risk: Jacobian %.3f, slope %.3f", worst_det,
+	      worst_slope);
+	printf("ok: iris + upper lid + lower lid never fold (monotonic mapping)\n");
+}
+
+/* No popping: a lower-lid shift growing in small steps changes the field in equally small steps. */
+static void test_low_lid_smooth(void)
+{
+	enum { STEPS = 90, NP = 9 };
+	float prev[NP][NP][2], worst = 0, mean = 0;
+	for (int s = 0; s <= STEPS; s++) {
+		const float t = (float)s / STEPS;
+		cf_eye e = make_eye(100.3f + 1.2f * t, 120.2f, 75, 23, 1.0f * t, -5.0f * t);
+		e.lid_sy = -3.0f * t;
+		e.low_sy = 2.0f * t;
+		float m = 0;
+		for (int j = 0; j < NP; j++)
+			for (int i = 0; i < NP; i++) {
+				float dx, dy, sl, sc;
+				cf_warp_debug_field(&e, e.cx + (i - NP / 2) * 4.4f, e.cy + (j - NP / 2) * 3.4f, &dx, &dy, &sl, &sc);
+				if (s > 0)
+					m = fmaxf(m, fmaxf(fabsf(dx - prev[j][i][0]), fabsf(dy - prev[j][i][1])));
+				prev[j][i][0] = dx, prev[j][i][1] = dy;
+			}
+		if (s > 0) {
+			worst = fmaxf(worst, m);
+			mean += m / STEPS;
+		}
+	}
+	printf("    correction with lower lid easing in: field change per frame worst %.3f px, mean %.3f px\n", worst, mean);
+	CHECK(worst < 2.0f * mean + 0.01f && worst < 0.12f, "field jumps by %.3f px in one step (mean %.3f)", worst, mean);
+	printf("ok: the lower-lid shift eases in without popping\n");
+}
+
 /* Catmull-Rom keeps a soft edge sharper than bilinear for a fractional shift. */
 static void test_bicubic_sharper(void)
 {
@@ -657,6 +878,7 @@ int main(void)
 		test_mirror(&formats[i]);
 		test_warp(&formats[i]);
 		test_warp_aperture_untouched(&formats[i]);
+		test_low_lid_untouched(&formats[i]);
 	}
 	/* Pupil delivery for notes glances (0.04-0.07 eye widths) with gaze.c's sizing, including the
 	 * sideways reading damping, and for a big glance. */
@@ -675,6 +897,10 @@ int main(void)
 	test_aperture_lid();
 	test_temporal_smoothness();
 	test_aperture_slope();
+	test_low_lid_identity();
+	test_low_lid_motion();
+	test_low_lid_no_fold();
+	test_low_lid_smooth();
 	test_bicubic_sharper();
 	test_extract_luma();
 	test_timing();

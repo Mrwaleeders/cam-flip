@@ -59,7 +59,18 @@ typedef struct {
 	float notes_side;    /* sideways gaze offset (eye widths) at the middle of the notes (notes calibration) */
 	float notes_open;    /* eye openness when looking at the notes (notes calibration); 0 = unknown */
 	cf_head_ref head_ref; /* the face looking into the lens (lens calibration); ok 0 = a typical face */
+
+	/* ---- Head and lid compensation (gaze.c, "Head and lids") */
+	/* How far the upper lid sits above, and the lower lid below, the line through the eye corners when
+	 * looking into the lens, eye widths (lens calibration, mean of both eyes). 0 = unknown (calibrated by
+	 * an older version): the lids then only follow the iris as before, nothing is restored. */
+	float baseline_upper, baseline_lower;
 } cf_gaze_params;
+
+/* "Eye contact strength" goes up to this (200%): over 1 the correction overshoots, so it can make up for
+ * a pupil reading that under-reads glances. The warp's own limits (AMOUNT_MAX_RY, the slope limit) still
+ * apply, and the lid restoration never goes past the lens-calibrated opening. */
+#define CF_STRENGTH_MAX 2.0f
 
 /* A notes calibration is only usable when the notes are clearly below the lens: at least this many
  * eye widths of downward gaze (baseline - notes_offset). Smaller or reversed means the user wasn't
@@ -77,6 +88,9 @@ typedef struct {
 	float openness; /* median eye openness while calibrating */
 	float side;     /* median sideways gaze offset while calibrating (eye widths, along the eye axis) */
 	cf_head_ref head; /* the head while calibrating (ok 0: too few frames with head measures) */
+	/* ---- Head and lid compensation: median upper / lower lid height above / below the corner line while
+	 * calibrating (eye widths, mean of both eyes): baseline_upper / baseline_lower for a lens calibration */
+	float upper, lower;
 } cf_calib_result;
 
 /* What the filter panel shows. */
@@ -214,6 +228,33 @@ typedef struct {
 	cf_head calib_head[64];
 	int calib_head_n;
 	cf_head_ref calib_head_result;
+
+	/* ---- Head and lid compensation (gaze.c, "Head and lids"). What the viewer reads as gaze is the head's
+	 * direction plus the eyes' direction in the head. The glance above is only the second; these add the
+	 * head (its tilt down and turn, against the lens calibration, as the iris shift that would make up for
+	 * them) and restore the lids, which narrow while reading. All in eye widths, smoothed, slew limited,
+	 * held through blinks and, like d_lock / side_lock, held while the gaze is away (so a look-away only
+	 * ever fades them). */
+	cf_one_euro head_pf, head_yf;    /* the head's pitch and yaw for these (see head_angles() in gaze.c) */
+	float head_v, head_h;            /* iris-shift equivalent of the head's tilt down / turn (eye widths) */
+	float head_v_lock, head_h_lock;
+	float lid_up, lid_lo;            /* upper / lower lid above / below the corner line now (smoothed) */
+	float lid_up1, lid_lo1;          /* ... the first of the two smoothing stages */
+	int have_lids;
+	float up_drop, lo_rise;          /* how far the upper lid has dropped / the lower lid risen against the
+					  * lens calibration (smoothed, slew limited; 0 when not calibrated) */
+	float up_drop_lock, lo_rise_lock;
+	float lid_unit[2];               /* upper-lid lift beyond LID_SHIFT x the iris lift, before strength (px) */
+	float low_unit[2];               /* lower-lid shift down, before strength (px) */
+	float calib_upper[64], calib_lower[64];
+	float calib_upper_result, calib_lower_result;
+	/* The glance's catch-up after the head moved (see glide_catch_up() in gaze.c), eye widths. */
+	float vor_acc;                   /* how far the head term moved lately (decaying), less what was glided */
+	float vor_off;                   /* the part of a catch-up still being glided in */
+	float vor_d, vor_h;              /* d_lock and head_v_lock last frame */
+	float vor_raw, vor_gap;          /* the raw glance (lightly smoothed), and how far d_lock lagged it */
+	double vor_t;
+	int have_vor;
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);

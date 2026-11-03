@@ -69,6 +69,10 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_HEAD_VERT "head_vert"
 #define S_HEAD_EYES "head_eyes"
 #define S_HEAD_TILT "head_tilt"
+/* The lids looking into the camera, learnt by step 1 (upper lid above / lower lid below the eye corners'
+ * line, eye widths): what reading narrows is restored from these. 0 (older step 1): not restored. */
+#define S_BASELINE_UPPER "baseline_upper"
+#define S_BASELINE_LOWER "baseline_lower"
 #define S_CALIB_VERSION "calib_version"
 
 /* Version 2: gaze offsets are in eye widths. Older calibrations are in other units. */
@@ -124,6 +128,7 @@ struct camflip {
 	float notes_side;
 	float notes_open; /* eye openness at the notes; 0 = unknown (calibrated by an older version) */
 	cf_head_ref head_ref; /* the face looking into the camera; ok 0 = not learnt (older step 1) */
+	float baseline_upper, baseline_lower; /* lids looking into the camera; 0 = not learnt (older step 1) */
 	bool has_notes;
 	bool notes_stale; /* notes no longer below the (newer) lens calibration: not used until redone */
 	bool lens_done;
@@ -274,6 +279,8 @@ static cf_gaze_params params_locked(const struct camflip *f)
 	p.notes_side = f->notes_side;
 	p.notes_open = f->notes_open;
 	p.head_ref = f->head_ref;
+	p.baseline_upper = f->baseline_upper;
+	p.baseline_lower = f->baseline_lower;
 	return p;
 }
 
@@ -784,6 +791,11 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		obs_data_set_double(changes, S_HEAD_VERT, res->head.vert);
 		obs_data_set_double(changes, S_HEAD_EYES, res->head.eyes);
 		obs_data_set_double(changes, S_HEAD_TILT, res->head.tilt);
+		/* The lids as they are while looking into the camera: what reading narrows is restored from here. */
+		f->baseline_upper = res->upper;
+		f->baseline_lower = res->lower;
+		obs_data_set_double(changes, S_BASELINE_UPPER, res->upper);
+		obs_data_set_double(changes, S_BASELINE_LOWER, res->lower);
 		f->calib_done_msg = "Camera calibrated.";
 	}
 	/* A new camera calibration can leave the saved notes above (or level with) the lens. */
@@ -1075,6 +1087,8 @@ static void camflip_update(void *data, obs_data_t *settings)
 	f->head_ref.vert = (float)obs_data_get_double(settings, S_HEAD_VERT);
 	f->head_ref.eyes = (float)obs_data_get_double(settings, S_HEAD_EYES);
 	f->head_ref.tilt = (float)obs_data_get_double(settings, S_HEAD_TILT);
+	f->baseline_upper = (float)obs_data_get_double(settings, S_BASELINE_UPPER);
+	f->baseline_lower = (float)obs_data_get_double(settings, S_BASELINE_LOWER);
 	check_notes_locked(f);
 	if (f->has_notes || f->lens_done)
 		f->needs_recalib = false;
@@ -1101,6 +1115,8 @@ static bool migrate_calibration(obs_data_t *settings)
 	obs_data_unset_user_value(settings, S_HEAD_VERT);
 	obs_data_unset_user_value(settings, S_HEAD_EYES);
 	obs_data_unset_user_value(settings, S_HEAD_TILT);
+	obs_data_unset_user_value(settings, S_BASELINE_UPPER);
+	obs_data_unset_user_value(settings, S_BASELINE_LOWER);
 	if (obs_data_has_user_value(settings, S_MAX_GLANCE))
 		obs_data_unset_user_value(settings, S_MAX_GLANCE); /* also in different units now */
 	obs_data_set_int(settings, S_CALIB_VERSION, CALIB_VERSION);
@@ -1206,6 +1222,8 @@ static void camflip_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, S_HEAD_VERT, 0.0);
 	obs_data_set_default_double(settings, S_HEAD_EYES, 0.0);
 	obs_data_set_default_double(settings, S_HEAD_TILT, 0.0);
+	obs_data_set_default_double(settings, S_BASELINE_UPPER, 0.0);
+	obs_data_set_default_double(settings, S_BASELINE_LOWER, 0.0);
 	/* S_CALIB_VERSION deliberately has no default, see migrate_calibration(). */
 }
 
@@ -1461,8 +1479,12 @@ static obs_properties_t *camflip_properties(void *data)
 
 	obs_properties_add_bool(props, S_EYE_CONTACT, "Eye contact");
 
-	p = obs_properties_add_float_slider(props, S_STRENGTH, "Eye contact strength", 0.0, 100.0, 1.0);
+	/* Up to CF_STRENGTH_MAX (200%): over 100% the correction overshoots, for when glances still show. */
+	p = obs_properties_add_float_slider(props, S_STRENGTH, "Eye contact strength", 0.0, 100.0 * CF_STRENGTH_MAX, 1.0);
 	obs_property_float_set_suffix(p, "%");
+	obs_property_set_long_description(
+		p, "100% cancels the glance at your notes as it is measured. If you still look like you're reading, "
+		   "go higher (up to 200%) to lift your eyes further; lower keeps some of the natural movement.");
 
 	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 5.0, 30.0, 1.0);
 	obs_property_float_set_suffix(p, "%");
