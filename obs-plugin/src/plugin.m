@@ -3,9 +3,17 @@
  *   - mirrors the video, so everyone in your call sees it mirrored, and
  *   - keeps eye contact when you glance slightly down at notes under the camera.
  *
- * It runs directly on each camera frame as it arrives (in the camera's own pixel format),
- * with no queues, copies of the whole frame, or extra GPU passes, so it adds no frame of delay
- * and doesn't change image quality outside the eyes.
+ * Threads:
+ *   - Video thread (filter_video): copies the frame's brightness into a spare buffer, asks the
+ *     gaze model where the eyes are *now* (cf_gaze_predict), warps the eyes and mirrors. It never
+ *     waits for face tracking, so the filter adds no delay and never stalls OBS.
+ *   - Tracking thread (one per filter): runs Apple Vision on the newest copied frame (older
+ *     frames are dropped, never queued), refines the pupils and feeds cf_gaze_update().
+ *   The gaze model is shared by both and guarded by `gaze_lock`; everything else that both
+ *   threads touch is guarded by `lock`. The two locks are never held together.
+ *
+ * Pixels are processed in the camera's own format, with no conversion, so nothing outside the
+ * eyes changes.
  */
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
@@ -13,9 +21,13 @@
 #import <Vision/Vision.h>
 
 #include <obs-module.h>
+#include <math.h>
 #include <pthread.h>
+#include <pthread/qos.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gaze.h"
 #include "warp.h"
@@ -42,34 +54,133 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_EYE_CONTACT "eye_contact"
 #define S_STRENGTH "strength"
 #define S_MAX_GLANCE "max_glance"
+#define S_SHOW_EYES "show_eyes"
 #define S_BASELINE "baseline"
+#define S_BASELINE_OPEN "baseline_open"
+#define S_NOTES_OFFSET "notes_offset"
+#define S_NOTES_SIDE "notes_side"
+#define S_HAS_NOTES "has_notes"
+#define S_CALIB_VERSION "calib_version"
+
+/* Version 2: gaze offsets are in eye widths. Older calibrations are in other units. */
+#define CALIB_VERSION 2
+#define DEFAULT_BASELINE 0.0 /* eye widths; pupil level with the eye corners */
+
+#define HOTKEY_NAME "camflip.toggle_eye_contact"
+#define HOTKEY_DESC "Cam Flip: toggle eye contact"
+
+#define FULL_DETECT_NS 1000000000ull /* re-run full face detection at least this often */
+#define LOG_EVERY_NS 10000000000ull  /* timing summary in the log */
+#define REFRESH_NS 1000000000ull     /* settings panel status refresh, at most this often */
+
+static uint64_t now_ns(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+typedef struct {
+	uint8_t *data; /* 8-bit brightness, tightly packed (stride = w) */
+	size_t cap;
+	int w, h;
+	double t; /* frame timestamp, seconds */
+} grey_frame;
+
+enum calib_state { CALIB_IDLE = 0, CALIB_LENS = 1, CALIB_NOTES = 2 };
 
 struct camflip {
 	obs_source_t *context;
-	pthread_mutex_t lock;
 
-	/* settings (guarded by lock) */
+	/* ---- guarded by `lock` ---- */
+	pthread_mutex_t lock;
+	pthread_cond_t wake; /* worker waits on this for a new frame or stop */
+
+	/* settings */
 	bool mirror;
 	bool eye_contact;
+	bool show_eyes;
 	float strength;
 	float max_glance;
 	float baseline;
-	bool calibrate_request;
+	float baseline_open;
+	float notes_offset;
+	float notes_side;
+	bool has_notes;
+	bool lens_done;
+	bool needs_recalib; /* old settings in old units were reset */
 
-	/* video thread only */
+	/* calibration requests (from the panel) and progress (from the worker) */
+	int calib_request; /* 0 none, else CALIB_LENS / CALIB_NOTES */
+	int calib_running; /* CALIB_IDLE / CALIB_LENS / CALIB_NOTES */
+	int calib_failed;  /* CALIB_IDLE or the step that gave up */
+	const char *calib_done_msg;
+
+	/* frame hand-off: two buffers, the worker owns `busy`, the newest waiting one is `pending` */
+	grey_frame frames[2];
+	int busy;
+	int pending;
+	bool stop;
+
+	/* status for the panel */
+	bool st_face;
+	float st_factor;
+	double ema_vision_ms, ema_warp_ms, ema_fps;
+	double last_frame_t; /* worker, for the analysed-fps estimate */
+
+	/* overlay: what Vision saw on the last analysed frame */
+	cf_face ov_face;
+
+	/* timing summary for the log (video thread logs it) */
+	double win_vision_ms;
+	unsigned long win_vision_n, win_full_n;
+	double win_warp_ms;
+	unsigned long win_warp_n;
+	uint64_t win_start;
+
+	/* diagnostics (tests) */
+	unsigned long vision_runs; /* frames analysed */
+	unsigned long vision_failures;
+	unsigned long full_detections;
+	unsigned long tracked_runs;
+
+	obs_hotkey_id hotkey;
+
+	/* ---- guarded by `gaze_lock` ---- */
+	pthread_mutex_t gaze_lock;
 	cf_gaze gaze;
-	void *handler; /* VNSequenceRequestHandler, retained */
-	void *request; /* VNDetectFaceLandmarksRequest, retained */
-	uint8_t *gray;
-	size_t gray_size;
+
+	/* ---- worker thread only ---- */
+	pthread_t worker;
+	bool worker_started;
+	void *handler;   /* VNSequenceRequestHandler, retained */
+	void *request;   /* VNDetectFaceLandmarksRequest, retained */
+	void *last_face; /* VNFaceObservation to track from on the next frame, retained, or NULL */
 	uint8_t *bgra;
 	size_t bgra_size;
 	bool vision_needs_bgra;
 	bool vision_grey_ok; /* Vision has accepted a grey frame at least once */
-	bool warned_format;
 	bool warned_vision;
-	unsigned long vision_runs;     /* for diagnostics/tests */
-	unsigned long vision_failures;
+	bool tracking_disabled;
+	int track_errors;
+	uint64_t last_detect_ns;
+	int last_w, last_h;
+	/* geometry learned at the last full detection, used to move the face box with the head */
+	double ref_off_x, ref_off_y; /* box centre minus landmark centroid, in box widths */
+	double ref_aspect;           /* box height / width, pixels */
+	double ref_width_per_iod;    /* box width / distance between the eyes */
+	double ref_side, ref_vert;   /* nose position relative to the eyes (head pose proxy) */
+	bool ref_has_nose;
+	double pose_roll, pose_yaw, pose_pitch;
+	bool pose_has_roll, pose_has_yaw, pose_has_pitch;
+	unsigned int last_sig;
+	uint64_t last_refresh;
+
+	/* ---- video thread only ---- */
+	bool warned_format;
+	bool vt_was_on;
+
+#ifdef CAMFLIP_TEST
+	bool test_pause; /* guarded by `lock`: worker leaves frames alone */
+#endif
 };
 
 static enum cf_format to_cf_format(enum video_format f)
@@ -102,7 +213,10 @@ static enum cf_format to_cf_format(enum video_format f)
 	}
 }
 
-/* ---------------------------------------------------------------- Vision */
+static bool is_rgb(enum cf_format fmt)
+{
+	return fmt == CF_FMT_RGBA || fmt == CF_FMT_BGRA || fmt == CF_FMT_BGRX;
+}
 
 static uint8_t *ensure(uint8_t **buf, size_t *size, size_t need)
 {
@@ -114,70 +228,173 @@ static uint8_t *ensure(uint8_t **buf, size_t *size, size_t need)
 	return *buf;
 }
 
-/* Runs Apple Vision on the frame's brightness and fills `face` (image pixels, origin top left). */
-static void detect_face(struct camflip *f, struct obs_source_frame *frame, const cf_channel *channels, int count,
-			enum cf_format fmt, cf_face *face)
+static cf_gaze_params params_locked(const struct camflip *f)
 {
-	memset(face, 0, sizeof(*face));
-	const int w = (int)frame->width, h = (int)frame->height;
-	face->image_width = w;
-	face->image_height = h;
+	cf_gaze_params p;
+	memset(&p, 0, sizeof(p));
+	p.strength = f->strength;
+	p.max_glance = f->max_glance;
+	p.baseline = f->baseline;
+	p.baseline_open = f->baseline_open;
+	p.has_notes = f->has_notes ? 1 : 0;
+	p.notes_offset = f->notes_offset;
+	p.notes_side = f->notes_side;
+	return p;
+}
 
-	@autoreleasepool {
-		/* Grey view of the frame. For planar formats this is the luma plane itself (no copy). */
-		uint8_t *grey = NULL;
-		size_t grey_stride = 0;
-		if (fmt == CF_FMT_NV12 || fmt == CF_FMT_I420 || fmt == CF_FMT_I422 || fmt == CF_FMT_I444 ||
-		    fmt == CF_FMT_Y800) {
-			grey = frame->data[0];
-			grey_stride = frame->linesize[0];
-		} else {
-			/* Packed YUV: copy the luma bytes out. RGB: green is a good stand-in for brightness. */
-			const cf_channel *src = &channels[0];
-			if (fmt == CF_FMT_RGBA || fmt == CF_FMT_BGRA || fmt == CF_FMT_BGRX)
-				src = &channels[1];
-			if (!ensure(&f->gray, &f->gray_size, (size_t)w * h))
-				return;
-			cf_extract_luma(src, f->gray);
-			grey = f->gray;
-			grey_stride = (size_t)w;
-		}
-		(void)count;
+/* ------------------------------------------------- settings written from other threads */
 
-		CVPixelBufferRef pb = NULL;
-		if (!f->vision_needs_bgra) {
-			CVPixelBufferCreateWithBytes(kCFAllocatorDefault, (size_t)w, (size_t)h, kCVPixelFormatType_OneComponent8,
-						     grey, grey_stride, NULL, NULL, NULL, &pb);
-		} else {
-			/* Fallback if this macOS version's Vision rejects 8-bit grey buffers. */
-			if (!ensure(&f->bgra, &f->bgra_size, (size_t)w * h * 4))
-				return;
-			for (int y = 0; y < h; y++) {
-				const uint8_t *s = grey + (size_t)y * grey_stride;
-				uint32_t *d = (uint32_t *)(f->bgra + (size_t)y * w * 4);
-				for (int x = 0; x < w; x++)
-					d[x] = 0xff000000u | ((uint32_t)s[x] * 0x010101u);
-			}
-			CVPixelBufferCreateWithBytes(kCFAllocatorDefault, (size_t)w, (size_t)h, kCVPixelFormatType_32BGRA,
-						     f->bgra, (size_t)w * 4, NULL, NULL, NULL, &pb);
-		}
-		if (!pb)
-			return;
+/*
+ * Calibration results and the hotkey change settings outside the settings panel. They are
+ * written on OBS's UI thread (where the panel itself writes them), through obs_source_update,
+ * so the saved settings, this filter and an open panel all agree. Holds only a weak reference,
+ * so it is safe if the filter is deleted before the task runs.
+ */
+struct ui_task {
+	obs_weak_source_t *weak;
+	obs_data_t *changes; /* may be NULL: just refresh the panel */
+};
 
-		VNSequenceRequestHandler *handler = (__bridge VNSequenceRequestHandler *)f->handler;
-		VNDetectFaceLandmarksRequest *request = (__bridge VNDetectFaceLandmarksRequest *)f->request;
-		NSError *error = nil;
-		BOOL ok = [handler performRequests:@[request]
-				   onCVPixelBuffer:pb
-				       orientation:kCGImagePropertyOrientationUp
-					     error:&error];
-		CVPixelBufferRelease(pb);
+static void ui_task_run(void *param)
+{
+	struct ui_task *t = param;
+	obs_source_t *src = obs_weak_source_get_source(t->weak);
+	if (src) {
+		if (t->changes)
+			obs_source_update(src, t->changes);
+		obs_source_update_properties(src);
+		obs_source_release(src);
+	}
+	if (t->changes)
+		obs_data_release(t->changes);
+	obs_weak_source_release(t->weak);
+	bfree(t);
+}
 
-		f->vision_runs++;
-		if (!ok) {
-			f->vision_failures++;
-			/* Only fall back to the slower BGRA path if grey input has never worked. A one-off
-			 * failure after grey frames have been accepted is not a format problem. */
+/* Runs on OBS's destroy-task thread, so the UI task below is posted, not run inline. */
+static void ui_task_hop(void *param)
+{
+	obs_queue_task(OBS_TASK_UI, ui_task_run, param, false);
+}
+
+/* Takes ownership of `changes`. */
+static void queue_ui(struct camflip *f, obs_data_t *changes)
+{
+	if (!f->context) { /* tests: no OBS source */
+		if (changes)
+			obs_data_release(changes);
+		return;
+	}
+	struct ui_task *t = bzalloc(sizeof(*t));
+	t->weak = obs_source_get_weak_source(f->context);
+	t->changes = changes;
+	/* Never run it inline on the UI thread: OBS's UI task handler and its "update_properties"
+	 * handler are direct calls there, so a button callback (or a hotkey handled on the UI thread)
+	 * would rebuild the settings panel while Qt is still inside the clicked widget, which frees
+	 * that widget under it. Bounce through another thread so it runs from the event loop. */
+	if (obs_in_task_thread(OBS_TASK_UI))
+		obs_queue_task(OBS_TASK_DESTROY, ui_task_hop, t, false);
+	else
+		obs_queue_task(OBS_TASK_UI, ui_task_run, t, false);
+}
+
+/* ---------------------------------------------------------------- Vision (worker thread) */
+
+static bool region_centroid(VNFaceLandmarkRegion2D *r, CGSize size, CGPoint *out)
+{
+	if (!r || r.pointCount == 0)
+		return false;
+	const CGPoint *p = [r pointsInImageOfSize:size];
+	double sx = 0, sy = 0;
+	for (NSUInteger i = 0; i < r.pointCount; i++) {
+		sx += p[i].x;
+		sy += p[i].y;
+	}
+	out->x = sx / (double)r.pointCount;
+	out->y = sy / (double)r.pointCount;
+	return true;
+}
+
+/* Landmark geometry, in Vision's image pixels (origin bottom left). */
+typedef struct {
+	CGPoint centroid, left, right, nose;
+	double iod; /* distance between the eye centres */
+	bool has_nose;
+	double side, vert; /* nose relative to the eyes, in eye distances: changes as the head turns */
+} face_geom;
+
+static bool measure_geom(VNFaceLandmarks2D *lm, CGSize size, face_geom *g)
+{
+	memset(g, 0, sizeof(*g));
+	if (!region_centroid(lm.allPoints, size, &g->centroid) || !region_centroid(lm.leftEye, size, &g->left) ||
+	    !region_centroid(lm.rightEye, size, &g->right))
+		return false;
+	const double ax = g->right.x - g->left.x, ay = g->right.y - g->left.y;
+	g->iod = sqrt(ax * ax + ay * ay);
+	if (g->iod < 4.0)
+		return false;
+	g->has_nose = region_centroid(lm.nose, size, &g->nose);
+	if (g->has_nose) {
+		const double ux = ax / g->iod, uy = ay / g->iod;
+		const double dx = g->nose.x - (g->left.x + g->right.x) / 2, dy = g->nose.y - (g->left.y + g->right.y) / 2;
+		g->side = (dx * ux + dy * uy) / g->iod;
+		g->vert = (-dx * uy + dy * ux) / g->iod;
+	}
+	return true;
+}
+
+static void set_last_face(struct camflip *f, VNFaceObservation *obs)
+{
+	if (f->last_face)
+		CFBridgingRelease(f->last_face);
+	f->last_face = obs ? (void *)CFBridgingRetain(obs) : NULL;
+}
+
+/* Face box for the next frame: the box from the last full detection, moved and scaled with
+ * the landmarks so it follows the head between detections. */
+static void plan_tracking(struct camflip *f, const face_geom *g, int w, int h)
+{
+	const double bw = f->ref_width_per_iod * g->iod;
+	const double bh = bw * f->ref_aspect;
+	const double cx = g->centroid.x + f->ref_off_x * bw;
+	const double cy = g->centroid.y + f->ref_off_y * bw;
+	if (cx < 0 || cy < 0 || cx > w || cy > h || bw < 8 || bh < 8) {
+		set_last_face(f, nil);
+		return;
+	}
+	const CGRect box = CGRectMake((cx - bw / 2) / w, (cy - bh / 2) / h, bw / w, bh / h);
+	VNFaceObservation *next = [VNFaceObservation
+		faceObservationWithRequestRevision:VNDetectFaceRectanglesRequestRevision3
+				       boundingBox:box
+					      roll:(f->pose_has_roll ? @(f->pose_roll) : nil)
+					       yaw:(f->pose_has_yaw ? @(f->pose_yaw) : nil)
+					     pitch:(f->pose_has_pitch ? @(f->pose_pitch) : nil)];
+	set_last_face(f, next);
+}
+
+/*
+ * One Vision pass. `track` nil = full face detection, otherwise only the landmarks inside that
+ * face box (much cheaper). Returns the face with eye landmarks, or nil.
+ */
+static VNFaceObservation *vision_pass(struct camflip *f, CVPixelBufferRef pb, VNFaceObservation *track,
+				      bool *vision_error)
+{
+	VNSequenceRequestHandler *handler = (__bridge VNSequenceRequestHandler *)f->handler;
+	VNDetectFaceLandmarksRequest *request = (__bridge VNDetectFaceLandmarksRequest *)f->request;
+	request.inputFaceObservations = track ? @[track] : nil;
+	NSError *error = nil;
+	BOOL ok = [handler performRequests:@[request]
+			   onCVPixelBuffer:pb
+			       orientation:kCGImagePropertyOrientationUp
+				     error:&error];
+	*vision_error = !ok;
+	if (!ok) {
+		pthread_mutex_lock(&f->lock);
+		f->vision_failures++;
+		pthread_mutex_unlock(&f->lock);
+		if (!track) {
+			/* Only fall back to the slower BGRA path if grey input has never worked. A
+			 * one-off failure after grey frames have been accepted is not a format problem. */
 			if (!f->vision_needs_bgra && !f->vision_grey_ok) {
 				f->vision_needs_bgra = true;
 				blog(LOG_INFO, "[cam-flip] Vision rejected grey frames, switching to BGRA input");
@@ -186,49 +403,402 @@ static void detect_face(struct camflip *f, struct obs_source_frame *frame, const
 				const char *why = error.localizedDescription.UTF8String;
 				blog(LOG_WARNING, "[cam-flip] face tracking failed: %s", why ? why : "unknown error");
 			}
-			return;
 		}
-		if (!f->vision_needs_bgra)
-			f->vision_grey_ok = true;
+		return nil;
+	}
+	if (!f->vision_needs_bgra)
+		f->vision_grey_ok = true;
 
-		VNFaceObservation *best = nil;
-		for (VNFaceObservation *obs in request.results) {
-			if (!best || obs.boundingBox.size.width > best.boundingBox.size.width)
-				best = obs;
+	VNFaceObservation *best = nil;
+	for (VNFaceObservation *obs in request.results) {
+		if (!best || obs.boundingBox.size.width > best.boundingBox.size.width)
+			best = obs;
+	}
+	VNFaceLandmarks2D *lm = best.landmarks;
+	if (!best || !lm.leftEye || !lm.rightEye || !lm.leftPupil || !lm.rightPupil)
+		return nil;
+	/* In tracking mode Vision always answers for the box we gave it, face or not. */
+	if (track && lm.confidence < 0.4f)
+		return nil;
+	return best;
+}
+
+static CVPixelBufferRef make_pixel_buffer(struct camflip *f, const grey_frame *g)
+{
+	CVPixelBufferRef pb = NULL;
+	if (!f->vision_needs_bgra) {
+		CVPixelBufferCreateWithBytes(kCFAllocatorDefault, (size_t)g->w, (size_t)g->h,
+					     kCVPixelFormatType_OneComponent8, g->data, (size_t)g->w, NULL, NULL, NULL,
+					     &pb);
+	} else {
+		/* Fallback if this macOS version's Vision rejects 8-bit grey buffers. */
+		if (!ensure(&f->bgra, &f->bgra_size, (size_t)g->w * g->h * 4))
+			return NULL;
+		for (int y = 0; y < g->h; y++) {
+			const uint8_t *s = g->data + (size_t)y * g->w;
+			uint32_t *d = (uint32_t *)(f->bgra + (size_t)y * g->w * 4);
+			for (int x = 0; x < g->w; x++)
+				d[x] = 0xff000000u | ((uint32_t)s[x] * 0x010101u);
 		}
-		VNFaceLandmarks2D *lm = best.landmarks;
-		if (!best || !lm.leftEye || !lm.rightEye || !lm.leftPupil || !lm.rightPupil)
-			return;
+		CVPixelBufferCreateWithBytes(kCFAllocatorDefault, (size_t)g->w, (size_t)g->h, kCVPixelFormatType_32BGRA,
+					     f->bgra, (size_t)g->w * 4, NULL, NULL, NULL, &pb);
+	}
+	return pb;
+}
 
-		const CGSize size = CGSizeMake(w, h);
-		VNFaceLandmarkRegion2D *regions[2] = {lm.leftEye, lm.rightEye};
-		cf_pt *outs[2] = {face->left_eye, face->right_eye};
-		int *counts[2] = {&face->left_count, &face->right_count};
-		for (int e = 0; e < 2; e++) {
-			const CGPoint *pts = [regions[e] pointsInImageOfSize:size];
-			int n = (int)regions[e].pointCount;
-			if (n > CF_MAX_EYE_POINTS)
-				n = CF_MAX_EYE_POINTS;
-			for (int i = 0; i < n; i++) {
-				outs[e][i].x = (float)pts[i].x;
-				outs[e][i].y = (float)(h - pts[i].y); /* Vision's origin is bottom left */
+/* Runs Apple Vision on a grey frame and fills `face` (image pixels, origin top left). */
+static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, bool *did_full)
+{
+	memset(face, 0, sizeof(*face));
+	const int w = g->w, h = g->h;
+	face->image_width = w;
+	face->image_height = h;
+	*did_full = false;
+
+	CVPixelBufferRef pb = make_pixel_buffer(f, g);
+	if (!pb)
+		return;
+
+	const uint64_t now = now_ns();
+	if (w != f->last_w || h != f->last_h) {
+		set_last_face(f, nil);
+		f->last_w = w;
+		f->last_h = h;
+	}
+	VNFaceObservation *track = nil;
+	if (f->last_face && !f->tracking_disabled && now - f->last_detect_ns < FULL_DETECT_NS)
+		track = (__bridge VNFaceObservation *)f->last_face;
+
+	bool vision_error = false;
+	VNFaceObservation *best = nil;
+	if (track) {
+		best = vision_pass(f, pb, track, &vision_error);
+		if (vision_error) {
+			if (++f->track_errors >= 3 && !f->tracking_disabled) {
+				f->tracking_disabled = true;
+				blog(LOG_INFO, "[cam-flip] fast face tracking unavailable, using full detection on every frame");
 			}
-			*counts[e] = n;
+		} else {
+			f->track_errors = 0;
 		}
-		const CGPoint *lp = [lm.leftPupil pointsInImageOfSize:size];
-		const CGPoint *rp = [lm.rightPupil pointsInImageOfSize:size];
-		if (lm.leftPupil.pointCount < 1 || lm.rightPupil.pointCount < 1)
-			return;
-		face->left_pupil = (cf_pt){(float)lp[0].x, (float)(h - lp[0].y)};
-		face->right_pupil = (cf_pt){(float)rp[0].x, (float)(h - rp[0].y)};
+		if (!best)
+			track = nil; /* lost the face: full detection on this same frame */
+	}
+	if (!track) {
+		*did_full = true;
+		best = vision_pass(f, pb, nil, &vision_error);
+	}
+	CVPixelBufferRelease(pb);
 
-		face->face_width = (float)(best.boundingBox.size.width * w);
-		if (best.yaw != nil) {
-			face->has_pose = 1;
-			face->yaw_deg = (float)(best.yaw.doubleValue * 180.0 / M_PI);
-			face->pitch_deg = best.pitch != nil ? (float)(best.pitch.doubleValue * 180.0 / M_PI) : 0.0f;
+	const CGSize size = CGSizeMake(w, h);
+	face_geom geom;
+	if (!best || !measure_geom(best.landmarks, size, &geom)) {
+		set_last_face(f, nil);
+		return;
+	}
+
+	if (!track) {
+		/* Fresh detection: remember how the detector's box sits around the landmarks. */
+		const CGRect bb = best.boundingBox;
+		const double bw = bb.size.width * w, bh = bb.size.height * h;
+		const double bcx = (bb.origin.x + bb.size.width / 2) * w, bcy = (bb.origin.y + bb.size.height / 2) * h;
+		f->ref_off_x = (bcx - geom.centroid.x) / bw;
+		f->ref_off_y = (bcy - geom.centroid.y) / bw;
+		f->ref_aspect = bh / bw;
+		f->ref_width_per_iod = bw / geom.iod;
+		f->ref_side = geom.side;
+		f->ref_vert = geom.vert;
+		f->ref_has_nose = geom.has_nose;
+		f->pose_has_roll = best.roll != nil;
+		f->pose_roll = best.roll.doubleValue;
+		f->pose_has_yaw = best.yaw != nil;
+		f->pose_yaw = best.yaw.doubleValue;
+		f->pose_has_pitch = best.pitch != nil;
+		f->pose_pitch = best.pitch.doubleValue;
+		f->last_detect_ns = now;
+	}
+	plan_tracking(f, &geom, w, h);
+	/* Head pose comes from full detections. If the head has turned or tilted noticeably since
+	 * the last one, detect again on the next frame so the pose (and the fade-out) stays fresh. */
+	if (track && f->ref_has_nose && geom.has_nose &&
+	    (fabs(geom.side - f->ref_side) > 0.05 || fabs(geom.vert - f->ref_vert) > 0.08))
+		f->last_detect_ns = 0;
+
+	VNFaceLandmarks2D *lm = best.landmarks;
+	VNFaceLandmarkRegion2D *regions[2] = {lm.leftEye, lm.rightEye};
+	cf_pt *outs[2] = {face->left_eye, face->right_eye};
+	int *counts[2] = {&face->left_count, &face->right_count};
+	for (int e = 0; e < 2; e++) {
+		const CGPoint *pts = [regions[e] pointsInImageOfSize:size];
+		int n = (int)regions[e].pointCount;
+		if (n > CF_MAX_EYE_POINTS)
+			n = CF_MAX_EYE_POINTS;
+		for (int i = 0; i < n; i++) {
+			outs[e][i].x = (float)pts[i].x;
+			outs[e][i].y = (float)(h - pts[i].y); /* Vision's origin is bottom left */
 		}
-		face->found = 1;
+		*counts[e] = n;
+	}
+	if (lm.leftPupil.pointCount < 1 || lm.rightPupil.pointCount < 1)
+		return;
+	const CGPoint *lp = [lm.leftPupil pointsInImageOfSize:size];
+	const CGPoint *rp = [lm.rightPupil pointsInImageOfSize:size];
+	face->left_pupil = (cf_pt){(float)lp[0].x, (float)(h - lp[0].y)};
+	face->right_pupil = (cf_pt){(float)rp[0].x, (float)(h - rp[0].y)};
+
+	/* Vision's pupil point is coarse; move it onto the real iris centre. */
+	face->left_pupil =
+		cf_refine_pupil(g->data, w, w, h, face->left_eye, face->left_count, face->left_pupil);
+	face->right_pupil =
+		cf_refine_pupil(g->data, w, w, h, face->right_eye, face->right_count, face->right_pupil);
+
+	face->face_width = (float)(best.boundingBox.size.width * w);
+	if (best.yaw != nil) {
+		face->has_pose = 1;
+		face->yaw_deg = (float)(best.yaw.doubleValue * 180.0 / M_PI);
+		face->pitch_deg = best.pitch != nil ? (float)(best.pitch.doubleValue * 180.0 / M_PI) : 0.0f;
+	}
+	face->found = 1;
+}
+
+/* Short code for "what the status panel shows", so it is refreshed only on real changes.
+ * Only discrete states: each refresh rebuilds the whole panel (and drops a slider the user is
+ * dragging), so it must not follow values that change while you look around. */
+static unsigned int status_sig_locked(const struct camflip *f)
+{
+	return (unsigned)f->calib_running | ((unsigned)f->calib_failed << 2) | ((unsigned)f->st_face << 4) |
+	       ((unsigned)f->lens_done << 5) | ((unsigned)f->has_notes << 6) | ((unsigned)f->eye_contact << 7);
+}
+
+static void process_frame(struct camflip *f, const grey_frame *g)
+{
+	pthread_mutex_lock(&f->lock);
+	const cf_gaze_params params = params_locked(f);
+	const int start = f->calib_request;
+	f->calib_request = 0;
+	if (start) {
+		f->calib_running = start;
+		f->calib_failed = CALIB_IDLE;
+		f->calib_done_msg = NULL;
+	}
+	pthread_mutex_unlock(&f->lock);
+
+	if (start) {
+		pthread_mutex_lock(&f->gaze_lock);
+		cf_gaze_start_calibration(&f->gaze, start == CALIB_NOTES ? CF_CALIB_NOTES : CF_CALIB_LENS);
+		pthread_mutex_unlock(&f->gaze_lock);
+	}
+
+	const uint64_t t0 = now_ns();
+	cf_face face;
+	bool did_full = false;
+	detect_face(f, g, &face, &did_full);
+
+	cf_eye eyes[2];
+	cf_calib_result res;
+	memset(&res, 0, sizeof(res));
+	cf_gaze_status st;
+	memset(&st, 0, sizeof(st));
+	pthread_mutex_lock(&f->gaze_lock);
+	cf_gaze_update(&f->gaze, &face, &params, g->t, eyes);
+	const int calibrated = cf_gaze_take_calibration(&f->gaze, &res);
+	cf_gaze_get_status(&f->gaze, &st);
+	pthread_mutex_unlock(&f->gaze_lock);
+	const double ms = (double)(now_ns() - t0) / 1e6;
+
+	obs_data_t *changes = NULL;
+	pthread_mutex_lock(&f->lock);
+	f->vision_runs++;
+	if (did_full)
+		f->full_detections++;
+	else
+		f->tracked_runs++;
+	f->win_vision_ms += ms;
+	f->win_vision_n++;
+	if (did_full)
+		f->win_full_n++;
+	f->ema_vision_ms = f->ema_vision_ms > 0 ? f->ema_vision_ms * 0.9 + ms * 0.1 : ms;
+	const double dt = g->t - f->last_frame_t;
+	if (f->last_frame_t > 0 && dt > 0 && dt < 1.0)
+		f->ema_fps = f->ema_fps > 0 ? f->ema_fps * 0.9 + 0.1 / dt : 1.0 / dt;
+	f->last_frame_t = g->t;
+	f->st_face = st.face_found != 0;
+	f->st_factor = st.factor;
+	f->ov_face = face;
+
+	const int step = f->calib_running;
+	if (calibrated != 0)
+		f->calib_running = CALIB_IDLE;
+	if (calibrated > 0) {
+		changes = obs_data_create();
+		if (res.target == CF_CALIB_NOTES) {
+			f->notes_offset = res.offset;
+			f->notes_side = res.side;
+			f->has_notes = true;
+			obs_data_set_double(changes, S_NOTES_OFFSET, res.offset);
+			obs_data_set_double(changes, S_NOTES_SIDE, res.side);
+			obs_data_set_bool(changes, S_HAS_NOTES, true);
+			f->calib_done_msg = "Notes calibrated.";
+		} else {
+			f->baseline = res.offset;
+			f->baseline_open = res.openness;
+			f->lens_done = true;
+			obs_data_set_double(changes, S_BASELINE, res.offset);
+			obs_data_set_double(changes, S_BASELINE_OPEN, res.openness);
+			f->calib_done_msg = "Camera calibrated.";
+		}
+		f->needs_recalib = false;
+		obs_data_set_int(changes, S_CALIB_VERSION, CALIB_VERSION);
+	} else if (calibrated < 0) {
+		f->calib_failed = step ? step : CALIB_LENS;
+	}
+
+	/* Refresh an open settings panel, at most once a second and only when something changed. */
+	bool refresh = false;
+	const unsigned int sig = status_sig_locked(f);
+	const uint64_t now = now_ns();
+	if (changes || (sig != f->last_sig && now - f->last_refresh >= REFRESH_NS)) {
+		f->last_sig = sig;
+		f->last_refresh = now;
+		refresh = true;
+	}
+	pthread_mutex_unlock(&f->lock);
+
+	if (calibrated > 0) {
+		if (res.target == CF_CALIB_NOTES)
+			blog(LOG_INFO, "[cam-flip] notes calibrated (offset %.3f, side %.3f eye widths)", res.offset,
+			     res.side);
+		else
+			blog(LOG_INFO, "[cam-flip] camera calibrated (baseline %.3f eye widths, openness %.3f)",
+			     res.offset, res.openness);
+	} else if (calibrated < 0) {
+		blog(LOG_WARNING, "[cam-flip] calibration gave up: no steady, front-facing face seen. "
+				  "Light your face, hold still and click the calibration button again");
+	}
+	if (refresh)
+		queue_ui(f, changes); /* persists calibration immediately, then refreshes the panel */
+	else if (changes)
+		obs_data_release(changes);
+}
+
+static void *worker_main(void *data)
+{
+	struct camflip *f = data;
+	pthread_setname_np("cam-flip tracking");
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
+	pthread_mutex_lock(&f->lock);
+	for (;;) {
+		while (!f->stop && (f->pending < 0
+#ifdef CAMFLIP_TEST
+				    || f->test_pause
+#endif
+				    ))
+			pthread_cond_wait(&f->wake, &f->lock);
+		if (f->stop)
+			break;
+		const int idx = f->pending;
+		f->pending = -1;
+		f->busy = idx;
+		pthread_mutex_unlock(&f->lock);
+
+		@autoreleasepool {
+			process_frame(f, &f->frames[idx]);
+		}
+
+		pthread_mutex_lock(&f->lock);
+		f->busy = -1;
+	}
+	pthread_mutex_unlock(&f->lock);
+	return NULL;
+}
+
+/* ---------------------------------------------------------------- Video thread helpers */
+
+/* Copies the frame's brightness into the free buffer and hands it to the worker. Any older
+ * frame still waiting is dropped: the worker always analyses the newest one. */
+static void submit_frame(struct camflip *f, const cf_channel *luma, double t)
+{
+	pthread_mutex_lock(&f->lock);
+	const int idx = f->busy == 0 ? 1 : 0;
+	if (f->pending == idx)
+		f->pending = -1;
+	pthread_mutex_unlock(&f->lock);
+
+	grey_frame *g = &f->frames[idx];
+	const int w = luma->width, h = luma->height;
+	if (!ensure(&g->data, &g->cap, (size_t)w * h))
+		return;
+	if (luma->step == 1) {
+		for (int y = 0; y < h; y++)
+			memcpy(g->data + (size_t)y * w, luma->base + (size_t)y * luma->linesize, (size_t)w);
+	} else {
+		cf_extract_luma(luma, g->data);
+	}
+	g->w = w;
+	g->h = h;
+	g->t = t;
+
+	pthread_mutex_lock(&f->lock);
+	f->pending = idx;
+	pthread_cond_signal(&f->wake);
+	pthread_mutex_unlock(&f->lock);
+}
+
+static void plot(const cf_channel *c, float x, float y, uint8_t v)
+{
+	const int ix = (int)lrintf(x), iy = (int)lrintf(y);
+	if (ix < 0 || iy < 0 || ix >= c->width || iy >= c->height)
+		return;
+	c->base[(size_t)iy * c->linesize + (size_t)ix * c->step] = v;
+}
+
+static void draw_line(const cf_channel *c, float x0, float y0, float x1, float y1, uint8_t v)
+{
+	const int n = (int)fmaxf(fabsf(x1 - x0), fabsf(y1 - y0)) + 1;
+	for (int i = 0; i <= n; i++) {
+		const float a = (float)i / (float)n;
+		plot(c, x0 + (x1 - x0) * a, y0 + (y1 - y0) * a, v);
+	}
+}
+
+static void draw_poly(const cf_channel *c, const cf_pt *p, int n, uint8_t v)
+{
+	for (int i = 0; i < n; i++)
+		draw_line(c, p[i].x, p[i].y, p[(i + 1) % n].x, p[(i + 1) % n].y, v);
+}
+
+/* Thin outlines in the brightness channel (before mirroring, so they mirror with the video):
+ * white = area the warp may change (ellipse) and the eye opening it moves the iris inside,
+ * black = eye outline Vision found, white crosses = refined pupils. */
+static void draw_overlay(struct camflip *f, const cf_channel *luma, const cf_eye *eyes, int n)
+{
+	pthread_mutex_lock(&f->lock);
+	const cf_face face = f->ov_face;
+	pthread_mutex_unlock(&f->lock);
+
+	if (face.found) {
+		draw_poly(luma, face.left_eye, face.left_count, 16);
+		draw_poly(luma, face.right_eye, face.right_count, 16);
+		const cf_pt pupils[2] = {face.left_pupil, face.right_pupil};
+		for (int i = 0; i < 2; i++) {
+			draw_line(luma, pupils[i].x - 3, pupils[i].y, pupils[i].x + 3, pupils[i].y, 235);
+			draw_line(luma, pupils[i].x, pupils[i].y - 3, pupils[i].x, pupils[i].y + 3, 235);
+		}
+	}
+	for (int e = 0; e < n; e++) {
+		const cf_eye *eye = &eyes[e];
+		const int steps = (int)fmaxf(24.0f, 6.3f * fmaxf(eye->rx, eye->ry));
+		for (int i = 0; i < steps; i++) {
+			const float a = 6.2831853f * (float)i / (float)steps;
+			plot(luma, eye->cx + eye->rx * cosf(a), eye->cy + eye->ry * sinf(a), 235);
+		}
+		const int ac = eye->aperture_count < CF_MAX_APERTURE ? eye->aperture_count : CF_MAX_APERTURE;
+		for (int i = 0; i < ac; i++) {
+			const int j = (i + 1) % ac;
+			draw_line(luma, eye->aperture[i][0], eye->aperture[i][1], eye->aperture[j][0],
+				  eye->aperture[j][1], 235);
+		}
 	}
 }
 
@@ -246,18 +816,53 @@ static void camflip_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&f->lock);
 	f->mirror = obs_data_get_bool(settings, S_MIRROR);
 	f->eye_contact = obs_data_get_bool(settings, S_EYE_CONTACT);
+	f->show_eyes = obs_data_get_bool(settings, S_SHOW_EYES);
 	f->strength = (float)obs_data_get_double(settings, S_STRENGTH) / 100.0f;
-	f->max_glance = (float)obs_data_get_double(settings, S_MAX_GLANCE) / 100.0f;
+	f->max_glance = (float)obs_data_get_double(settings, S_MAX_GLANCE) / 100.0f; /* eye widths */
+	f->baseline = (float)obs_data_get_double(settings, S_BASELINE);
+	f->baseline_open = (float)obs_data_get_double(settings, S_BASELINE_OPEN);
+	f->notes_offset = (float)obs_data_get_double(settings, S_NOTES_OFFSET);
+	f->notes_side = (float)obs_data_get_double(settings, S_NOTES_SIDE);
+	f->has_notes = obs_data_get_bool(settings, S_HAS_NOTES);
+	f->lens_done = f->baseline_open > 0.0f;
+	if (f->has_notes || f->lens_done)
+		f->needs_recalib = false;
 	pthread_mutex_unlock(&f->lock);
+}
+
+/* Calibrations saved by older versions use other units: drop them (once) and ask again. */
+static bool migrate_calibration(obs_data_t *settings)
+{
+	/* No default for this key (OBS applies defaults before create), so a missing key really
+	 * means "saved by an older version or never calibrated". */
+	if (obs_data_has_user_value(settings, S_CALIB_VERSION) &&
+	    obs_data_get_int(settings, S_CALIB_VERSION) == CALIB_VERSION)
+		return false;
+	const bool had_old = obs_data_has_user_value(settings, S_BASELINE);
+	obs_data_unset_user_value(settings, S_BASELINE);
+	obs_data_unset_user_value(settings, S_BASELINE_OPEN);
+	obs_data_unset_user_value(settings, S_NOTES_OFFSET);
+	obs_data_unset_user_value(settings, S_NOTES_SIDE);
+	obs_data_unset_user_value(settings, S_HAS_NOTES);
+	if (obs_data_has_user_value(settings, S_MAX_GLANCE))
+		obs_data_unset_user_value(settings, S_MAX_GLANCE); /* also in different units now */
+	obs_data_set_int(settings, S_CALIB_VERSION, CALIB_VERSION);
+	if (had_old)
+		blog(LOG_INFO, "[cam-flip] calibration from an older version was reset; please calibrate again");
+	return had_old;
 }
 
 static void *camflip_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct camflip *f = bzalloc(sizeof(*f));
 	f->context = source;
+	f->busy = -1;
+	f->pending = -1;
+	f->hotkey = OBS_INVALID_HOTKEY_ID;
 	pthread_mutex_init(&f->lock, NULL);
+	pthread_mutex_init(&f->gaze_lock, NULL);
+	pthread_cond_init(&f->wake, NULL);
 	cf_gaze_init(&f->gaze);
-	f->baseline = (float)obs_data_get_double(settings, S_BASELINE);
 
 	@autoreleasepool {
 		VNDetectFaceLandmarksRequest *request = [[VNDetectFaceLandmarksRequest alloc] init];
@@ -266,41 +871,151 @@ static void *camflip_create(obs_data_t *settings, obs_source_t *source)
 		f->handler = (void *)CFBridgingRetain([[VNSequenceRequestHandler alloc] init]);
 	}
 
+	const bool reset = migrate_calibration(settings);
 	camflip_update(f, settings);
+	f->needs_recalib = reset;
+
+	if (pthread_create(&f->worker, NULL, worker_main, f) == 0)
+		f->worker_started = true;
+	else
+		blog(LOG_ERROR, "[cam-flip] could not start the tracking thread; eye contact is off");
 	return f;
+}
+
+static void hotkey_unregister(struct camflip *f)
+{
+	/* Never call into the hotkey system while holding `lock`: the hotkey thread holds its own
+	 * lock while calling camflip_hotkey, which takes `lock`. */
+	pthread_mutex_lock(&f->lock);
+	const obs_hotkey_id id = f->hotkey;
+	f->hotkey = OBS_INVALID_HOTKEY_ID;
+	pthread_mutex_unlock(&f->lock);
+	if (id != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(id); /* waits for a running callback to finish */
 }
 
 static void camflip_destroy(void *data)
 {
 	struct camflip *f = data;
-	if (f->request)
-		CFBridgingRelease(f->request);
-	if (f->handler)
-		CFBridgingRelease(f->handler);
-	free(f->gray);
+	hotkey_unregister(f);
+
+	pthread_mutex_lock(&f->lock);
+	f->stop = true;
+	pthread_cond_broadcast(&f->wake);
+	pthread_mutex_unlock(&f->lock);
+	if (f->worker_started)
+		pthread_join(f->worker, NULL);
+
+	@autoreleasepool {
+		set_last_face(f, nil);
+		if (f->request)
+			CFBridgingRelease(f->request);
+		if (f->handler)
+			CFBridgingRelease(f->handler);
+	}
+	for (int i = 0; i < 2; i++)
+		free(f->frames[i].data);
 	free(f->bgra);
+	pthread_cond_destroy(&f->wake);
+	pthread_mutex_destroy(&f->gaze_lock);
 	pthread_mutex_destroy(&f->lock);
 	bfree(f);
-}
-
-static void camflip_save(void *data, obs_data_t *settings)
-{
-	struct camflip *f = data;
-	pthread_mutex_lock(&f->lock);
-	obs_data_set_double(settings, S_BASELINE, f->baseline);
-	pthread_mutex_unlock(&f->lock);
 }
 
 static void camflip_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_MIRROR, true);
 	obs_data_set_default_bool(settings, S_EYE_CONTACT, true);
+	obs_data_set_default_bool(settings, S_SHOW_EYES, false);
 	obs_data_set_default_double(settings, S_STRENGTH, 70.0);
-	obs_data_set_default_double(settings, S_MAX_GLANCE, 45.0);
-	obs_data_set_default_double(settings, S_BASELINE, 0.05);
+	obs_data_set_default_double(settings, S_MAX_GLANCE, 15.0);
+	obs_data_set_default_double(settings, S_BASELINE, DEFAULT_BASELINE);
+	obs_data_set_default_double(settings, S_BASELINE_OPEN, 0.0);
+	obs_data_set_default_double(settings, S_NOTES_OFFSET, 0.0);
+	obs_data_set_default_double(settings, S_NOTES_SIDE, 0.0);
+	obs_data_set_default_bool(settings, S_HAS_NOTES, false);
+	/* S_CALIB_VERSION deliberately has no default, see migrate_calibration(). */
 }
 
-static bool camflip_calibrate_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+/* ---------------------------------------------------------------- Hotkey */
+
+static void camflip_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	(void)id;
+	(void)hotkey;
+	struct camflip *f = data;
+	if (!pressed)
+		return;
+	pthread_mutex_lock(&f->lock);
+	f->eye_contact = !f->eye_contact;
+	const bool on = f->eye_contact;
+	pthread_mutex_unlock(&f->lock);
+	blog(LOG_INFO, "[cam-flip] eye contact %s (hotkey)", on ? "on" : "off");
+
+	obs_data_t *changes = obs_data_create();
+	obs_data_set_bool(changes, S_EYE_CONTACT, on);
+	queue_ui(f, changes);
+}
+
+/*
+ * The hotkey belongs to the camera source this filter sits on, so it is listed under the
+ * camera's name in Settings › Hotkeys. (OBS loads saved filters as private sources, which
+ * can't have hotkeys of their own.) OBS saves and restores the key binding together with the
+ * camera source's own hotkeys, so no save/load code is needed here.
+ */
+static void camflip_filter_add(void *data, obs_source_t *parent)
+{
+	struct camflip *f = data;
+	hotkey_unregister(f);
+	if (!parent)
+		return;
+	const obs_hotkey_id id = obs_hotkey_register_source(parent, HOTKEY_NAME, HOTKEY_DESC, camflip_hotkey, f);
+	pthread_mutex_lock(&f->lock);
+	f->hotkey = id;
+	pthread_mutex_unlock(&f->lock);
+}
+
+static void camflip_filter_remove(void *data, obs_source_t *parent)
+{
+	(void)parent;
+	hotkey_unregister(data);
+}
+
+/* ---------------------------------------------------------------- Settings panel */
+
+static bool request_calibration(struct camflip *f, int step)
+{
+	if (!f)
+		return false;
+	pthread_mutex_lock(&f->lock);
+	f->calib_request = step;
+	f->calib_running = step; /* shown straight away; the worker starts it on the next frame */
+	f->calib_failed = CALIB_IDLE;
+	f->calib_done_msg = NULL;
+	pthread_mutex_unlock(&f->lock);
+	blog(LOG_INFO, "[cam-flip] calibrating: %s for a second or two",
+	     step == CALIB_NOTES ? "look at the middle of your notes" : "look into the camera");
+	/* Returning true only re-lays out the panel's current properties; rebuild them so the status
+	 * shows "Calibrating…" straight away. */
+	queue_ui(f, NULL);
+	return false;
+}
+
+static bool camflip_calib_lens_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	(void)props;
+	(void)property;
+	return request_calibration(data, CALIB_LENS);
+}
+
+static bool camflip_calib_notes_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	(void)props;
+	(void)property;
+	return request_calibration(data, CALIB_NOTES);
+}
+
+static bool camflip_forget_notes_clicked(obs_properties_t *props, obs_property_t *property, void *data)
 {
 	(void)props;
 	(void)property;
@@ -308,15 +1023,77 @@ static bool camflip_calibrate_clicked(obs_properties_t *props, obs_property_t *p
 	if (!f)
 		return false;
 	pthread_mutex_lock(&f->lock);
-	f->calibrate_request = true;
+	f->has_notes = false;
+	f->notes_offset = 0.0f;
+	f->notes_side = 0.0f;
+	f->calib_done_msg = NULL;
 	pthread_mutex_unlock(&f->lock);
-	blog(LOG_INFO, "[cam-flip] calibrating: look into the camera for one second");
+	obs_data_t *changes = obs_data_create();
+	obs_data_set_bool(changes, S_HAS_NOTES, false);
+	obs_data_set_double(changes, S_NOTES_OFFSET, 0.0);
+	obs_data_set_double(changes, S_NOTES_SIDE, 0.0);
+	queue_ui(f, changes); /* saves it and rebuilds the panel */
+	blog(LOG_INFO, "[cam-flip] notes calibration cleared");
 	return false;
+}
+
+static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
+{
+	pthread_mutex_lock(&f->lock);
+	const bool eye_contact = f->eye_contact, face = f->st_face, lens = f->lens_done, notes = f->has_notes;
+	const bool recalib = f->needs_recalib;
+	const int running = f->calib_running, failed = f->calib_failed;
+	const char *done = f->calib_done_msg;
+	const double vms = f->ema_vision_ms, fps = f->ema_fps, wms = f->ema_warp_ms;
+	pthread_mutex_unlock(&f->lock);
+
+	char calib[200], track[160], speed[200];
+	*warn = false;
+	if (running == CALIB_LENS)
+		snprintf(calib, sizeof(calib), "Calibrating: keep looking into the camera…");
+	else if (running == CALIB_NOTES)
+		snprintf(calib, sizeof(calib), "Calibrating: keep looking at the middle of your notes…");
+	else if (failed) {
+		*warn = true;
+		snprintf(calib, sizeof(calib),
+			 "Calibration gave up: no steady, front-facing face seen. Light your face and try step %d again.",
+			 failed == CALIB_NOTES ? 2 : 1);
+	} else if (recalib) {
+		*warn = true;
+		snprintf(calib, sizeof(calib), "Please calibrate again (this version measures your eyes differently).");
+	} else {
+		snprintf(calib, sizeof(calib), "%s%sCalibration: camera %s, notes %s.", done ? done : "", done ? " " : "",
+			 lens ? "done" : "not done", notes ? "done" : "not done");
+	}
+
+	if (!eye_contact)
+		snprintf(track, sizeof(track), "Eye contact is off.");
+	else if (!face)
+		snprintf(track, sizeof(track), "No face found. Light your face and look towards the camera.");
+	else
+		snprintf(track, sizeof(track), "Face found.");
+
+	if (vms > 0)
+		snprintf(speed, sizeof(speed),
+			 "Speed: eye tracking %.1f ms per frame (%.0f frames/s), in the background. "
+			 "Warp and mirror %.2f ms.",
+			 vms, fps, wms);
+	else
+		snprintf(speed, sizeof(speed), "Speed: warp and mirror %.2f ms per frame.", wms);
+
+	snprintf(out, size, "%s\n%s\n%s", calib, track, speed);
 }
 
 static obs_properties_t *camflip_properties(void *data)
 {
-	(void)data;
+	struct camflip *f = data;
+	bool has_notes = false;
+	if (f) {
+		pthread_mutex_lock(&f->lock);
+		has_notes = f->has_notes;
+		pthread_mutex_unlock(&f->lock);
+	}
+
 	obs_properties_t *props = obs_properties_create();
 
 	obs_property_t *p = obs_properties_add_bool(props, S_MIRROR, "Mirror video (everyone in the call sees it mirrored)");
@@ -328,32 +1105,68 @@ static obs_properties_t *camflip_properties(void *data)
 	p = obs_properties_add_float_slider(props, S_STRENGTH, "Eye contact strength", 0.0, 100.0, 1.0);
 	obs_property_float_set_suffix(p, "%");
 
-	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 20.0, 80.0, 1.0);
-	obs_property_float_set_suffix(p, "% of an eye height");
+	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 5.0, 30.0, 1.0);
+	obs_property_float_set_suffix(p, "%");
 	obs_property_set_long_description(
-		p, "Glances further down than this (like at your keyboard) fade back to your real eyes so it stays natural.");
+		p, "How far down you can look and still be corrected. Glances further down (like at your keyboard) "
+		   "fade back to your real eyes so it stays natural. Not used once step 2 (notes) is calibrated: "
+		   "then the correction is matched to your notes and fades out just beyond them.");
+	if (has_notes)
+		obs_property_set_enabled(p, false);
 
-	p = obs_properties_add_button2(props, "calibrate", "Calibrate: look into the camera, then click",
-				       camflip_calibrate_clicked, data);
-	obs_property_set_long_description(p, "Takes about a second. Redo it if you move your screen or chair a lot.");
+	p = obs_properties_add_button2(props, "calibrate_lens", "1. Click, then look into the camera",
+				       camflip_calib_lens_clicked, data);
+	obs_property_set_long_description(p, "After clicking, look straight into the camera lens until the status says it's "
+					     "done (a second or two). Redo it if you move your screen or chair.");
+
+	p = obs_properties_add_button2(props, "calibrate_notes", "2. Click, then look at your notes",
+				       camflip_calib_notes_clicked, data);
+	obs_property_set_long_description(
+		p, "After clicking, look at the middle of the line you usually read, with your head still, until the "
+		   "status says it's done (a second or two). The correction is then matched exactly to your notes.");
+
+	if (has_notes) {
+		p = obs_properties_add_button2(props, "forget_notes", "Forget notes calibration",
+					       camflip_forget_notes_clicked, data);
+		obs_property_set_long_description(p, "Go back to using the \"Correct glances up to\" slider.");
+	}
+
+	if (f) {
+		char text[700];
+		bool warn = false;
+		status_text(f, text, sizeof(text), &warn);
+		/* No long description: OBS then shows the description itself as the info text. */
+		p = obs_properties_add_text(props, "status", text, OBS_TEXT_INFO);
+		if (warn)
+			obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
+	}
+
+	p = obs_properties_add_bool(props, S_SHOW_EYES, "Show tracked eyes (for tuning)");
+	obs_property_set_long_description(
+		p, "Draws thin outlines in the video: black = eye outline found, white crosses = pupils, "
+		   "white = area being corrected. Turn it off before a call.");
 
 	obs_properties_add_text(props, "info",
 				"Tip: in Teams/Zoom/Meet pick “OBS Virtual Camera” and turn off “Mirror my video”, "
-				"so your own preview matches what others see.",
+				"so your own preview matches what others see. Toggle eye contact with a hotkey: "
+				"Settings › Hotkeys › “" HOTKEY_DESC "” under your camera.",
 				OBS_TEXT_INFO);
 	return props;
 }
 
+/* ---------------------------------------------------------------- Video */
+
 static struct obs_source_frame *camflip_filter_video(void *data, struct obs_source_frame *frame)
 {
 	struct camflip *f = data;
+	const uint64_t start = now_ns();
 
 	pthread_mutex_lock(&f->lock);
 	const bool mirror = f->mirror;
 	const bool eye_contact = f->eye_contact;
-	const bool calibrate = f->calibrate_request;
-	f->calibrate_request = false;
-	cf_gaze_params params = {.strength = f->strength, .max_glance = f->max_glance, .baseline = f->baseline};
+	const bool show_eyes = f->show_eyes;
+	const bool calibrating = f->calib_request != 0 || f->calib_running != 0;
+	const cf_gaze_params params = params_locked(f);
 	pthread_mutex_unlock(&f->lock);
 
 	const enum cf_format fmt = to_cf_format(frame->format);
@@ -369,37 +1182,70 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 		}
 		return frame;
 	}
+	/* Brightness channel: the luma plane, or green for RGB cameras. */
+	const cf_channel *luma = &channels[is_rgb(fmt) && count > 1 ? 1 : 0];
 
-	if (calibrate)
-		cf_gaze_start_calibration(&f->gaze);
+	/* Turning eye contact back on starts from a clean slate (fades in), not from stale tracking. */
+	if (eye_contact && !f->vt_was_on && !calibrating) {
+		pthread_mutex_lock(&f->gaze_lock);
+		cf_gaze_init(&f->gaze);
+		pthread_mutex_unlock(&f->gaze_lock);
+	}
+	f->vt_was_on = eye_contact;
 
 	/* Eye contact first (on the camera's original orientation), then mirror. */
-	if ((eye_contact || f->gaze.calibrating) && !frame->flip) {
-		cf_face face;
-		detect_face(f, frame, channels, count, fmt, &face);
-		cf_eye eyes[2];
+	if ((eye_contact || calibrating) && !frame->flip && f->worker_started) {
 		const double t = (double)frame->timestamp / 1e9;
-		const int n = cf_gaze_update(&f->gaze, &face, &params, t, eyes);
+		submit_frame(f, luma, t);
 
-		float baseline;
-		const int calibrated = cf_gaze_take_calibration(&f->gaze, &baseline);
-		if (calibrated > 0) {
-			pthread_mutex_lock(&f->lock);
-			f->baseline = baseline;
-			pthread_mutex_unlock(&f->lock);
-			blog(LOG_INFO, "[cam-flip] calibrated (baseline %.3f)", baseline);
-		} else if (calibrated < 0) {
-			blog(LOG_WARNING, "[cam-flip] calibration gave up: no steady, front-facing face seen. "
-					  "Look straight into the camera and click Calibrate again");
+		cf_eye eyes[2];
+		int n = 0;
+		if (eye_contact) {
+			pthread_mutex_lock(&f->gaze_lock);
+			n = cf_gaze_predict(&f->gaze, &params, t, eyes);
+			pthread_mutex_unlock(&f->gaze_lock);
+			if (n > 0)
+				cf_warp_frame(channels, count, eyes, n);
 		}
-
-		if (eye_contact && n > 0)
-			cf_warp_frame(channels, count, eyes, n);
+		if (show_eyes)
+			draw_overlay(f, luma, eyes, n);
 	}
 
 	if (mirror)
 		cf_mirror_frame(channels, count);
 
+	/* Timing: the video thread part, plus a summary in the log every 10 s. */
+	const uint64_t end = now_ns();
+	const double ms = (double)(end - start) / 1e6;
+	bool log_now = false;
+	double vis_ms = 0, warp_ms = 0, secs = 0;
+	unsigned long vis_n = 0, full_n = 0;
+	pthread_mutex_lock(&f->lock);
+	f->ema_warp_ms = f->ema_warp_ms > 0 ? f->ema_warp_ms * 0.95 + ms * 0.05 : ms;
+	f->win_warp_ms += ms;
+	f->win_warp_n++;
+	if (!f->win_start)
+		f->win_start = end;
+	if (end - f->win_start >= LOG_EVERY_NS) {
+		log_now = true;
+		secs = (double)(end - f->win_start) / 1e9;
+		vis_ms = f->win_vision_n ? f->win_vision_ms / f->win_vision_n : 0;
+		vis_n = f->win_vision_n;
+		full_n = f->win_full_n;
+		warp_ms = f->win_warp_n ? f->win_warp_ms / f->win_warp_n : 0;
+		f->win_vision_ms = f->win_warp_ms = 0;
+		f->win_vision_n = f->win_full_n = f->win_warp_n = 0;
+		f->win_start = end;
+	}
+	pthread_mutex_unlock(&f->lock);
+	if (log_now) {
+		if (vis_n)
+			blog(LOG_INFO,
+			     "[cam-flip] tracking %.1f ms avg (%.0f fps analysed, %lu full face detections), warp %.2f ms",
+			     vis_ms, (double)vis_n / secs, full_n, warp_ms);
+		else
+			blog(LOG_INFO, "[cam-flip] tracking idle, warp %.2f ms", warp_ms);
+	}
 	return frame;
 }
 
@@ -411,10 +1257,11 @@ static struct obs_source_info camflip_filter = {
 	.create = camflip_create,
 	.destroy = camflip_destroy,
 	.update = camflip_update,
-	.save = camflip_save,
 	.get_defaults = camflip_defaults,
 	.get_properties = camflip_properties,
 	.filter_video = camflip_filter_video,
+	.filter_add = camflip_filter_add,
+	.filter_remove = camflip_filter_remove,
 };
 
 bool obs_module_load(void)

@@ -12,7 +12,8 @@ clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -fobjc-arc \
   -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
   -o build/test_plugin
-./build/test_plugin
+# The filter runs face tracking on its own thread: fail (instead of hanging CI) if anything deadlocks.
+perl -e 'alarm shift; exec @ARGV' 180 ./build/test_plugin
 
 # Real module load, exactly like OBS at startup.
 clang -arch "$(uname -m)" -mmacosx-version-min=13.0 \
