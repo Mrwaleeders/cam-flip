@@ -673,6 +673,9 @@ static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, b
 	const CGPoint *rp = [lm.rightPupil pointsInImageOfSize:size];
 	face->left_pupil = (cf_pt){(float)lp[0].x, (float)(vh - lp[0].y)};
 	face->right_pupil = (cf_pt){(float)rp[0].x, (float)(vh - rp[0].y)};
+	face->left_pupil_vision = face->left_pupil;
+	face->right_pupil_vision = face->right_pupil;
+	face->has_vision_pupils = 1;
 #ifdef CAMFLIP_TEST
 	f->dbg_raw_pupil[0] = face->left_pupil;
 	f->dbg_raw_pupil[1] = face->right_pupil;

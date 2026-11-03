@@ -34,7 +34,11 @@ typedef struct {
 	int left_count;
 	cf_pt right_eye[CF_MAX_EYE_POINTS];
 	int right_count;
-	cf_pt left_pupil, right_pupil;
+	cf_pt left_pupil, right_pupil; /* iris centres (refined) */
+	/* Vision's own pupil points before refinement: coarse but steady, a second opinion on eye
+	 * movement. has_vision_pupils 0 = not given (then only the refined points are used). */
+	cf_pt left_pupil_vision, right_pupil_vision;
+	int has_vision_pupils;
 	int has_pose;
 	float yaw_deg, pitch_deg;
 	float face_width; /* pixels */

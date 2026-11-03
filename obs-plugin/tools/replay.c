@@ -3,6 +3,7 @@
  * it live, and measures shaking. Pure C: runs anywhere.
  *
  *   replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength 0..1] [--out per-frame.csv]
+ *          [--baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P]
  *
  * --lag N     the tracking result used for frame k comes from frame k-N (background tracking),
  *             moved forward with cf_gaze_predict(); 0 = analysed in step with the video.
@@ -63,6 +64,9 @@ static int parse(const char *path, row_t **rows_out)
 		f->image_height = (int)v[10];
 		r->vision_pupil[0] = (cf_pt){(float)v[11], (float)v[12]};
 		r->vision_pupil[1] = (cf_pt){(float)v[13], (float)v[14]};
+		f->left_pupil_vision = r->vision_pupil[0];
+		f->right_pupil_vision = r->vision_pupil[1];
+		f->has_vision_pupils = 1;
 		f->left_pupil = (cf_pt){(float)v[15], (float)v[16]};
 		f->right_pupil = (cf_pt){(float)v[17], (float)v[18]};
 		int i = 19;
@@ -127,6 +131,8 @@ int main(int argc, char **argv)
 	double lens[2] = {0, 0}, notes[2] = {0, 0};
 	float strength = 1.0f;
 	const char *outp = NULL;
+	float cal[5] = {0, 0, 0, 0, 0}; /* baseline, baseline_open, notes_offset, notes_side, notes_open */
+	int have_cal = 0;
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "--lag") && i + 1 < argc)
 			lag = atoi(argv[++i]);
@@ -138,6 +144,16 @@ int main(int argc, char **argv)
 			strength = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc)
 			outp = argv[++i];
+		else if (!strcmp(argv[i], "--baseline") && i + 1 < argc)
+			cal[0] = (float)atof(argv[++i]), have_cal |= 1;
+		else if (!strcmp(argv[i], "--baseline-open") && i + 1 < argc)
+			cal[1] = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--notes-offset") && i + 1 < argc)
+			cal[2] = (float)atof(argv[++i]), have_cal |= 2;
+		else if (!strcmp(argv[i], "--notes-side") && i + 1 < argc)
+			cal[3] = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--notes-open") && i + 1 < argc)
+			cal[4] = (float)atof(argv[++i]);
 	}
 	row_t *rows;
 	const int n = parse(argv[1], &rows);
@@ -148,6 +164,17 @@ int main(int argc, char **argv)
 
 	/* Calibrate exactly like the buttons do, on the given time ranges. */
 	cf_gaze_params p = {.strength = strength, .max_glance = 0.15f};
+	/* Calibration as saved in the filter's settings (OBS scene JSON), if given. */
+	if (have_cal & 1) {
+		p.baseline = cal[0];
+		p.baseline_open = cal[1];
+	}
+	if (have_cal & 2) {
+		p.has_notes = 1;
+		p.notes_offset = cal[2];
+		p.notes_side = cal[3];
+		p.notes_open = cal[4];
+	}
 	for (int step = 0; step < 2; step++) {
 		const double *r = step == 0 ? lens : notes;
 		if (!(r[1] > r[0]))
