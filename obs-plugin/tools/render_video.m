@@ -1,0 +1,510 @@
+/*
+ * Diagnostics: renders a recording through Cam Flip's real tracking, gaze model and warp, the way
+ * the plugin runs live, so a change can be judged on a real face, frame by frame, before it ships.
+ *
+ *   render_video <in.mov> <out-dir> [options]
+ *
+ * Writes into <out-dir>:
+ *   corrected.mov  the full frame with eye contact applied (no mirror), high bitrate H.264
+ *   compare.mov    an eye close-up: the original on top, corrected below, 3x enlarged
+ *   frames.csv     per analysed frame: t, warp count, eye centres and shifts, pupils seen in the
+ *                  output (--measure), for numbers
+ *
+ * Options
+ *   --lag N            the warp for frame k uses tracking from frame k-N, moved forward by
+ *                      cf_gaze_predict (live it is 1: the worker analyses frame k after it is shown)
+ *   --dedupe X         skip frames that differ from the previous kept frame by less than X mean grey
+ *                      levels (OBS recording at 60 fps from a 30 fps camera repeats frames; default 0.6,
+ *                      0 keeps every frame)
+ *   --baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P
+ *                      calibration, as saved in the filter's settings (OBS scene JSON)
+ *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead
+ *   --strength S       0..1 (default 1)
+ *   --measure          also track the corrected output and report how much the iris seen by the
+ *                      viewer shakes (RMS of value minus its centred 5-frame mean, pixels)
+ *   --zoom Z           compare.mov enlargement (default 3)
+ *
+ * Nothing leaves this Mac. tools/render.sh builds and runs it.
+ */
+#define CAMFLIP_TEST 1
+#include "../src/plugin.m"
+
+#import <AVFoundation/AVFoundation.h>
+
+typedef struct {
+	double t;
+	int ok;
+	double in_y[2], out_y[2], in_x[2], out_x[2]; /* pupil minus eye-outline centroid */
+	double shift_y[2], cx[2], cy[2];
+} meas_t;
+
+static double shake5(const double *x, const int *ok, int n)
+{
+	double s = 0;
+	int c = 0;
+	for (int i = 2; i < n - 2; i++) {
+		if (!(ok[i - 2] && ok[i - 1] && ok[i] && ok[i + 1] && ok[i + 2]))
+			continue;
+		const double m = (x[i - 2] + x[i - 1] + x[i] + x[i + 1] + x[i + 2]) / 5.0;
+		s += (x[i] - m) * (x[i] - m);
+		c++;
+	}
+	return c ? sqrt(s / c) : NAN;
+}
+
+static cf_pt centroid_of(const cf_pt *p, int n)
+{
+	cf_pt c = {0, 0};
+	for (int i = 0; i < n; i++) {
+		c.x += p[i].x;
+		c.y += p[i].y;
+	}
+	if (n) {
+		c.x /= (float)n;
+		c.y /= (float)n;
+	}
+	return c;
+}
+
+static AVAssetWriter *make_writer(NSString *path, int w, int h, double bitrate, AVAssetWriterInput **in_out,
+				  AVAssetWriterInputPixelBufferAdaptor **ad_out)
+{
+	[[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+	NSError *err = nil;
+	AVAssetWriter *wr = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:path] fileType:AVFileTypeQuickTimeMovie
+							 error:&err];
+	if (!wr)
+		return nil;
+	NSDictionary *vs = @{
+		AVVideoCodecKey: AVVideoCodecTypeH264,
+		AVVideoWidthKey: @(w),
+		AVVideoHeightKey: @(h),
+		AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(bitrate)},
+	};
+	AVAssetWriterInput *in = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vs];
+	in.expectsMediaDataInRealTime = NO;
+	NSDictionary *pa = @{
+		(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+		(id)kCVPixelBufferWidthKey: @(w),
+		(id)kCVPixelBufferHeightKey: @(h),
+	};
+	AVAssetWriterInputPixelBufferAdaptor *ad =
+		[AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:in
+										  sourcePixelBufferAttributes:pa];
+	[wr addInput:in];
+	*in_out = in;
+	*ad_out = ad;
+	return wr;
+}
+
+static void append(AVAssetWriterInput *in, AVAssetWriterInputPixelBufferAdaptor *ad, CVPixelBufferRef pb, double t)
+{
+	while (!in.readyForMoreMediaData)
+		usleep(1000);
+	[ad appendPixelBuffer:pb withPresentationTime:CMTimeMakeWithSeconds(t, 600)];
+}
+
+/* Copies the region (x0, y0, cw, ch) of an NV12 frame, enlarged z times (nearest), into dst at row
+ * offset dy (even). */
+static void blit_zoom(const uint8_t *sy, size_t sys, const uint8_t *suv, size_t suvs, int x0, int y0, int cw, int ch,
+		      int z, uint8_t *dy_, size_t dys, uint8_t *duv, size_t duvs, int dy)
+{
+	for (int y = 0; y < ch * z; y++) {
+		const uint8_t *s = sy + (size_t)(y0 + y / z) * sys + x0;
+		uint8_t *d = dy_ + (size_t)(dy + y) * dys;
+		for (int x = 0; x < cw * z; x++)
+			d[x] = s[x / z];
+	}
+	for (int y = 0; y < ch * z / 2; y++) {
+		const int sy2 = (y0 + (2 * y) / z) / 2;
+		const uint8_t *s = suv + (size_t)sy2 * suvs;
+		uint8_t *d = duv + (size_t)(dy / 2 + y) * duvs;
+		for (int x = 0; x < cw * z / 2; x++) {
+			const int sx2 = (x0 + (2 * x) / z) / 2;
+			d[2 * x] = s[2 * sx2];
+			d[2 * x + 1] = s[2 * sx2 + 1];
+		}
+	}
+}
+
+static int parse_range(const char *s, double r[2])
+{
+	return sscanf(s, "%lf-%lf", &r[0], &r[1]) == 2;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc < 3) {
+		fprintf(stderr, "usage: render_video <in> <out-dir> [--lag N] [--dedupe X] [--baseline B] "
+				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--lens a-b] "
+				"[--notes a-b] [--strength S] [--measure] [--zoom Z]\n");
+		return 2;
+	}
+	int lag = 1, measure = 0, zoom = 3;
+	double dedupe = 0.6, lens[2] = {0, 0}, notes_r[2] = {0, 0};
+	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
+	for (int i = 3; i < argc; i++) {
+		const char *a = argv[i];
+		const char *v = i + 1 < argc ? argv[i + 1] : "0";
+		if (!strcmp(a, "--lag")) { lag = atoi(v); i++; }
+		else if (!strcmp(a, "--dedupe")) { dedupe = atof(v); i++; }
+		else if (!strcmp(a, "--baseline")) { p.baseline = (float)atof(v); i++; }
+		else if (!strcmp(a, "--baseline-open")) { p.baseline_open = (float)atof(v); i++; }
+		else if (!strcmp(a, "--notes-offset")) { p.notes_offset = (float)atof(v); p.has_notes = 1; i++; }
+		else if (!strcmp(a, "--notes-side")) { p.notes_side = (float)atof(v); i++; }
+		else if (!strcmp(a, "--notes-open")) { p.notes_open = (float)atof(v); i++; }
+		else if (!strcmp(a, "--lens")) { parse_range(v, lens); i++; }
+		else if (!strcmp(a, "--notes")) { parse_range(v, notes_r); i++; }
+		else if (!strcmp(a, "--strength")) { p.strength = (float)atof(v); i++; }
+		else if (!strcmp(a, "--zoom")) { zoom = atoi(v) < 1 ? 1 : atoi(v); i++; }
+		else if (!strcmp(a, "--measure")) measure = 1;
+		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
+	}
+	if (lag < 0)
+		lag = 0;
+
+	@autoreleasepool {
+		NSString *dir = [NSString stringWithUTF8String:argv[2]];
+		[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil
+								error:nil];
+		AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]]
+							options:nil];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+#pragma clang diagnostic pop
+		if (tracks.count == 0) {
+			fprintf(stderr, "no video track (remux .mkv to .mp4 first)\n");
+			return 1;
+		}
+
+		obs_data_t *settings = obs_data_create();
+		camflip_defaults(settings);
+		struct camflip *f = camflip_create(settings, NULL);
+		struct camflip *f_out = measure ? camflip_create(settings, NULL) : NULL;
+
+		/* Pass 1 (only if calibrating from time ranges): run the calibration like the buttons do. */
+		for (int step = 0; step < 2; step++) {
+			const double *r = step == 0 ? lens : notes_r;
+			if (!(r[1] > r[0]))
+				continue;
+			NSError *err = nil;
+			AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:asset error:&err];
+			AVAssetReaderTrackOutput *o = [AVAssetReaderTrackOutput
+				assetReaderTrackOutputWithTrack:tracks[0]
+						 outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:
+									@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
+			[rd addOutput:o];
+			[rd startReading];
+			cf_gaze cg;
+			cf_gaze_init(&cg);
+			cf_gaze_start_calibration(&cg, step == 0 ? CF_CALIB_LENS : CF_CALIB_NOTES);
+			grey_frame g = {0};
+			double t0 = -1;
+			int got = 0;
+			cf_calib_result res;
+			CMSampleBufferRef sb;
+			while (!got && (sb = [o copyNextSampleBuffer])) {
+				CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+				const double ts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+				if (t0 < 0)
+					t0 = ts;
+				const double t = ts - t0;
+				if (t >= r[0] && t <= r[1]) {
+					CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+					const int w = (int)CVPixelBufferGetWidthOfPlane(pb, 0), h = (int)CVPixelBufferGetHeightOfPlane(pb, 0);
+					ensure(&g.data, &g.cap, (size_t)w * h);
+					const uint8_t *src = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+					for (int y = 0; y < h; y++)
+						memcpy(g.data + (size_t)y * w, src + (size_t)y * CVPixelBufferGetBytesPerRowOfPlane(pb, 0), (size_t)w);
+					CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+					g.w = w;
+					g.h = h;
+					g.t = t;
+					cf_face face;
+					bool full;
+					detect_face(f, &g, &face, &full);
+					cf_eye tmp[2];
+					cf_gaze_update(&cg, &face, &p, t, tmp);
+					got = cf_gaze_take_calibration(&cg, &res);
+				}
+				CFRelease(sb);
+			}
+			free(g.data);
+			if (got > 0 && step == 0) {
+				p.baseline = res.offset;
+				p.baseline_open = res.openness;
+				printf("lens calibration: baseline %.4f open %.4f\n", res.offset, res.openness);
+			} else if (got > 0) {
+				p.has_notes = 1;
+				p.notes_offset = res.offset;
+				p.notes_side = res.side;
+				p.notes_open = res.openness;
+				printf("notes calibration: offset %.4f side %.4f open %.4f\n", res.offset, res.side, res.openness);
+			} else {
+				printf("%s calibration failed (%d)\n", step == 0 ? "lens" : "notes", got);
+			}
+		}
+		printf("params: strength %.2f baseline %.4f open %.4f notes %d offset %.4f side %.4f open %.4f, lag %d\n",
+		       p.strength, p.baseline, p.baseline_open, p.has_notes, p.notes_offset, p.notes_side, p.notes_open, lag);
+
+		NSError *err = nil;
+		AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
+		AVAssetReaderTrackOutput *out = [AVAssetReaderTrackOutput
+			assetReaderTrackOutputWithTrack:tracks[0]
+					 outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:
+								@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
+		[reader addOutput:out];
+		if (![reader startReading]) {
+			fprintf(stderr, "cannot read video\n");
+			return 1;
+		}
+
+		cf_gaze gaze;
+		cf_gaze_init(&gaze);
+		enum { QMAX = 16 };
+		cf_face q[QMAX]; /* faces waiting to be fed, newest last */
+		double qt[QMAX];
+		int qn = 0;
+
+		AVAssetWriter *wfull = nil, *wcmp = nil;
+		AVAssetWriterInput *ifull = nil, *icmp = nil;
+		AVAssetWriterInputPixelBufferAdaptor *afull = nil, *acmp = nil;
+		FILE *csv = fopen([[dir stringByAppendingPathComponent:@"frames.csv"] UTF8String], "w");
+		fprintf(csv, "t,n,factor,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,in_ly,in_ry,out_ly,out_ry\n");
+
+		size_t cap = 4096, nm = 0;
+		meas_t *m = calloc(cap, sizeof(meas_t));
+		uint8_t *prev = NULL;
+		int frames = 0, kept = 0, warped = 0;
+		double t0 = -1, track_ms = 0;
+		int crop_x = -1, crop_y = 0, crop_w = 0, crop_h = 0;
+		grey_frame g = {0}, g2 = {0};
+		CMSampleBufferRef sb;
+		while ((sb = [out copyNextSampleBuffer])) {
+			@autoreleasepool {
+				CVPixelBufferRef src = CMSampleBufferGetImageBuffer(sb);
+				const double ts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+				if (t0 < 0)
+					t0 = ts;
+				const double t = ts - t0;
+				frames++;
+				CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+				const int w = (int)CVPixelBufferGetWidthOfPlane(src, 0), h = (int)CVPixelBufferGetHeightOfPlane(src, 0);
+				const size_t sys = CVPixelBufferGetBytesPerRowOfPlane(src, 0), suvs = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
+				const uint8_t *sy = CVPixelBufferGetBaseAddressOfPlane(src, 0), *suv = CVPixelBufferGetBaseAddressOfPlane(src, 1);
+
+				/* Duplicate frames (60 fps recording of a 30 fps camera): the filter never sees them. */
+				bool dup = false;
+				if (!prev)
+					prev = malloc((size_t)w * h);
+				else if (dedupe > 0) {
+					double sad = 0;
+					long cnt = 0;
+					for (int y = 0; y < h; y += 4)
+						for (int x = 0; x < w; x += 4, cnt++)
+							sad += abs((int)sy[(size_t)y * sys + x] - (int)prev[(size_t)y * w + x]);
+					dup = sad / (double)cnt < dedupe;
+				}
+				if (dup) {
+					CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+					CFRelease(sb);
+					continue;
+				}
+				kept++;
+				for (int y = 0; y < h; y++)
+					memcpy(prev + (size_t)y * w, sy + (size_t)y * sys, (size_t)w);
+
+				/* Writable copy, the frame OBS hands the filter. */
+				CVPixelBufferRef dst = NULL;
+				CVPixelBufferCreate(NULL, (size_t)w, (size_t)h, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, NULL, &dst);
+				CVPixelBufferLockBaseAddress(dst, 0);
+				uint8_t *dy = CVPixelBufferGetBaseAddressOfPlane(dst, 0), *duv = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+				const size_t dys = CVPixelBufferGetBytesPerRowOfPlane(dst, 0), duvs = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+				for (int y = 0; y < h; y++)
+					memcpy(dy + (size_t)y * dys, sy + (size_t)y * sys, (size_t)w);
+				for (int y = 0; y < (h + 1) / 2; y++)
+					memcpy(duv + (size_t)y * duvs, suv + (size_t)y * suvs, (size_t)((w + 1) / 2 * 2));
+
+				/* Track this frame (the worker would do it after the frame is shown). */
+				ensure(&g.data, &g.cap, (size_t)w * h);
+				memcpy(g.data, prev, (size_t)w * h);
+				g.w = w;
+				g.h = h;
+				g.t = t;
+				cf_face face;
+				bool full;
+				const uint64_t s0 = now_ns();
+				detect_face(f, &g, &face, &full);
+				track_ms += (double)(now_ns() - s0) / 1e6;
+				if (qn == QMAX) {
+					memmove(q, q + 1, sizeof(q[0]) * (QMAX - 1));
+					memmove(qt, qt + 1, sizeof(qt[0]) * (QMAX - 1));
+					qn--;
+				}
+				q[qn] = face;
+				qt[qn] = t;
+				qn++;
+				/* Feed everything except the newest `lag` frames. */
+				while (qn > lag) {
+					cf_eye tmp[2];
+					cf_gaze_update(&gaze, &q[0], &p, qt[0], tmp);
+					memmove(q, q + 1, sizeof(q[0]) * (QMAX - 1));
+					memmove(qt, qt + 1, sizeof(qt[0]) * (QMAX - 1));
+					qn--;
+				}
+
+				/* Warp, exactly like camflip_filter_video. */
+				cf_eye eyes[2];
+				memset(eyes, 0, sizeof(eyes));
+				const int n = cf_gaze_predict(&gaze, &p, t, eyes);
+				cf_gaze_status st;
+				cf_gaze_get_status(&gaze, &st);
+				if (n > 0) {
+					uint8_t *planes[2] = {dy, duv};
+					const uint32_t ls[2] = {(uint32_t)dys, (uint32_t)duvs};
+					cf_channel ch[8];
+					const int cc = cf_channels(CF_FMT_NV12, planes, ls, w, h, ch);
+					cf_warp_frame(ch, cc, eyes, n);
+					warped++;
+				}
+
+				/* What the viewer sees: track the corrected frame too. */
+				cf_face seen;
+				memset(&seen, 0, sizeof(seen));
+				if (f_out) {
+					ensure(&g2.data, &g2.cap, (size_t)w * h);
+					for (int y = 0; y < h; y++)
+						memcpy(g2.data + (size_t)y * w, dy + (size_t)y * dys, (size_t)w);
+					g2.w = w;
+					g2.h = h;
+					g2.t = t;
+					bool full2;
+					detect_face(f_out, &g2, &seen, &full2);
+				}
+				if (nm == cap) {
+					cap *= 2;
+					m = realloc(m, cap * sizeof(meas_t));
+				}
+				meas_t *mm = &m[nm++];
+				memset(mm, 0, sizeof(*mm));
+				mm->t = t;
+				mm->ok = face.found && face.left_count >= 4 && face.right_count >= 4 && (!f_out || seen.found);
+				const cf_pt *ein[2] = {face.left_eye, face.right_eye};
+				const int nin[2] = {face.left_count, face.right_count};
+				const cf_pt pin[2] = {face.left_pupil, face.right_pupil};
+				const cf_pt pout[2] = {seen.left_pupil, seen.right_pupil};
+				for (int e = 0; e < 2; e++) {
+					const cf_pt c = centroid_of(ein[e], nin[e]);
+					mm->in_y[e] = pin[e].y - c.y;
+					mm->in_x[e] = pin[e].x - c.x;
+					mm->out_y[e] = pout[e].y - c.y;
+					mm->out_x[e] = pout[e].x - c.x;
+					mm->shift_y[e] = n > e ? eyes[e].sy : 0;
+					mm->cx[e] = n > e ? eyes[e].cx : c.x;
+					mm->cy[e] = n > e ? eyes[e].cy : c.y;
+				}
+				fprintf(csv, "%.4f,%d,%.3f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", t, n,
+					st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
+					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1]);
+
+				/* Writers, sized on the first frame. The close-up crop is fixed from the first face. */
+				if (!wfull) {
+					wfull = make_writer([dir stringByAppendingPathComponent:@"corrected.mov"], w, h, 40e6, &ifull, &afull);
+					[wfull startWriting];
+					[wfull startSessionAtSourceTime:kCMTimeZero];
+				}
+				if (crop_x < 0 && face.found && face.left_count && face.right_count) {
+					float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+					for (int e = 0; e < 2; e++)
+						for (int i = 0; i < nin[e]; i++) {
+							x0 = fminf(x0, ein[e][i].x);
+							x1 = fmaxf(x1, ein[e][i].x);
+							y0 = fminf(y0, ein[e][i].y);
+							y1 = fmaxf(y1, ein[e][i].y);
+						}
+					const float span = x1 - x0;
+					crop_w = ((int)(span * 1.5f) + 7) & ~7;
+					crop_h = ((int)(span * 0.45f) + 7) & ~7;
+					crop_x = ((int)((x0 + x1) / 2 - crop_w / 2)) & ~1;
+					crop_y = ((int)((y0 + y1) / 2 - crop_h / 2)) & ~1;
+					crop_x = crop_x < 0 ? 0 : (crop_x + crop_w > w ? (w - crop_w) & ~1 : crop_x);
+					crop_y = crop_y < 0 ? 0 : (crop_y + crop_h > h ? (h - crop_h) & ~1 : crop_y);
+					wcmp = make_writer([dir stringByAppendingPathComponent:@"compare.mov"], crop_w * zoom,
+							   crop_h * zoom * 2, 30e6, &icmp, &acmp);
+					[wcmp startWriting];
+					[wcmp startSessionAtSourceTime:kCMTimeZero];
+				}
+				append(ifull, afull, dst, t);
+				if (wcmp) {
+					CVPixelBufferRef cb = NULL;
+					CVPixelBufferCreate(NULL, (size_t)(crop_w * zoom), (size_t)(crop_h * zoom * 2),
+							    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, NULL, &cb);
+					CVPixelBufferLockBaseAddress(cb, 0);
+					uint8_t *cy = CVPixelBufferGetBaseAddressOfPlane(cb, 0), *cuv = CVPixelBufferGetBaseAddressOfPlane(cb, 1);
+					const size_t cys = CVPixelBufferGetBytesPerRowOfPlane(cb, 0), cuvs = CVPixelBufferGetBytesPerRowOfPlane(cb, 1);
+					blit_zoom(sy, sys, suv, suvs, crop_x, crop_y, crop_w, crop_h, zoom, cy, cys, cuv, cuvs, 0);
+					blit_zoom(dy, dys, duv, duvs, crop_x, crop_y, crop_w, crop_h, zoom, cy, cys, cuv, cuvs, crop_h * zoom);
+					CVPixelBufferUnlockBaseAddress(cb, 0);
+					append(icmp, acmp, cb, t);
+					CVPixelBufferRelease(cb);
+				}
+				CVPixelBufferUnlockBaseAddress(dst, 0);
+				CVPixelBufferRelease(dst);
+				CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+				CFRelease(sb);
+			}
+		}
+		fclose(csv);
+		for (int k = 0; k < 2; k++) {
+			AVAssetWriter *wr = k ? wcmp : wfull;
+			AVAssetWriterInput *in = k ? icmp : ifull;
+			if (!wr)
+				continue;
+			[in markAsFinished];
+			dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+			[wr finishWritingWithCompletionHandler:^{
+				dispatch_semaphore_signal(sem);
+			}];
+			dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+			if (wr.status != AVAssetWriterStatusCompleted)
+				fprintf(stderr, "writing failed: %s\n", wr.error.localizedDescription.UTF8String);
+		}
+
+		/* Summary */
+		const int nn = (int)nm;
+		int *ok = calloc((size_t)nn + 1, sizeof(int)), *okw = calloc((size_t)nn + 1, sizeof(int));
+		double *buf[10];
+		for (int s = 0; s < 10; s++)
+			buf[s] = calloc((size_t)nn + 1, sizeof(double));
+		for (int i = 0; i < nn; i++) {
+			ok[i] = m[i].ok;
+			okw[i] = m[i].ok && m[i].shift_y[0] != 0;
+			buf[0][i] = m[i].in_y[0];
+			buf[1][i] = m[i].in_y[1];
+			buf[2][i] = m[i].out_y[0];
+			buf[3][i] = m[i].out_y[1];
+			buf[4][i] = m[i].in_y[0] + m[i].shift_y[0]; /* intended seen position */
+			buf[5][i] = m[i].shift_y[0];
+			buf[6][i] = m[i].cx[0];
+			buf[7][i] = m[i].cy[0];
+			buf[8][i] = m[i].out_x[0];
+			buf[9][i] = m[i].in_x[0];
+		}
+		printf("frames %d read, %d kept (camera frames), %d warped, mean tracking %.1f ms\n", frames, kept, warped,
+		       kept ? track_ms / kept : 0);
+		printf("pupil-in-eye y shake, original video (px): L %.2f R %.2f | x L %.2f\n", shake5(buf[0], ok, nn),
+		       shake5(buf[1], ok, nn), shake5(buf[9], ok, nn));
+		printf("while warped: shift y %.2f | warp centre x %.2f y %.2f | intended seen y %.2f\n",
+		       shake5(buf[5], okw, nn), shake5(buf[6], okw, nn), shake5(buf[7], okw, nn), shake5(buf[4], okw, nn));
+		if (f_out)
+			printf("SEEN by tracking the corrected video (px): y L %.2f R %.2f, x L %.2f (original y L %.2f, same frames)\n",
+			       shake5(buf[2], okw, nn), shake5(buf[3], okw, nn), shake5(buf[8], okw, nn), shake5(buf[0], okw, nn));
+		printf("wrote %s/{corrected.mov,compare.mov,frames.csv}\n", argv[2]);
+		camflip_destroy(f);
+		if (f_out)
+			camflip_destroy(f_out);
+		obs_data_release(settings);
+	}
+	return 0;
+}

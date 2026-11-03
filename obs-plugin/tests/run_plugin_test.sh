@@ -21,12 +21,14 @@ clang -arch "$(uname -m)" -mmacosx-version-min=13.0 \
   tests/test_load.c -F"$FW" -framework libobs -Wl,-rpath,"$FW" -o build/test_load
 ./build/test_load "$PWD/build/cam-flip.plugin/Contents/MacOS/cam-flip"
 
-# The diagnostics tool (tools/diag_video.m) must keep compiling against the plugin internals.
-clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -fobjc-arc \
-  -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
-  tools/diag_video.m src/gaze.c src/warp.c \
-  -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
-  -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
-  -framework AVFoundation -framework CoreMedia \
-  -o build/diag_video
-echo "ok: diagnostics tool builds"
+# The diagnostics tools (tools/*.m) must keep compiling against the plugin internals.
+for tool in diag_video render_video; do
+  clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -fobjc-arc -Wall -Werror \
+    -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
+    "tools/$tool.m" src/gaze.c src/warp.c \
+    -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
+    -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
+    -framework AVFoundation -framework CoreMedia \
+    -o "build/$tool"
+done
+echo "ok: diagnostics tools build"
