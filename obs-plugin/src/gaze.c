@@ -934,25 +934,153 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 	out->factor = (g->down.ready && g->down.value > 0) ? g->factor * g->far_fade : 0.0f;
 }
 
-/* ---- Iris centre refinement */
-
-#define RP_MAXW 80
-#define RP_MAXH 48
-
-/*
- * Two steps on a small grid over the eye's bounding box, masked by the eye outline:
- *  1. darkest square (side ~1.4 R, inscribed in the iris) near the guess, via integral images;
- *  2. means of gradients (Timm & Barth) in a few pixels around it: the point most image
- *     gradients point away from, i.e. the centre of the dark disc's edge. This also works when
- *     the lids cover part of the iris, where a darkness centroid would be pulled off centre.
+/* ---- Iris centre refinement
+ *
+ * The gaze model turns the refined point's vertical position into a shift of the iris, so any
+ * frame-to-frame jitter or flip here shows as shaking eyes. Everything below is therefore a
+ * continuous function of the pixels and the landmarks: soft weights, fractional pixel coverage and
+ * blends, no argmax and no on/off thresholds, so a sub-pixel change gives a sub-pixel answer.
+ *
+ * The iris (radius ~0.2 eye widths) is usually cut by both lids, so its vertical centre shows only
+ * in its left and right edges (the limbus arcs); the dark area itself just fills the opening.
+ *  1. Lid curves through the outline, pinned at the corners. Vision gives 6 points per eye, a coarse
+ *     hexagon that cuts off the curved lids' corners; the curves follow the lids between them.
+ *  2. Iris and sclera grey levels (percentiles inside the outline, away from the lash line) and a
+ *     linear darkness ramp between them, so an edge's position comes out sub-pixel, by area.
+ *  3. Iris column: mean shift on the darkness profile along the eye, from Vision's point.
+ *  4. Darkness centroid across the eye in those columns: steady, but drawn towards the middle of
+ *     the opening when the lids cut the iris. The fallback.
+ *  5. Per pixel row, the iris' left and right edges: dark width out from the centre (a running
+ *     minimum, so lashes or a dark corner past a gap of sclera don't count; bright patches near the
+ *     centre, catchlights and the screen's reflection on the cornea, bridged), kept only where
+ *     sclera shows just beyond and the lids (landmarks) are clear. A circle fit through these edge
+ *     points (Kasa, linear least squares, refitted with weights that discount points off the circle)
+ *     gives the centre, unbiased by the lids, from either or both arcs.
+ *  6. The fit is blended in by how well it is determined (few rows when squinting), and the result
+ *     towards Vision's point when the eye is nearly closed, shows no contrast or no iris.
  */
+
+#define RP_IRIS_R 0.20f      /* iris radius, eye widths */
+#define RP_CELLS_W 100       /* eyes wider than this many pixels are sampled in s x s blocks */
+#define RP_MAXCELLS 6144     /* grid cells over the eye's bounding box */
+#define RP_MAXROW 160        /* grid cells per row */
+#define RP_NB 64             /* grey histogram bins */
+#define RP_UP0 0.04f         /* lash line: weight 0 within this many eye widths under the upper lid ... */
+#define RP_UP1 0.08f         /* ... 1 from here (levels, iris column and centroid) */
+#define RP_LO0 0.02f         /* same over the lower lid */
+#define RP_LO1 0.045f
+#define RP_EUP0 0.03f        /* lid clearance for edge points, the image check does the rest */
+#define RP_EUP1 0.06f
+#define RP_ELO0 0.015f
+#define RP_ELO1 0.035f
+#define RP_P_IRIS 0.20f      /* grey percentiles inside the outline: iris level ... */
+#define RP_P_SCLERA 0.90f    /* ... and sclera level */
+#define RP_RAMP0 0.15f       /* darkness 1 below iris + this x (sclera - iris), 0 above ... */
+#define RP_RAMP1 0.85f       /* ... iris + this x (sclera - iris), linear in between */
+#define RP_CONTRAST0 18.0f   /* sclera - iris grey levels: below this, no refinement ... */
+#define RP_CONTRAST1 36.0f   /* ... full refinement from here */
+#define RP_OPEN0 0.09f       /* openness (outline height / width): below this, Vision's point ... */
+#define RP_OPEN1 0.14f
+#define RP_FILL_R 0.45f      /* bright patches near the centre: bridged if dark within this x R further out ... */
+#define RP_FILL0 0.50f       /* ... for cells up to this x R from the centre, fading out ... */
+#define RP_FILL1 0.75f       /* ... by here (R units) ... */
+#define RP_FILLCAP0 0.80f    /* ... and dark counted only up to this x R from the centre, fading out ... */
+#define RP_FILLCAP1 0.90f    /* ... by here, so lashes past the iris are never reached */
+#define RP_CLEAR0 0.75f      /* an edge point needs this much bright sclera just beyond it ... */
+#define RP_CLEAR1 0.95f      /* ... to count fully */
+#define RP_MAXPTS 256        /* edge points */
+#define RP_TAU 0.06          /* circle refit: points this far off the circle (R units) count half */
+#define RP_SIG0 0.06f        /* circle fit's nominal error (R units): trusted fully below this ... */
+#define RP_SIG1 0.15f        /* ... not at all above */
+
+typedef struct {
+	float c0x, c0y; /* corner midpoint */
+	float ux, uy;   /* along the eye, unit */
+	float nx, ny;   /* across the eye, towards the lower lid */
+	float ihw;      /* 1 / half width */
+	float up[2], lo[2]; /* lid curves: upper -(1-t^2)(up0 + up1 t), lower (1-t^2)(lo0 + lo1 t) */
+} rp_frame;
+
+static inline float rp_ss(float e0, float inv, float x) /* smoothstep, inv = 1 / (e1 - e0) */
+{
+	float t = (x - e0) * inv;
+	t = t < 0 ? 0 : (t > 1 ? 1 : t);
+	return t * t * (3 - 2 * t);
+}
+
+/* For a point (dx, dy) from the corner midpoint: how far below the upper lid (du) and above the
+ * lower lid (dl) it is, in pixels across the eye. 0 outside the corners' span. */
+static inline int rp_lids(const rp_frame *e, float dx, float dy, float *du, float *dl)
+{
+	const float t = (dx * e->ux + dy * e->uy) * e->ihw, b = dx * e->nx + dy * e->ny;
+	if (!(t > -1 && t < 1))
+		return 0;
+	const float f = 1 - t * t;
+	*du = b + f * (e->up[0] + e->up[1] * t);
+	*dl = f * (e->lo[0] + e->lo[1] * t) - b;
+	return 1;
+}
+
+/* Soft outline mask from rp_lids' distances, cells of size fs. */
+static inline float rp_mask(float du, float dl, float ifs)
+{
+	return clampf(du * ifs + 0.5f, 0, 1) * clampf(dl * ifs + 0.5f, 0, 1);
+}
+
+/* Weighted circle fit through edge points (Kasa: x^2 + y^2 = A x + B y + C, centre (A/2, B/2)),
+ * refitted a few times with Cauchy weights on the distance from the circle, so a few stray points
+ * (a reflection reaching the iris edge, lashes touching it) lose their pull smoothly. Coordinates in
+ * iris radii. Returns 0 if degenerate; else the centre, the sum of the final weights and how well
+ * the centre's height is pinned down: its error for an edge error of 0.03 radii per point. */
+static int rp_circle(const float *px, const float *py, const float *om, int n, float *cx, float *cy, float *wsum,
+		     float *sig)
+{
+	double a = 0, b = 0, r = 0;
+	int ok = 0;
+	for (int it = 0; it < 4; it++) {
+		double S[3][3] = {{0}}, Y[3] = {0}, ws = 0;
+		for (int i = 0; i < n; i++) {
+			double wi = om[i];
+			if (it) {
+				const double d = (hypot(px[i] - a, py[i] - b) - r) / RP_TAU;
+				wi /= 1 + d * d;
+			}
+			const double v = (double)px[i] * px[i] + (double)py[i] * py[i], r3[3] = {px[i], py[i], 1};
+			for (int u = 0; u < 3; u++) {
+				for (int q = 0; q < 3; q++)
+					S[u][q] += wi * r3[u] * r3[q];
+				Y[u] += wi * r3[u] * v;
+			}
+			ws += wi;
+		}
+		const double a11 = S[0][0], a12 = S[0][1], a13 = S[0][2], a22 = S[1][1], a23 = S[1][2], a33 = S[2][2];
+		const double c11 = a22 * a33 - a23 * a23, c12 = a13 * a23 - a12 * a33, c13 = a12 * a23 - a13 * a22;
+		const double c22 = a11 * a33 - a13 * a13, c23 = a12 * a13 - a11 * a23, c33 = a11 * a22 - a12 * a12;
+		const double det = a11 * c11 + a12 * c12 + a13 * c13;
+		if (!(det > 1e-9))
+			break;
+		const double A = (c11 * Y[0] + c12 * Y[1] + c13 * Y[2]) / det;
+		const double B = (c12 * Y[0] + c22 * Y[1] + c23 * Y[2]) / det;
+		const double C = (c13 * Y[0] + c23 * Y[1] + c33 * Y[2]) / det;
+		a = 0.5 * A;
+		b = 0.5 * B;
+		r = sqrt(fmax(C + a * a + b * b, 0));
+		*cx = (float)a;
+		*cy = (float)b;
+		*wsum = (float)ws;
+		*sig = (float)(0.03 * sqrt(c22 / det));
+		ok = 1;
+	}
+	return ok;
+}
+
 cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, const cf_pt *eye, int count,
 		      cf_pt guess)
 {
-	if (!grey || !eye || count < 4 || count > CF_MAX_EYE_POINTS || width <= 0 || height <= 0)
+	if (!grey || !eye || count < 4 || count > CF_MAX_EYE_POINTS || width <= 0 || height <= 0 || stride < width)
 		return guess;
 
-	/* Corners: the farthest pair of outline points. */
+	/* 1. Frame and lids. Corners: the farthest pair of outline points. */
 	int ia = 0, ib = 1;
 	float best = -1;
 	for (int i = 0; i < count; i++)
@@ -966,218 +1094,362 @@ cf_pt cf_refine_pupil(const uint8_t *grey, int stride, int width, int height, co
 			}
 		}
 	const float w = sqrtf(best);
-	if (!(w >= 8))
+	if (!(w >= 8 && w < 4096))
 		return guess;
-	const float ux = (eye[ib].x - eye[ia].x) / w, uy = (eye[ib].y - eye[ia].y) / w;
+	rp_frame e;
+	e.ux = (eye[ib].x - eye[ia].x) / w;
+	e.uy = (eye[ib].y - eye[ia].y) / w;
+	if (e.ux < 0) {
+		e.ux = -e.ux;
+		e.uy = -e.uy;
+	}
+	e.nx = -e.uy;
+	e.ny = e.ux;
+	e.ihw = 2 / w;
+	e.c0x = 0.5f * (eye[ia].x + eye[ib].x);
+	e.c0y = 0.5f * (eye[ia].y + eye[ib].y);
+	/* Least squares for each lid's two coefficients from the points on its side. */
+	double M[2][5] = {{0}};
+	int nside[2] = {0, 0};
 	float lo = 0, hi = 0;
-	float minx = eye[0].x, maxx = eye[0].x, miny = eye[0].y, maxy = eye[0].y;
-	for (int i = 0; i < count; i++) {
-		const float v = (eye[i].x - eye[ia].x) * uy - (eye[i].y - eye[ia].y) * ux;
-		lo = fminf(lo, v);
-		hi = fmaxf(hi, v);
-		minx = fminf(minx, eye[i].x);
-		maxx = fmaxf(maxx, eye[i].x);
-		miny = fminf(miny, eye[i].y);
-		maxy = fmaxf(maxy, eye[i].y);
-	}
-	if ((hi - lo) / w < 0.12f)
-		return guess; /* nearly closed */
-
-	/* Grid: bounding box, subsampled if the eye is large. */
-	int x0 = (int)floorf(minx), y0 = (int)floorf(miny);
-	int x1 = (int)ceilf(maxx), y1 = (int)ceilf(maxy);
-	x0 = x0 < 0 ? 0 : x0;
-	y0 = y0 < 0 ? 0 : y0;
-	x1 = x1 > width ? width : x1;
-	y1 = y1 > height ? height : y1;
-	if (x1 - x0 < 6 || y1 - y0 < 3)
-		return guess;
-	int s = 1;
-	while ((x1 - x0 + s - 1) / s > RP_MAXW || (y1 - y0 + s - 1) / s > RP_MAXH)
-		s++;
-	const int gw = (x1 - x0 + s - 1) / s, gh = (y1 - y0 + s - 1) / s;
-
-	uint8_t img[RP_MAXH][RP_MAXW];
-	uint8_t mask[RP_MAXH][RP_MAXW];
-	uint32_t isum[RP_MAXH + 1][RP_MAXW + 1];
-	uint16_t icnt[RP_MAXH + 1][RP_MAXW + 1];
-
-	/* Mask: scanline fill of the outline polygon at cell centres. */
-	uint32_t total = 0, n_in = 0;
-	for (int j = 0; j < gh; j++) {
-		const float y = (float)(y0 + j * s) + 0.5f;
-		float xs[CF_MAX_EYE_POINTS];
-		int nx = 0;
-		for (int k = 0; k < count; k++) {
-			const cf_pt a = eye[k], b = eye[(k + 1) % count];
-			if ((a.y <= y && b.y > y) || (b.y <= y && a.y > y)) {
-				const float x = a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
-				int q = nx++;
-				while (q > 0 && xs[q - 1] > x) {
-					xs[q] = xs[q - 1];
-					q--;
-				}
-				xs[q] = x;
-			}
-		}
-		const uint8_t *row = grey + (size_t)(y0 + j * s) * (size_t)stride;
-		for (int i = 0; i < gw; i++) {
-			const float x = (float)(x0 + i * s) + 0.5f;
-			int inside = 0;
-			for (int q = 0; q + 1 < nx; q += 2)
-				if (x >= xs[q] && x < xs[q + 1])
-					inside = 1;
-			img[j][i] = row[x0 + i * s];
-			mask[j][i] = (uint8_t)inside;
-			if (inside) {
-				total += img[j][i];
-				n_in++;
-			}
-		}
-	}
-	if (n_in < 20)
-		return guess;
-	const float mean_all = (float)total / (float)n_in;
-	float bright = 0;
-	int nb = 0;
-	for (int j = 0; j < gh; j++)
-		for (int i = 0; i < gw; i++)
-			if (mask[j][i] && img[j][i] >= mean_all) {
-				bright += img[j][i];
-				nb++;
-			}
-	bright = nb ? bright / (float)nb : mean_all;
-
-	for (int i = 0; i <= gw; i++) {
-		isum[0][i] = 0;
-		icnt[0][i] = 0;
-	}
-	for (int j = 0; j < gh; j++) {
-		uint32_t rs = 0;
-		uint16_t rc = 0;
-		isum[j + 1][0] = 0;
-		icnt[j + 1][0] = 0;
-		for (int i = 0; i < gw; i++) {
-			if (mask[j][i]) {
-				rs += img[j][i];
-				rc++;
-			}
-			isum[j + 1][i + 1] = isum[j][i + 1] + rs;
-			icnt[j + 1][i + 1] = (uint16_t)(icnt[j][i + 1] + rc);
-		}
-	}
-
-	/* 1. Darkest square near the guess (grid units from here on). */
-	const float R = 0.2f * w / (float)s; /* iris radius */
-	int hb = (int)lrintf(0.7f * R);
-	hb = hb < 1 ? 1 : hb;
-	const float gx = (guess.x - (float)x0 - 0.5f) / (float)s, gy = (guess.y - (float)y0 - 0.5f) / (float)s;
-	const float wg = w / (float)s;
-	const int rxs = (int)ceilf(0.3f * wg), rys = (int)ceilf(0.2f * wg);
-	const int area = (2 * hb + 1) * (2 * hb + 1);
-	float best_score = 1e9f, best_mean = 0;
-	int bi = -1, bj = -1;
-	for (int j = (int)lrintf(gy) - rys; j <= (int)lrintf(gy) + rys; j++) {
-		if (j < 0 || j >= gh)
+	for (int k = 0; k < count; k++) {
+		const float dx = eye[k].x - e.c0x, dy = eye[k].y - e.c0y;
+		const float t = (dx * e.ux + dy * e.uy) * e.ihw, b = dx * e.nx + dy * e.ny;
+		lo = fminf(lo, b);
+		hi = fmaxf(hi, b);
+		if (k == ia || k == ib || !(fabsf(t) < 0.97f) || b == 0)
 			continue;
-		for (int i = (int)lrintf(gx) - rxs; i <= (int)lrintf(gx) + rxs; i++) {
-			if (i < 0 || i >= gw || !mask[j][i])
-				continue;
-			const int ax = i - hb < 0 ? 0 : i - hb, bx = i + hb + 1 > gw ? gw : i + hb + 1;
-			const int ay = j - hb < 0 ? 0 : j - hb, by = j + hb + 1 > gh ? gh : j + hb + 1;
-			const int c = icnt[by][bx] - icnt[ay][bx] - icnt[by][ax] + icnt[ay][ax];
-			if (c < 6 || c * 10 < area * 3)
-				continue;
-			const uint32_t sum = isum[by][bx] - isum[ay][bx] - isum[by][ax] + isum[ay][ax];
-			const float mean = (float)sum / (float)c;
-			const float dx = (float)i - gx, dy = (float)j - gy;
-			const float dn = (dx * dx + dy * dy) / (0.09f * wg * wg);
-			const float score = mean + 20.0f * dn;
-			if (score < best_score) {
-				best_score = score;
-				best_mean = mean;
-				bi = i;
-				bj = j;
+		const int z = b > 0;
+		const double f0 = 1.0 - (double)t * t, f1 = f0 * t, bb = fabs((double)b);
+		M[z][0] += f0 * f0;
+		M[z][1] += f0 * f1;
+		M[z][2] += f1 * f1;
+		M[z][3] += f0 * bb;
+		M[z][4] += f1 * bb;
+		nside[z]++;
+	}
+	if (!nside[0] || !nside[1])
+		return guess;
+	float *coef[2] = {e.up, e.lo};
+	for (int z = 0; z < 2; z++) {
+		const double det = M[z][0] * M[z][2] - M[z][1] * M[z][1];
+		if (nside[z] >= 2 && det > 1e-3 * M[z][0] * M[z][2]) {
+			coef[z][0] = (float)((M[z][3] * M[z][2] - M[z][4] * M[z][1]) / det);
+			coef[z][1] = (float)((M[z][4] * M[z][0] - M[z][3] * M[z][1]) / det);
+		} else {
+			coef[z][0] = (float)(M[z][3] / M[z][0]);
+			coef[z][1] = 0;
+		}
+	}
+	/* Nearly closed: Vision's point, faded in (a switch would be a jump). */
+	float conf = smoothstepf(RP_OPEN0, RP_OPEN1, (hi - lo) / w);
+	if (!(conf > 0))
+		return guess;
+
+	/* Grid: the lids' bounding box in s x s pixel blocks (block means: a big eye is low-passed, not
+	 * aliased; blocks aligned to multiples of s, so they don't move with the eye). */
+	float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+	for (int k = 0; k <= 16; k++) {
+		const float t = -1 + (float)k / 8.0f, f = 1 - t * t;
+		const float bs[2] = {-f * (e.up[0] + e.up[1] * t), f * (e.lo[0] + e.lo[1] * t)};
+		for (int z = 0; z < 2; z++) {
+			const float x = e.c0x + 0.5f * w * t * e.ux + bs[z] * e.nx;
+			const float y = e.c0y + 0.5f * w * t * e.uy + bs[z] * e.ny;
+			minx = fminf(minx, x);
+			maxx = fmaxf(maxx, x);
+			miny = fminf(miny, y);
+			maxy = fmaxf(maxy, y);
+		}
+	}
+	if (!(maxx > 0 && maxy > 0 && minx < (float)width && miny < (float)height && maxx - minx < 2 * w &&
+	      maxy - miny < 2 * w))
+		return guess;
+	int s = 1 + (int)(w / RP_CELLS_W), x0, y0, gw, gh;
+	for (;;) {
+		x0 = (int)fmaxf(minx - 1, 0) / s * s;
+		y0 = (int)fmaxf(miny - 1, 0) / s * s;
+		const int x1 = (int)fminf(ceilf(maxx + 1), (float)width), y1 = (int)fminf(ceilf(maxy + 1), (float)height);
+		gw = (x1 - x0 + s - 1) / s;
+		gh = (y1 - y0 + s - 1) / s;
+		if (gw < 3 || gh < 3)
+			return guess;
+		if (gw * gh <= RP_MAXCELLS && gw <= RP_MAXROW)
+			break;
+		s++;
+	}
+	const float fs = (float)s, ifs = 1 / fs;
+	float val[RP_MAXCELLS]; /* block mean grey, then darkness (0 outside the outline) */
+	float qw[RP_MAXCELLS];  /* outline mask x lid bands (away from the lash line) */
+	if (s == 1) {
+		for (int j = 0; j < gh; j++) {
+			const uint8_t *row = grey + (size_t)(y0 + j) * (size_t)stride + x0;
+			for (int i = 0; i < gw; i++)
+				val[j * gw + i] = row[i];
+		}
+	} else {
+		for (int j = 0; j < gh; j++) {
+			const int py0 = y0 + j * s, py1 = py0 + s > height ? height : py0 + s;
+			for (int i = 0; i < gw; i++) {
+				const int px0 = x0 + i * s, px1 = px0 + s > width ? width : px0 + s;
+				unsigned sum = 0;
+				for (int y = py0; y < py1; y++) {
+					const uint8_t *row = grey + (size_t)y * (size_t)stride;
+					for (int x = px0; x < px1; x++)
+						sum += row[x];
+				}
+				val[j * gw + i] = (float)sum / (float)((py1 - py0) * (px1 - px0));
 			}
 		}
 	}
-	if (bi < 0 || bright - best_mean < 15.0f)
-		return guess; /* nothing dark enough: low contrast */
+	/* Cell centres relative to the corner midpoint: (gx0 + i fs, gy0 + j fs). */
+	const float gx0 = (float)x0 + 0.5f * fs - e.c0x, gy0 = (float)y0 + 0.5f * fs - e.c0y;
 
-	/* 2. Means of gradients around the darkest square. */
-	enum { MAXG = 512 };
-	float gpx[MAXG], gpy[MAXG], gux[MAXG], guy[MAXG];
-	float mags[MAXG];
-	int ng = 0;
-	double msum = 0, msum2 = 0;
-	const float rr = 2.0f * R;
-	for (int j = 1; j < gh - 1 && ng < MAXG; j++)
-		for (int i = 1; i < gw - 1 && ng < MAXG; i++) {
-			if (!(mask[j][i] && mask[j - 1][i] && mask[j + 1][i] && mask[j][i - 1] && mask[j][i + 1]))
+	/* 2. Grey levels: weighted histogram inside the outline, away from the lash line. */
+	const float U0 = RP_UP0 * w, iU = 1 / ((RP_UP1 - RP_UP0) * w);
+	const float B0 = RP_LO0 * w, iB = 1 / ((RP_LO1 - RP_LO0) * w);
+	float hist[RP_NB] = {0}, qsum = 0;
+	for (int j = 0; j < gh; j++) {
+		const float dy = gy0 + (float)j * fs;
+		for (int i = 0; i < gw; i++) {
+			const int c = j * gw + i;
+			float du, dl, m = 0, q = 0;
+			if (rp_lids(&e, gx0 + (float)i * fs, dy, &du, &dl)) {
+				m = rp_mask(du, dl, ifs);
+				if (m > 0)
+					q = m * rp_ss(U0, iU, du) * rp_ss(B0, iB, dl);
+			}
+			qw[c] = q;
+			if (m <= 0)
+				val[c] = -1; /* outside the outline */
+			if (q <= 0)
 				continue;
-			const float dx = (float)(i - bi), dy = (float)(j - bj);
-			if (dx * dx + dy * dy > rr * rr)
-				continue;
-			const float ggx = 0.5f * ((float)img[j][i + 1] - (float)img[j][i - 1]);
-			const float ggy = 0.5f * ((float)img[j + 1][i] - (float)img[j - 1][i]);
-			const float mg = sqrtf(ggx * ggx + ggy * ggy);
-			if (mg < 1.0f)
-				continue;
-			gpx[ng] = (float)i;
-			gpy[ng] = (float)j;
-			gux[ng] = ggx / mg;
-			guy[ng] = ggy / mg;
-			mags[ng] = mg;
-			msum += mg;
-			msum2 += (double)mg * mg;
-			ng++;
+			const float v = val[c] * (RP_NB / 256.0f) - 0.5f; /* linear split between bins */
+			const int k = (int)v;
+			if (v <= 0) {
+				hist[0] += q;
+			} else if (k >= RP_NB - 1) {
+				hist[RP_NB - 1] += q;
+			} else {
+				const float fr = v - (float)k;
+				hist[k] += q * (1 - fr);
+				hist[k + 1] += q * fr;
+			}
+			qsum += q;
 		}
-	float cx = (float)bi, cy = (float)bj;
-	if (ng >= 8) {
-		const double mm = msum / ng;
-		const float thr = (float)(mm + 0.3 * sqrt(fmax(msum2 / ng - mm * mm, 0)));
+	}
+	const float R = RP_IRIS_R * w;
+	if (!(qsum * fs * fs >= 0.3f * R * R))
+		return guess;
+	float lev[2];
+	const float pct[2] = {RP_P_IRIS, RP_P_SCLERA};
+	for (int z = 0; z < 2; z++) {
+		const float target = pct[z] * qsum;
+		float cum = 0;
 		int k = 0;
-		for (int q = 0; q < ng; q++)
-			if (mags[q] >= thr) {
-				gpx[k] = gpx[q];
-				gpy[k] = gpy[q];
-				gux[k] = gux[q];
-				guy[k] = guy[q];
-				k++;
-			}
-		ng = k;
+		while (k < RP_NB - 1 && cum + hist[k] < target)
+			cum += hist[k++];
+		const float fr = hist[k] > 0 ? clampf((target - cum) / hist[k], 0, 1) : 0.5f;
+		lev[z] = ((float)k + fr) * (256.0f / RP_NB);
 	}
-	if (ng >= 8) {
-		const float span = fmaxf(2.0f, 0.4f * R);
-		float bestv = -1;
-		for (float oy = -span; oy <= span + 1e-3f; oy += 0.5f)
-			for (float ox = -span; ox <= span + 1e-3f; ox += 0.5f) {
-				const float qx = (float)bi + ox, qy = (float)bj + oy;
-				float v = 0;
-				for (int q = 0; q < ng; q++) {
-					const float dx = gpx[q] - qx, dy = gpy[q] - qy;
-					const float dd = dx * dx + dy * dy;
-					if (dd < 0.25f)
-						continue;
-					const float dot = (dx * gux[q] + dy * guy[q]) / sqrtf(dd);
-					if (dot > 0)
-						v += dot * dot;
-				}
-				if (v > bestv) {
-					bestv = v;
-					cx = qx;
-					cy = qy;
-				}
+	const float contrast = lev[1] - lev[0];
+	conf *= smoothstepf(RP_CONTRAST0, RP_CONTRAST1, contrast); /* nothing to see: Vision's point */
+	if (!(conf > 0))
+		return guess;
+	const float th0 = lev[0] + RP_RAMP0 * contrast, ith = 1 / ((RP_RAMP1 - RP_RAMP0) * contrast);
+	for (int c = 0; c < gw * gh; c++)
+		val[c] = val[c] < 0 ? 0 : 1 - clampf((val[c] - th0) * ith, 0, 1);
+
+	/* 3. Iris column: mean shift along the eye on the darkness profile (away from the lash line),
+	 * from Vision's point. */
+	float prof[2 * RP_MAXROW + 8];
+	const int np = (int)(w * ifs) + 4;
+	if (np > 2 * RP_MAXROW + 8)
+		return guess;
+	memset(prof, 0, sizeof(float) * (size_t)np);
+	const float pa0 = -0.5f * w - fs; /* profile bin k is at pa0 + k fs along the eye */
+	for (int j = 0; j < gh; j++) {
+		const float dy = gy0 + (float)j * fs;
+		for (int i = 0; i < gw; i++) {
+			const int c = j * gw + i;
+			const float d = val[c] * qw[c];
+			if (d <= 0)
+				continue;
+			const float p = ((gx0 + (float)i * fs) * e.ux + dy * e.uy - pa0) * ifs;
+			const int k = (int)p;
+			if (p >= 0 && k + 1 < np) {
+				const float fr = p - (float)k;
+				prof[k] += d * (1 - fr);
+				prof[k + 1] += d * fr;
 			}
+		}
+	}
+	float xc = (guess.x - e.c0x) * e.ux + (guess.y - e.c0y) * e.uy;
+	if (!isfinite(xc))
+		return guess;
+	xc = clampf(xc, -0.3f * w, 0.3f * w);
+	const float H = 1.7f * R, iH = 2 / H; /* kernel: flat to H/2, smooth to 0 at H */
+	for (int it = 0; it < 4; it++) {
+		double sw = 0, sa = 0;
+		int k0 = (int)floorf((xc - H - pa0) * ifs), k1 = (int)ceilf((xc + H - pa0) * ifs);
+		k0 = k0 < 0 ? 0 : k0;
+		k1 = k1 > np - 1 ? np - 1 : k1;
+		for (int k = k0; k <= k1; k++) {
+			const float a = pa0 + (float)k * fs;
+			const float kk = 1 - rp_ss(0.5f * H, iH, fabsf(a - xc));
+			sw += prof[k] * kk;
+			sa += prof[k] * kk * a;
+		}
+		if (!(sw > 1e-3))
+			break;
+		xc = (float)(sa / sw);
 	}
 
-	const cf_pt res = {(float)x0 + cx * (float)s + 0.5f, (float)y0 + cy * (float)s + 0.5f};
-	/* Sanity: must be inside the outline and not far from the guess. */
-	const int ci = (int)lrintf(cx), cj = (int)lrintf(cy);
-	if (ci < 0 || cj < 0 || ci >= gw || cj >= gh || !mask[cj][ci])
+	/* 4. Darkness centroid across the eye in the iris columns. */
+	const float Hc = 1.6f * R, iHc = 4 / Hc; /* flat to 0.75 Hc */
+	double cs = 0, cb = 0;
+	for (int j = 0; j < gh; j++) {
+		const float dy = gy0 + (float)j * fs;
+		for (int i = 0; i < gw; i++) {
+			const int c = j * gw + i;
+			const float d = val[c] * qw[c];
+			if (d <= 0)
+				continue;
+			const float dx = gx0 + (float)i * fs;
+			const float kk = 1 - rp_ss(0.75f * Hc, iHc, fabsf(dx * e.ux + dy * e.uy - xc));
+			cs += d * kk;
+			cb += d * kk * (dx * e.nx + dy * e.ny);
+		}
+	}
+	conf *= smoothstepf(0.05f, 0.12f, (float)cs * fs * fs / (3.14159265f * R * R)); /* no iris seen */
+	if (!(conf > 0) || !(cs > 0))
 		return guess;
-	const float mdx = res.x - guess.x, mdy = res.y - guess.y;
-	if (mdx * mdx + mdy * mdy > 0.35f * 0.35f * w * w)
+	const float bc = (float)(cb / cs);
+	float by = bc;
+
+	/* 5. Limbus edge points per grid row, and a circle through them. */
+	{
+		const float X0 = e.c0x + xc * e.ux + bc * e.nx, Y0 = e.c0y + xc * e.uy + bc * e.ny; /* centre so far */
+		const float pc = (X0 - (float)x0) * ifs - 0.5f; /* X0 in cell index units (centres at integers) */
+		const int ic = (int)floorf(pc), icx = (int)floorf(pc + 0.5f);
+		const float fr = pc - (float)ic;
+		const float pw = Hc * ifs, pn = 0.1f * R * ifs, pf = 0.4f * R * ifs; /* window, clearance */
+		const int nf = (int)ceilf(RP_FILL_R * R * ifs);                      /* bridging reach, cells */
+		const int nwin = (int)ceilf(pw + pf) + nf + 3;
+		const int lo_i = ic - nwin < 0 ? 0 : ic - nwin, hi_i = ic + 1 + nwin > gw - 1 ? gw - 1 : ic + 1 + nwin;
+		const float EU0 = RP_EUP0 * w, iEU = 1 / ((RP_EUP1 - RP_EUP0) * w);
+		const float EL0 = RP_ELO0 * w, iEL = 1 / ((RP_ELO1 - RP_ELO0) * w);
+		const float iR = 1 / R;
+		/* Per column: how much a cell is bridged (fz), and how much of its darkness may bridge
+		 * cells nearer the centre (fc). Both fade with the distance from the centre column. */
+		float fz[RP_MAXROW], fc[RP_MAXROW];
+		{
+			const float z0 = RP_FILL0 * R * ifs, iz = 1 / ((RP_FILL1 - RP_FILL0) * R * ifs);
+			const float k0 = RP_FILLCAP0 * R * ifs, ik = 1 / ((RP_FILLCAP1 - RP_FILLCAP0) * R * ifs);
+			for (int i = lo_i; i <= hi_i; i++) {
+				fz[i] = 1 - rp_ss(z0, iz, fabsf((float)i - pc));
+				fc[i] = 1 - rp_ss(k0, ik, fabsf((float)i - pc));
+			}
+		}
+		float ptx[RP_MAXPTS], pty[RP_MAXPTS], ptw[RP_MAXPTS];
+		int npt = 0;
+		for (int j = 0; ic >= 0 && ic + 1 < gw && j < gh; j++) {
+			const float Yj = (float)(y0 + j * s) + 0.5f * fs, dy = Yj - e.c0y;
+			float du, dl;
+			/* The row must cross the iris itself: not far from the centre so far, and its centre
+			 * column clear of the lid bands (lashes are dark too) ... */
+			float core = 1 - smoothstepf(1.0f * R, 1.25f * R, fabsf(Yj - Y0));
+			core *= rp_lids(&e, X0 - e.c0x, dy, &du, &dl) ? rp_ss(EU0, iEU, du) * rp_ss(EL0, iEL, dl) : 0;
+			if (core <= 0)
+				continue;
+			const float *src = val + j * gw;
+			float row[RP_MAXROW], mr[RP_MAXROW];
+			for (int i = lo_i; i <= hi_i; i++) {
+				mr[i] = rp_lids(&e, gx0 + (float)i * fs, dy, &du, &dl) ? rp_mask(du, dl, ifs) : 0;
+				row[i] = src[i] * mr[i];
+			}
+			/* ... and be dark at the centre column, bright patches there bridged (dark both sides). */
+			{
+				float ml = row[ic], mg = row[ic + 1];
+				for (int k = 1; k <= nf; k++) {
+					if (ic - k >= lo_i && row[ic - k] > ml)
+						ml = row[ic - k];
+					if (ic + 1 + k <= hi_i && row[ic + 1 + k] > mg)
+						mg = row[ic + 1 + k];
+				}
+				core *= smoothstepf(0.5f, 0.85f, fmaxf(row[ic] * (1 - fr) + row[ic + 1] * fr, fminf(ml, mg)));
+			}
+			if (core <= 0)
+				continue;
+			for (int z = 0; z < 2; z++) {
+				const int step = z ? 1 : -1;
+				/* Dark width out from the centre within the window: running minimum, so dark
+				 * things past a gap of sclera don't count. Cells cut by the centre or the window
+				 * end count by their coverage, also in the minimum. Near the centre a cell counts
+				 * as dark as the darkest cell within reach further out (bright patches inside the
+				 * iris bridged; the outer edge itself is not moved, nothing past it is dark). */
+				const float lim = z ? pc + pw : pc - pw;
+				float W = 0, rm = 1;
+				for (int i = icx; i >= lo_i && i <= hi_i; i += step) {
+					const float cov = fminf((float)i + 0.5f, z ? lim : pc) - fmaxf((float)i - 0.5f, z ? pc : lim);
+					if (cov <= 0) {
+						if (i != icx)
+							break;
+						continue;
+					}
+					float d = row[i];
+					if (fz[i] > 0) {
+						float m = d;
+						for (int k = 1, ii = i + step; k <= nf && ii >= lo_i && ii <= hi_i; k++, ii += step)
+							m = fmaxf(m, row[ii] * fc[ii]);
+						d += fz[i] * (m - d);
+					}
+					const float de = 1 - cov * (1 - d);
+					rm = de < rm ? de : rm;
+					W += rm * cov;
+				}
+				/* Sclera just beyond the edge: inside the outline and bright. */
+				const float pe = pc + (float)step * W;
+				const float r0 = z ? pe + pn : pe - pf, r1 = z ? pe + pf : pe - pn;
+				float clear = 0;
+				for (int i = (int)floorf(r0 + 0.5f); i <= (int)ceilf(r1 - 0.5f); i++) {
+					if (i < lo_i || i > hi_i)
+						continue;
+					const float cov = fminf((float)i + 0.5f, r1) - fmaxf((float)i - 0.5f, r0);
+					if (cov > 0)
+						clear += (mr[i] - row[i]) * cov;
+				}
+				clear /= r1 - r0;
+				const float Wpx = W * fs;
+				/* The lids (landmarks) clear of the edge point too. */
+				float band = 0;
+				if (rp_lids(&e, X0 + (float)step * Wpx - e.c0x, dy, &du, &dl))
+					band = rp_ss(EU0, iEU, du) * rp_ss(EL0, iEL, dl);
+				const float om = core * band * smoothstepf(RP_CLEAR0, RP_CLEAR1, clear) *
+						 smoothstepf(0.25f * R, 0.45f * R, Wpx);
+				if (om <= 0 || npt >= RP_MAXPTS)
+					continue;
+				ptx[npt] = (float)step * Wpx * iR; /* R units around (X0, Y0) */
+				pty[npt] = (Yj - Y0) * iR;
+				ptw[npt++] = om;
+			}
+		}
+		float fcx, fcy, fw, sig;
+		if (npt >= 3 && rp_circle(ptx, pty, ptw, npt, &fcx, &fcy, &fw, &sig)) {
+			/* Few rows (squinting) or one short arc: less trusted. */
+			const float g = (1 - smoothstepf(RP_SIG0, RP_SIG1, sig)) * smoothstepf(3, 6, fw);
+			const float fx = X0 + fcx * R - e.c0x, fy = Y0 + fcy * R - e.c0y;
+			const float bf = clampf(fx * e.nx + fy * e.ny, bc - R, bc + R);
+			if (isfinite(bf))
+				by = bc + g * (bf - bc);
+		}
+	}
+
+	/* 6. Result, faded towards Vision's point when unsure, or far from it. */
+	cf_pt res = {e.c0x + xc * e.ux + by * e.nx, e.c0y + xc * e.uy + by * e.ny};
+	conf *= 1 - smoothstepf(0.3f, 0.45f, hypotf(res.x - guess.x, res.y - guess.y) / w);
+	if (!(conf > 0) || !isfinite(res.x) || !isfinite(res.y))
 		return guess;
+	res.x = guess.x + conf * (res.x - guess.x);
+	res.y = guess.y + conf * (res.y - guess.y);
 	return res;
 }

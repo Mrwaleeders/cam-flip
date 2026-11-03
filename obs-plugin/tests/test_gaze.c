@@ -154,6 +154,99 @@ static void draw_eye(uint8_t *img, int w, int h, const cf_pt *eye, int count, fl
 		}
 }
 
+/*
+ * A more realistic eye for cf_refine_pupil, as Apple Vision sees it: curved lids, Vision's coarse
+ * 6-point outline (both corners, two points on each lid: a hexagon that cuts the lids' corners), an
+ * iris cut by both lids, a darker pupil and limbal ring, a catchlight, a dark lash band along the
+ * upper lid (inside the hexagon), the lid's shadow on the sclera, optionally the screen's reflection on
+ * the cornea, and per-pixel noise. Edges are anti-aliased (blurred over `blur` px), so a sub-pixel move
+ * changes the image smoothly, like a camera.
+ * Sizes for a 1080p MacBook camera: eye 86 px wide, opening ~25 px, iris radius 17 px; k scales them
+ * (k = 2: a 4K-ish 172 px eye).
+ */
+typedef struct {
+	float cx, cy;       /* corner midpoint */
+	float hw;           /* half eye width */
+	float up_h, lo_h;   /* lid heights above / below the corner line, at the middle */
+	float ix, iy, ir;   /* iris centre and radius */
+	float lash, blur;   /* lash band thickness under the upper lid, edge blur (px) */
+	float noise;        /* uniform per-pixel noise, +-grey levels */
+	uint32_t seed;
+	float refl_w, refl_h, refl_x, refl_y, refl_v; /* the screen's reflection on the cornea: half sizes and
+						       * centre from the iris centre (iris radii), grey; 0: none */
+} real_eye;
+
+static real_eye real_eye_at(float k, float cx, float cy)
+{
+	const real_eye r = {cx, cy, 43 * k, 14 * k, 13 * k, cx + 2 * k, cy - 0.5f * k, 17 * k, 3.5f * k, 1.2f * k, 6, 1,
+			    0, 0, 0, 0, 0};
+	return r;
+}
+
+static float real_up(const real_eye *s, float x)
+{
+	const float t = (x - s->cx) / s->hw;
+	return fabsf(t) >= 1 ? s->cy : s->cy - s->up_h * powf(1 - t * t, 0.7f) * (1 + 0.08f * t);
+}
+
+static float real_lo(const real_eye *s, float x)
+{
+	const float t = (x - s->cx) / s->hw;
+	return fabsf(t) >= 1 ? s->cy : s->cy + s->lo_h * powf(1 - t * t, 0.8f) * (1 - 0.05f * t);
+}
+
+static float cov01(float v)
+{
+	return v < 0 ? 0 : (v > 1 ? 1 : v);
+}
+
+/* Draws the eye into img (w x h) and fills eye[6] with the hexagon outline. */
+static void draw_real_eye(uint8_t *img, int w, int h, const real_eye *s, cf_pt eye[6])
+{
+	uint32_t rng = s->seed * 2654435761u + 12345u; /* own generator: leaves rand() alone */
+	const float b = s->blur;
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) {
+			const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+			const float yu = real_up(s, px), yl = real_lo(s, px);
+			const float open = cov01((py - yu) / b + 0.5f) * cov01((yl - py) / b + 0.5f);
+			float v = 150; /* skin */
+			if (open > 0) {
+				const float shade = 25 * expf(-fmaxf(py - yu, 0) / (0.07f * s->hw)); /* lid shadow */
+				float vo = 200 - shade;                                             /* sclera */
+				const float d = hypotf(px - s->ix, py - s->iy);
+				const float ci = cov01((s->ir - d) / b + 0.5f);
+				if (ci > 0) {
+					float iv = 80 - 15 * cov01((d - 0.75f * s->ir) / (0.25f * s->ir)); /* limbal ring */
+					iv += cov01((0.4f * s->ir - d) / b + 0.5f) * (35 - iv);            /* pupil */
+					const float dc = hypotf(px - (s->ix + 0.25f * s->ir), py - (s->iy - 0.3f * s->ir));
+					iv += cov01((0.12f * s->ir - dc) / b + 0.5f) * (235 - iv);         /* catchlight */
+					if (s->refl_v > 0) {
+						const float rx = fabsf(px - (s->ix + s->refl_x * s->ir)) - s->refl_w * s->ir;
+						const float ry = fabsf(py - (s->iy + s->refl_y * s->ir)) - s->refl_h * s->ir;
+						iv += cov01(-rx / b + 0.5f) * cov01(-ry / b + 0.5f) * (s->refl_v - iv);
+					}
+					vo += ci * (iv - 0.5f * shade - vo);
+				}
+				vo += cov01((yu + s->lash - py) / b + 0.5f) * (45 - vo); /* lashes */
+				v += open * (vo - v);
+			}
+			if (fabsf((px - s->cx) / s->hw) < 0.95f) /* lashes above the lid line too */
+				v += cov01((py - (yu - 0.5f * s->lash)) / b + 0.5f) * cov01((yu - py) / b + 0.5f) * (45 - v);
+			rng = rng * 1664525u + 1013904223u;
+			v += s->noise * ((float)(rng >> 8) / 8388608.0f - 1.0f);
+			img[y * w + x] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : lrintf(v)));
+		}
+	/* Vision's hexagon: corners, and each lid at a third of the way out from the middle. */
+	const float xs[2] = {s->cx - 0.36f * s->hw, s->cx + 0.36f * s->hw};
+	eye[0] = (cf_pt){s->cx - s->hw, s->cy};
+	eye[1] = (cf_pt){xs[0], real_up(s, xs[0])};
+	eye[2] = (cf_pt){xs[1], real_up(s, xs[1])};
+	eye[3] = (cf_pt){s->cx + s->hw, s->cy};
+	eye[4] = (cf_pt){xs[1], real_lo(s, xs[1])};
+	eye[5] = (cf_pt){xs[0], real_lo(s, xs[0])};
+}
+
 /* Direction of the warp's push, in degrees (0 = straight up, positive = towards the right). */
 static float shift_angle_deg(const cf_eye *e)
 {
@@ -1068,6 +1161,187 @@ int main(void)
 		cf_pt r4 = cf_refine_pupil(img, W, W, H, closed, 16, guess);
 		CHECK(r4.x == guess.x && r4.y == guess.y, "closed eye should return the guess");
 		printf("ok: iris refinement error %.2f / %.2f px, %.3f ms per eye\n", err, err2, ms);
+	}
+
+	/* 13b. Iris refinement on a realistic eye (draw_real_eye: Vision's 6-point outline, the iris cut by
+	 * both lids, lashes inside the outline). On real footage the old refinement flipped between two
+	 * heights ~10 px apart from one frame to the next while the iris moved smoothly (the vertical
+	 * centre of a lid-clipped iris barely shows, and an argmax over a flat score jumped between the
+	 * ends of its search range): the corrected eyes shook. The refined point must be steady, follow
+	 * sub-pixel iris moves smoothly, and stay fast. 1080p (86 px eye) and 4K (172 px eye). */
+	{
+		enum { MW = 400, MH = 220 };
+		static uint8_t img[MW * MH];
+		for (int v = 0; v < 2; v++) {
+			const float k = v ? 2.0f : 1.0f;
+			const int W = (int)(200 * k), H = (int)(110 * k);
+			const float cx = 0.5f * (float)W + 0.3f, cy = 0.5f * (float)H + 0.4f;
+			const char *name = v ? "4K" : "1080p";
+			cf_pt eye[6];
+
+			/* 1. The same eye under different camera noise: one steady answer, not two clusters. */
+			const int seeds = 24;
+			double s1 = 0, s2 = 0;
+			float lo = 1e9f, hi = -1e9f;
+			for (int sd = 0; sd < seeds; sd++) {
+				real_eye s = real_eye_at(k, cx, cy);
+				s.seed = 100 + (uint32_t)sd;
+				draw_real_eye(img, W, H, &s, eye);
+				const cf_pt r = cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix - 3 * k, s.iy - 2 * k});
+				s1 += r.y;
+				s2 += (double)r.y * r.y;
+				lo = fminf(lo, r.y);
+				hi = fmaxf(hi, r.y);
+			}
+			const double mean = s1 / seeds, sdev = sqrt(fmax(s2 / seeds - mean * mean, 0));
+			const float truth_y = real_eye_at(k, cx, cy).iy;
+			CHECK(sdev < 0.2 && hi - lo < 0.6, "%s: refined y over %d noise seeds: sd %.3f px, range %.3f px",
+			      name, seeds, sdev, hi - lo);
+			CHECK(fabs(mean - truth_y) < 2 * k, "%s: refined y %.2f, iris centre at %.2f", name, mean, truth_y);
+
+			/* 2. The iris moving down 10 px (20 at 4K) in 0.25 px steps, the lids still and cutting
+			 * more and more of it: the refined point follows smoothly, never back up, no jumps. */
+			const int steps = (int)(40 * k);
+			float first = 0, prev = 0, max_step = 0, min_step = 1e9f;
+			for (int q = 0; q <= steps; q++) {
+				real_eye s = real_eye_at(k, cx, cy);
+				s.iy += 0.25f * (float)q;
+				s.seed = 7;
+				draw_real_eye(img, W, H, &s, eye);
+				/* Vision's point: coarse, follows only part of the move */
+				const cf_pt g = {s.ix - 1 * k, truth_y + 0.125f * (float)q - 1 * k};
+				const float y = cf_refine_pupil(img, W, W, H, eye, 6, g).y;
+				if (q) {
+					max_step = fmaxf(max_step, y - prev);
+					min_step = fminf(min_step, y - prev);
+				} else {
+					first = y;
+				}
+				prev = y;
+			}
+			const float gain = (prev - first) / (0.25f * (float)steps);
+			CHECK(min_step > 0 && max_step < 1.0f, "%s: iris moving down in 0.25 px steps: refined steps %.3f..%.3f px",
+			      name, min_step, max_step);
+			CHECK(gain > 0.4f && gain < 1.6f, "%s: iris moved %.1f px down, refined point %.2f px (%.0f%%)", name,
+			      0.25f * (float)steps, prev - first, 100 * gain);
+
+			/* 3. A glance down with the upper lid following it (iris 8 px down, upper lid 4 px; x k):
+			 * reads as down, clearly. */
+			float lid_move;
+			{
+				real_eye s = real_eye_at(k, cx, cy);
+				s.seed = 9;
+				draw_real_eye(img, W, H, &s, eye);
+				const float y0 = cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix, s.iy}).y;
+				s.iy += 8 * k;
+				s.up_h -= 4 * k;
+				draw_real_eye(img, W, H, &s, eye);
+				lid_move = cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix, s.iy - 3 * k}).y - y0;
+				CHECK(lid_move > 0.4f * 8 * k, "%s: glance with the lid following: refined point moved %.2f px of %.0f",
+				      name, lid_move, 8 * k);
+			}
+
+			/* 4. A frame sequence: the iris jittering +-0.3 px, fresh camera noise and +-0.5 px outline
+			 * noise every frame. Frame-to-frame steps stay about as small as the iris' own. */
+			double step2 = 0, true2 = 0;
+			{
+				uint32_t rng = 5;
+				float py = 0, ty = 0;
+				const int frames = 120;
+				for (int fr = 0; fr < frames; fr++) {
+					real_eye s = real_eye_at(k, cx, cy);
+					float u[16];
+					for (int q = 0; q < 16; q++) {
+						rng = rng * 1664525u + 1013904223u;
+						u[q] = (float)(rng >> 8) / 8388608.0f - 1.0f; /* -1..1 */
+					}
+					s.ix += 0.3f * u[0];
+					s.iy += 0.3f * u[1];
+					s.seed = 1000 + (uint32_t)fr;
+					draw_real_eye(img, W, H, &s, eye);
+					for (int q = 0; q < 6; q++) {
+						eye[q].x += 0.5f * u[2 + 2 * q];
+						eye[q].y += 0.5f * u[3 + 2 * q];
+					}
+					const float y = cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix + 1, s.iy + 1}).y;
+					if (fr) {
+						step2 += (double)(y - py) * (y - py);
+						true2 += (double)(s.iy - ty) * (s.iy - ty);
+					}
+					py = y;
+					ty = s.iy;
+				}
+				step2 = sqrt(step2 / (frames - 1));
+				true2 = sqrt(true2 / (frames - 1));
+				CHECK(step2 < 0.6, "%s: jittering iris (own RMS step %.2f px): refined RMS step %.2f px", name, true2,
+				      step2);
+			}
+
+			/* 5. Reading along the notes: the iris sweeping sideways 36 px (72 at 4K) at a steady
+			 * height. The height stays put. */
+			float side_range;
+			{
+				float ylo = 1e9f, yhi = -1e9f;
+				for (int q = 0; q <= 144; q++) {
+					real_eye s = real_eye_at(k, cx, cy);
+					s.ix = cx + (-18 + 0.25f * (float)q) * k;
+					s.seed = 7;
+					draw_real_eye(img, W, H, &s, eye);
+					const float y = cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix - 2 * k, s.iy - 1}).y;
+					ylo = fminf(ylo, y);
+					yhi = fmaxf(yhi, y);
+				}
+				side_range = yhi - ylo;
+				CHECK(side_range < 0.5f * k, "%s: sideways sweep moved the refined height by %.2f px", name, side_range);
+			}
+
+			/* 6. The screen's reflection on the cornea (a bright patch in the iris, nearly as bright as
+			 * the sclera): the down sweep of check 2 stays smooth. The patch moving with the iris below
+			 * the pupil, staying put in the image while the iris moves under it, and off to the side
+			 * reaching towards the iris edge. */
+			float refl_lo = 1e9f, refl_hi = -1e9f;
+			for (int rv = 0; rv < 3; rv++) {
+				float rprev = 0;
+				for (int q = 0; q <= steps; q++) {
+					real_eye s = real_eye_at(k, cx, cy);
+					const float rw[3] = {0.25f, 0.2f, 0.2f}, rh[3] = {0.18f, 0.13f, 0.15f};
+					const float rx[3] = {0, 0, -0.5f}, rgrey[3] = {190, 170, 180};
+					s.refl_w = rw[rv];
+					s.refl_h = rh[rv];
+					s.refl_x = rx[rv];
+					s.refl_y = rv == 1 ? 0.2f - 0.25f * (float)q / s.ir : (rv ? 0 : 0.25f);
+					s.refl_v = rgrey[rv];
+					s.iy += 0.25f * (float)q;
+					s.seed = 7;
+					draw_real_eye(img, W, H, &s, eye);
+					const cf_pt g = {s.ix - 1 * k, truth_y + 0.125f * (float)q - 1 * k};
+					const float y = cf_refine_pupil(img, W, W, H, eye, 6, g).y;
+					if (q) {
+						refl_lo = fminf(refl_lo, y - rprev);
+						refl_hi = fmaxf(refl_hi, y - rprev);
+					}
+					rprev = y;
+				}
+			}
+			CHECK(refl_lo > 0 && refl_hi < 1.0f,
+			      "%s: iris moving down in 0.25 px steps with a corneal reflection: refined steps %.3f..%.3f px", name,
+			      refl_lo, refl_hi);
+
+			/* Fast enough for every camera frame. */
+			real_eye s = real_eye_at(k, cx, cy);
+			draw_real_eye(img, W, H, &s, eye);
+			float sink = 0;
+			const clock_t c0 = clock();
+			for (int i = 0; i < 1000; i++)
+				sink += cf_refine_pupil(img, W, W, H, eye, 6, (cf_pt){s.ix + (float)(i & 1), s.iy}).y;
+			const double ms = (double)(clock() - c0) / CLOCKS_PER_SEC * 1000.0 / 1000.0;
+			CHECK(ms < 0.3 && sink > 0, "%s: refine_pupil took %.3f ms per eye", name, ms);
+			printf("ok: realistic %s eye (6-point outline): noise sd %.3f px (range %.2f), %.0f px move followed "
+			       "%.0f%% in steps %.2f..%.2f px, lid-follow %.1f of %.0f px, jitter RMS step %.2f px (iris %.2f), "
+			       "sideways %.2f px, with a corneal reflection steps %.2f..%.2f px, %.3f ms\n",
+			       name, sdev, hi - lo, 0.25f * (float)steps, 100 * gain, min_step, max_step, lid_move, 8 * k, step2,
+			       true2, side_range, refl_lo, refl_hi, ms);
+		}
 	}
 
 	/* 22. Noisy landmarks on both eyes while sitting still: the push keeps a steady direction
