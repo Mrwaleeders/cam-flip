@@ -147,7 +147,7 @@ int main(void)
 	CHECK(first_app < 0.75f * 4.0f, "glance showed %.2f px of 4 on its first frame", first_app);
 	CHECK(worst_up > -0.2f, "correction overshot above the lens by %.2f px", -worst_up);
 	CHECK(max_step <= 4.0f, "correction jumped %.2f px in one frame", max_step);
-	CHECK(fabsf(out[0].lid_sy - 0.35f * out[0].sy) < 0.05f, "upper lid should follow by ~0.35");
+	CHECK(fabsf(out[0].lid_sy - 0.45f * out[0].sy) < 0.05f, "upper lid should follow by ~0.45");
 	CHECK(out[0].aperture_count == 8, "eye outline should be passed to the warp");
 	{
 		float ext_x = 0, ext_y = 0;

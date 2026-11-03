@@ -25,7 +25,7 @@
 #define BLINK_HOLD_MAX 0.40   /* s: a "blink" longer than this is eyes closed: fade out */
 #define SETTLE_TIME 0.07      /* s: ignore the pupil this long after the lids reopen */
 #define LID_GLANCE_K 0.30f    /* eye widths of downward gaze per unit of lid drop (far-glance cue only) */
-#define LID_SHIFT 0.35f       /* upper lid follows the iris by this fraction */
+#define LID_SHIFT 0.45f       /* upper lid follows the iris by this fraction (real lids track vertical gaze) */
 #define AMOUNT_MAX_RY 0.38f   /* vertical iris shift limit, fraction of ry (well inside the fold limit) */
 #define HSHIFT_MAX_RX 0.30f   /* sideways iris shift limit, fraction of rx */
 #define READ_DAMP 0.65f       /* fraction of the sideways reading excursion cancelled at full strength */
