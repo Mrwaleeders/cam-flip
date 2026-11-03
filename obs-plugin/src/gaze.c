@@ -34,6 +34,9 @@
 #define PREDICT_MAX_DT 0.10   /* s: never extrapolate further than this */
 #define VEL_TAU 0.05         /* s: smoothing of the velocity used for prediction */
 #define LOST_HOLD 0.20        /* s: a face missing for less than this (detector dropout) is held, not faded */
+#define LOST_FADE_TAU 0.02    /* s: ... missing for longer: the correction lets go this fast */
+#define ROLL_MIN_CUTOFF 1.0   /* Hz: head roll smoothing (One Euro) of the push direction when still */
+#define ROLL_BETA 3.0         /* ... per rad/s of roll speed: a real head tilt is followed quickly */
 #define RESYNC_JUMP 0.03f     /* eye widths: after a blink, a gaze change bigger than this is taken at once */
 /* Vertical saccade detection. Changes of the raw glance below `lo` are landmark noise (smoothed),
  * changes above `hi` are a saccade (a glance to or from the notes) and are taken at once. Both
@@ -235,6 +238,34 @@ static int face_axes(const cf_face *face, cf_pt *axis, cf_pt *up)
 	axis->y = ay;
 	*up = u;
 	return 1;
+}
+
+/* Sets g->axis and g->up (the directions the iris is pushed along) from this frame's eye axis.
+ * The raw axis wobbles by a degree or so with landmark noise, which made the push direction
+ * wobble, so its roll angle is One Euro smoothed: steady when the head is still, quick to follow
+ * a real tilt (at 30 deg/s it trails by ~2 deg, a tenth of a pixel on a few-pixel shift). Only
+ * the output direction is smoothed: the measurements use the frame's own axis, so a head roll
+ * never reads as a glance. The angle is unwrapped against the filtered one, so the axis keeps
+ * the orientation the measurements used. */
+static void smooth_axes(cf_gaze *g, cf_pt axis, double t)
+{
+	double a = atan2(axis.y, axis.x);
+	if (g->roll.ready) {
+		while (a - g->roll.value > M_PI)
+			a -= 2.0 * M_PI;
+		while (a - g->roll.value < -M_PI)
+			a += 2.0 * M_PI;
+	}
+	const double roll = oe_filter(&g->roll, a, t, ROLL_MIN_CUTOFF, ROLL_BETA);
+	const float ax = (float)cos(roll), ay = (float)sin(roll);
+	cf_pt u = {-ay, ax};
+	if (u.y > 0) {
+		u.x = -u.x;
+		u.y = -u.y;
+	}
+	g->axis.x = ax;
+	g->axis.y = ay;
+	g->up = u;
 }
 
 void cf_gaze_init(cf_gaze *g)
@@ -513,19 +544,23 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	g->face_found = ok;
 
 	if (!ok) {
-		/* Face lost: fade out where the eyes last were. */
 		g->tracking = 0;
 		g->have_rel_open = 0;
 		g->have_down_raw = 0;
 		g->blink = g->closing = g->half = 0;
 		g->ease = 0;
 		g->hist_n = 0;
-		/* The detector often misses a frame or two: hold the correction through that instead of
-		 * letting the eyes dip and climb back. Lost for longer: fade out. */
+		/* The detector often misses a frame or two: hold the correction exactly as it was through
+		 * that instead of letting the eyes dip and climb back. Lost for longer, the person may well
+		 * have moved and the spot being warped may no longer be their eyes: let go quickly, like a
+		 * saccade (gone ~0.1 s after the hold), instead of a slow glide down at a stale spot. */
 		const int brief = g->have_geometry && g->cx[0].ready && t - g->cx[0].t < LOST_HOLD;
 		const float old = g->factor;
-		if (!brief)
-			g->factor = ease_factor(g->factor, 0, dt);
+		if (!brief) {
+			g->factor -= (float)(1.0 - exp(-dt / LOST_FADE_TAU)) * g->factor;
+			if (g->factor < 0.05f)
+				g->factor = 0; /* the last few percent are invisible: just stop */
+		}
 		g->last_target = 0;
 		if (!g->have_geometry || g->factor < 0.01f) {
 			g->have_geometry = g->factor >= 0.01f && g->have_geometry;
@@ -541,8 +576,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		return finish_output(g, p, out);
 	}
 	g->tracking = 1;
-	g->up = up;
-	g->axis = axis;
+	smooth_axes(g, axis, t);
 
 	const float offset = 0.5f * (m[0].offset + m[1].offset);
 	const float side = 0.5f * (m[0].side + m[1].side);

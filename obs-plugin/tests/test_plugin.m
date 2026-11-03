@@ -336,6 +336,70 @@ static void run_calibration_stall(struct camflip *f)
 	free_frame(&tf);
 }
 
+/* Upside-down frames (frame->flip): not tracked, logged once, and a calibration requested on them
+ * is cancelled at once (PR #1) with the panel's flipped-frames message, instead of waiting for the
+ * no-frames timeout. A normal frame afterwards doesn't bring it back. */
+static void run_flipped_frames(struct camflip *f)
+{
+	wait_idle(f, 5000);
+	const unsigned long before = runs(f);
+	camflip_calib_lens_clicked(NULL, NULL, f);
+	test_frame tf;
+	make_frame(&tf, VIDEO_FORMAT_NV12, 640, 360);
+	tf.frame.timestamp = 26000000000ull;
+	tf.frame.flip = true;
+	camflip_filter_video(f, &tf.frame);
+	wait_idle(f, 5000);
+	pthread_mutex_lock(&f->lock);
+	const bool eye_contact = f->eye_contact;
+	const bool cancelled = f->calib_request == 0 && f->calib_running == CALIB_IDLE && f->calib_no_frames &&
+			       f->frames_flipped;
+	pthread_mutex_unlock(&f->lock);
+	check(cancelled && runs(f) == before && (!eye_contact || f->warned_flip),
+	      "an upside-down frame skips tracking and cancels the calibration at once");
+
+	char text[700];
+	bool warn = false;
+	status_text(f, text, sizeof(text), &warn);
+	printf("info: status panel says:\n%s\n", text);
+	check(warn && strstr(text, "upside-down") != NULL && strstr(text, "Calibrating") == NULL,
+	      "status says calibration can't run on upside-down frames");
+
+	tf.frame.flip = false;
+	tf.frame.timestamp = 26100000000ull;
+	camflip_filter_video(f, &tf.frame);
+	wait_idle(f, 5000);
+	pthread_mutex_lock(&f->lock);
+	const bool still_idle = f->calib_running == CALIB_IDLE && f->calib_request == 0 && !f->calib_cancel &&
+				!f->frames_flipped;
+	pthread_mutex_unlock(&f->lock);
+	check(still_idle, "the cancelled calibration stays cancelled when upright frames come");
+	free_frame(&tf);
+}
+
+/* The calibration lives in the settings (written through obs_source_update on the UI thread), so a
+ * saved value is read back and the Defaults button (user value removed) resets it. (PR #1's check;
+ * the default baseline is DEFAULT_BASELINE here.) */
+static void run_baseline_defaults(struct camflip *f, obs_data_t *settings)
+{
+	obs_data_set_double(settings, S_BASELINE, 0.125);
+	obs_data_set_double(settings, S_BASELINE_OPEN, 0.3);
+	camflip_update(f, settings);
+	pthread_mutex_lock(&f->lock);
+	const float saved = f->baseline;
+	const bool lens_saved = f->lens_done;
+	pthread_mutex_unlock(&f->lock);
+	obs_data_unset_user_value(settings, S_BASELINE);
+	obs_data_unset_user_value(settings, S_BASELINE_OPEN);
+	camflip_update(f, settings);
+	pthread_mutex_lock(&f->lock);
+	const float reset = f->baseline;
+	const bool lens_reset = f->lens_done;
+	pthread_mutex_unlock(&f->lock);
+	check(fabsf(saved - 0.125f) < 1e-6f && lens_saved && fabsf(reset - (float)DEFAULT_BASELINE) < 1e-6f && !lens_reset,
+	      "baseline comes from the settings and Defaults resets it");
+}
+
 /* Redoing the camera calibration so the saved notes are no longer below it: the panel says so and
  * the notes are not used until step 2 is redone. */
 static void run_notes_stale(struct camflip *f, obs_data_t *restore)
@@ -649,6 +713,8 @@ int main(void)
 
 	run_calibration_request(f);
 	run_calibration_stall(f);
+	run_flipped_frames(f);
+	run_baseline_defaults(f, settings);
 	run_face_tracking(f);
 	run_notes_stale(f, settings);
 	run_hotkey_names();

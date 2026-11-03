@@ -195,6 +195,7 @@ struct camflip {
 
 	/* ---- video thread only ---- */
 	bool warned_format;
+	bool warned_flip;
 	bool vt_was_on;
 
 #ifdef CAMFLIP_TEST
@@ -300,6 +301,26 @@ static void log_calib_stalled(bool flipped)
 		     "[cam-flip] calibration didn't finish: no camera frames for %d s. Make sure the camera "
 		     "is on and try again",
 		     (int)(CALIB_STALL_NS / 1000000000ull));
+}
+
+/* The camera sends upside-down frames, which can't be tracked: give up a requested or running
+ * calibration straight away (the panel shows the flipped-frames message for it). The worker drops
+ * whatever the gaze model started on an earlier frame (calib_cancel). Returns true if it cancelled. */
+static bool calib_cancel_flipped(struct camflip *f)
+{
+	pthread_mutex_lock(&f->lock);
+	const bool cancel = f->calib_request || f->calib_running;
+	if (cancel) {
+		f->calib_request = 0;
+		f->calib_running = CALIB_IDLE;
+		f->calib_failed = CALIB_IDLE;
+		f->calib_no_frames = true; /* no usable frames; with frames_flipped the panel says why */
+		f->calib_cancel = true;
+	}
+	pthread_mutex_unlock(&f->lock);
+	if (cancel)
+		log_calib_stalled(true);
+	return cancel;
 }
 
 /* ------------------------------------------------- settings written from other threads */
@@ -1451,6 +1472,19 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 		pthread_mutex_unlock(&f->gaze_lock);
 	}
 	f->vt_was_on = eye_contact;
+
+	if (frame->flip) {
+		/* Upside-down (bottom-up) frames aren't tracked (below): the panel says why; log it once.
+		 * A calibration can't run on them either: cancel it at once, with the panel saying why,
+		 * instead of showing "Calibrating…" until it times out for lack of frames. */
+		if (eye_contact && !f->warned_flip) {
+			f->warned_flip = true;
+			blog(LOG_WARNING, "[cam-flip] eye contact is unavailable: this camera sends upside-down "
+					  "(flipped) frames. Mirroring still works");
+		}
+		if (calibrating && calib_cancel_flipped(f))
+			queue_ui(f, NULL); /* show it in an open panel */
+	}
 
 	/* Eye contact first (on the camera's original orientation), then mirror. */
 	if ((eye_contact || calibrating) && !frame->flip && f->worker_started) {

@@ -85,6 +85,7 @@ typedef struct {
 typedef struct {
 	cf_one_euro cx[2], cy[2], rx[2], ry[2], eye_h[2];
 	cf_one_euro down;
+	cf_one_euro roll;  /* head roll (angle of the eye axis), smoothed: sets g->up and g->axis */
 	float factor;      /* current, smoothed 0..1 */
 	float last_target; /* for diagnostics */
 	cf_pt up;          /* smoothed face "up" direction */
@@ -147,7 +148,7 @@ typedef struct {
 	int ap_count[2];
 	float amount_unit[2];   /* vertical iris shift before strength (px) */
 	float hshift_unit[2];   /* sideways iris shift before strength (px, along the eye axis) */
-	cf_pt axis;             /* eye axis (unit, from the left eye towards the right eye) */
+	cf_pt axis;             /* smoothed eye axis (unit, from the left eye towards the right eye) */
 	cf_eye last_out[2];
 	int last_n;
 } cf_gaze;
