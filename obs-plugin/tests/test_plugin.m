@@ -123,6 +123,45 @@ int main(void)
 		printf("ok: Apple Vision processes the frames\n");
 	}
 
+	/* The calibration result is read back from the settings, and Defaults resets it. */
+	obs_data_set_double(settings, S_BASELINE, 0.125);
+	camflip_update(f, settings);
+	const float saved = f->baseline;
+	obs_data_unset_user_value(settings, S_BASELINE);
+	camflip_update(f, settings);
+	if (saved < 0.124f || saved > 0.126f || f->baseline < 0.049f || f->baseline > 0.051f) {
+		printf("FAIL: baseline not taken from settings (saved %.3f, default %.3f)\n", saved, f->baseline);
+		failures++;
+	} else {
+		printf("ok: baseline comes from the settings and Defaults resets it\n");
+	}
+
+	/* An upside-down frame cancels a requested calibration instead of leaving it pending. */
+	{
+		const int w = 64, h = 48;
+		struct obs_source_frame frame;
+		memset(&frame, 0, sizeof(frame));
+		frame.width = w;
+		frame.height = h;
+		frame.format = VIDEO_FORMAT_NV12;
+		frame.flip = true;
+		frame.linesize[0] = w;
+		frame.linesize[1] = w;
+		frame.data[0] = calloc((size_t)w * h, 1);
+		frame.data[1] = calloc((size_t)w * h / 2, 1);
+		const unsigned long runs = f->vision_runs;
+		camflip_calibrate_clicked(NULL, NULL, f);
+		camflip_filter_video(f, &frame);
+		if (f->gaze.calibrating || f->calibrate_request || !f->warned_flip || f->vision_runs != runs) {
+			printf("FAIL: upside-down frame left calibration pending or ran face tracking\n");
+			failures++;
+		} else {
+			printf("ok: upside-down frames skip eye contact and cancel calibration\n");
+		}
+		free(frame.data[0]);
+		free(frame.data[1]);
+	}
+
 	camflip_destroy(f);
 	obs_data_release(settings);
 	if (failures) {

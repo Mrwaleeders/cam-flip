@@ -96,11 +96,41 @@ void cf_gaze_start_calibration(cf_gaze *g)
 {
 	g->calibrating = 1;
 	g->calib_count = 0;
+	g->calib_frames = 0;
 	g->calib_done = 0;
+	g->calib_failed = 0;
+}
+
+static int cmpf(const void *a, const void *b);
+
+static void finish_calibration(cf_gaze *g)
+{
+	qsort(g->calib_samples, (size_t)g->calib_count, sizeof(float), cmpf);
+	g->calib_result = g->calib_samples[g->calib_count / 2];
+	g->calibrating = 0;
+	g->calib_done = 1;
+}
+
+/* Called once per frame while calibrating, whether or not a face was found, so a calibration
+ * started while the user looks away (or is out of frame) can't run forever. */
+static void calibration_tick(cf_gaze *g)
+{
+	if (!g->calibrating || ++g->calib_frames < CF_CALIB_TIMEOUT_FRAMES)
+		return;
+	if (g->calib_count >= CF_CALIB_MIN_SAMPLES) {
+		finish_calibration(g);
+	} else {
+		g->calibrating = 0;
+		g->calib_failed = 1;
+	}
 }
 
 int cf_gaze_take_calibration(cf_gaze *g, float *baseline_out)
 {
+	if (g->calib_failed) {
+		g->calib_failed = 0;
+		return -1;
+	}
 	if (!g->calib_done)
 		return 0;
 	g->calib_done = 0;
@@ -135,12 +165,23 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 
 	float target = 0;
 
+	calibration_tick(g);
+
 	if (ok) {
-		/* Face "up": perpendicular to the line between the eyes, pointing to the top of the image. */
-		float ax = m[1].center.x - m[0].center.x, ay = m[1].center.y - m[0].center.y;
-		const float alen = fmaxf(sqrtf(ax * ax + ay * ay), 1e-3f);
-		ax /= alen;
-		ay /= alen;
+		g->lost_time = 0;
+
+		/* Face "up": perpendicular to the line between the eyes, pointing to the top of the image.
+		 * The raw eye centres jitter by a pixel or so every frame, which would make the direction
+		 * of the warp wobble, so the roll angle of that line is smoothed (One Euro again: steady
+		 * when the head is still, quick to follow a real tilt). The line is taken left to right,
+		 * so the angle stays well inside -90..90 degrees and never wraps around. */
+		float lx = m[1].center.x - m[0].center.x, ly = m[1].center.y - m[0].center.y;
+		if (lx < 0) {
+			lx = -lx;
+			ly = -ly;
+		}
+		const double roll = oe_filter(&g->roll, atan2(ly, fmaxf(lx, 1e-3f)), t, 1.0, 3.0);
+		const float ax = (float)cos(roll), ay = (float)sin(roll);
 		cf_pt up = {-ay, ax};
 		if (up.y > 0) {
 			up.x = -up.x;
@@ -165,12 +206,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 
 		if (g->calibrating && !blinking && abs_yaw < 15) {
 			g->calib_samples[g->calib_count++] = offset;
-			if (g->calib_count >= 30) {
-				qsort(g->calib_samples, (size_t)g->calib_count, sizeof(float), cmpf);
-				g->calib_result = g->calib_samples[g->calib_count / 2];
-				g->calibrating = 0;
-				g->calib_done = 1;
-			}
+			if (g->calib_count >= CF_CALIB_SAMPLES)
+				finish_calibration(g);
 		}
 
 		/* Eye geometry: follows the head closely (high beta), so the warp stays on the eyes. */
@@ -222,9 +259,17 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p, dou
 			out[i].sy = up.y * amount;
 		}
 	} else {
-		/* Face lost: fade out where the eyes last were. */
-		g->factor = ease_factor(g->factor, 0, dt);
+		/* Face lost. A frame or two without a face is usually just the detector missing one,
+		 * so hold the warp exactly as it was. If the face stays away longer, the person may well
+		 * have moved and the spot we'd be warping may no longer be their eyes, so fade out fast. */
+		g->lost_time += dt;
 		g->last_target = 0;
+		if (g->lost_time >= CF_LOST_GRACE_S) {
+			const double a = 1.0 - exp(-dt / 0.02);
+			g->factor -= (float)a * g->factor;
+			if (g->factor < 0.05f)
+				g->factor = 0; /* the last few percent are invisible: just stop */
+		}
 		if (!g->have_geometry || g->factor < 0.01f) {
 			g->have_geometry = g->factor >= 0.01f && g->have_geometry;
 			return 0;
