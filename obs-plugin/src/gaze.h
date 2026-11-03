@@ -86,11 +86,53 @@ typedef struct {
 	int ready;
 } cf_one_euro;
 
+/* One gaze channel (vertical glance or sideways position) made robust against measurement outliers:
+ * a change bigger than noise is only taken at once when another sensor backs it up (see gaze.c). */
+typedef struct {
+	float lr_bias;    /* typical left-eye minus right-eye reading (eye widths) */
+	float lr_noise;   /* mean |left - right - lr_bias| while they agree: what disagreement is noise */
+	float v_anchor;   /* Vision's reading where the accepted gaze is (follows it slowly, reset on a jump) */
+	float v_last;     /* Vision's reading last frame */
+	float v_noise;    /* mean frame-to-frame change of Vision's reading */
+	float v_gain;     /* refined change per Vision change (Vision's point is coarse: it under-reads) */
+	float v_gain_err; /* typical error of v_gain (log ratio), seen on the saccades it was learnt from */
+	int have_v;
+	float v_off;      /* the reading minus v_gain x Vision's, averaged since the last change taken ... */
+	int v_off_n;      /* ... over this many readings (0: none yet) */
+	/* While outliers are about: up to two other levels the readings keep going to (as offsets from where
+	 * Vision's point says the gaze is, see vote()), and the share of readings at the accepted level and at
+	 * each, recently (w_) and over a longer memory (s_). */
+	float alt[2], w_alt[2], s_alt[2];
+	int have_alt[2];
+	float w_acc, s_acc;
+	float lid_anchor; /* eye openness where the accepted gaze is (vertical channel) */
+	int have_lid;
+	float m_prev;     /* last frame's combined reading */
+	int have_prev;
+	int steady_n;     /* frames running the reading has been away from the accepted value, but steady */
+	int held_big;     /* last frame's reading was a saccade-sized change that was not taken */
+	int away;         /* last frame's reading was past the noise band and not taken at once */
+	int followed;     /* this frame's reading persisted away and the accepted value followed it */
+	double jump_t;    /* the last change taken at once: when, ... */
+	float jump_from, jump_size; /* ... from where, and how big (to see it come straight back) */
+	int jump_weak;    /* ... and only both eyes moving alike backed it up (no Vision point, lids still) */
+	int settle;       /* readings since that change: the first few are averaged in quickly */
+	double out_t;     /* last time an outlier was seen (the measurement counts as clean a while after) */
+	double shown;     /* the value the output uses: the accepted one, smoothed and slew-limited (see slew()) */
+	double shown_x;   /* the accepted value it last followed */
+	int have_shown;
+} cf_robust;
+
 typedef struct {
 	cf_one_euro cx[2], cy[2], rx[2], ry[2], eye_h[2];
 	cf_one_euro down;
 	cf_one_euro roll;  /* head roll (angle of the eye axis), smoothed: sets g->up and g->axis */
-	float factor;      /* current, smoothed 0..1 */
+	float factor;      /* current, smoothed 0..1 (head turn, face size, and looking away all fade it) */
+	float factor_mid;  /* the first of its two easing stages */
+	/* The glance and sideways position the shift is made from: the live ones while the gaze is on the
+	 * notes, held while it is away, so a look-away fades out from where it left. */
+	float d_lock, side_lock;
+	int have_lock;
 	float last_target; /* for diagnostics */
 	cf_pt up;          /* smoothed face "up" direction */
 	double last_t;
@@ -130,6 +172,10 @@ typedef struct {
 	float down_noise;       /* typical frame-to-frame change of the raw glance (eye widths): landmark noise */
 	float last_down_raw;
 	int have_down_raw;
+	float side_noise;       /* the same for the raw sideways gaze */
+	float last_side_raw;
+	int have_side_raw;
+	cf_robust rb_down, rb_side; /* outlier rejection and output slew guard for the glance and sideways gaze */
 	/* The last few frames' glance state, so a blink or half blink caught a frame or two late (the lids
 	 * dragging Vision's pupil point down on the way) can be undone back to before the lids moved. */
 	struct {
