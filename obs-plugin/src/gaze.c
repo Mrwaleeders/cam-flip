@@ -1580,13 +1580,15 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 #define RP_UP1 0.08f         /* ... 1 from here (levels, iris column and centroid) */
 #define RP_LO0 0.02f         /* same over the lower lid */
 #define RP_LO1 0.045f
-#define RP_EUP0 0.03f        /* lid clearance for edge points, the image check does the rest */
-#define RP_EUP1 0.06f
-#define RP_ELO0 0.015f
-#define RP_ELO1 0.035f
+#define RP_EUP0 0.01f        /* lid clearance for edge points: just inside the landmarks' lids, since */
+#define RP_EUP1 0.03f        /* the image check (sclera beyond the edge) keeps lashes out; looking down, */
+#define RP_ELO0 0.005f       /* the rows near the lids are the ones that tell where the centre is */
+#define RP_ELO1 0.02f
 #define RP_P_IRIS 0.20f      /* grey percentiles inside the outline: iris level ... */
 #define RP_P_SCLERA 0.90f    /* ... and sclera level */
-#define RP_RAMP0 0.15f       /* darkness 1 below iris + this x (sclera - iris), 0 above ... */
+#define RP_RAMP0 0.30f       /* darkness 1 below iris + this x (sclera - iris), 0 above ... (well above the */
+                             /* iris level, so a light or textured iris body reads fully dark: the edge */
+                             /* widths are integrals of darkness and would shrink, row by row, with it) */
 #define RP_RAMP1 0.85f       /* ... iris + this x (sclera - iris), linear in between */
 #define RP_CONTRAST0 18.0f   /* sclera - iris grey levels: below this, no refinement ... */
 #define RP_CONTRAST1 36.0f   /* ... full refinement from here */
@@ -1601,8 +1603,8 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 #define RP_CLEAR1 0.95f      /* ... to count fully */
 #define RP_MAXPTS 512        /* edge points */
 #define RP_TAU 0.06          /* circle refit: points this far off the circle (R units) count half */
-#define RP_SIG0 0.06f        /* circle fit's nominal error (R units): trusted fully below this ... */
-#define RP_SIG1 0.15f        /* ... not at all above */
+#define RP_SIG0 0.12f        /* circle fit's nominal error (R units): trusted fully below this ... */
+#define RP_SIG1 0.30f        /* ... not at all above (the centroid it falls back on reads a lowered gaze short) */
 
 typedef struct {
 	float c0x, c0y; /* corner midpoint */
@@ -1923,7 +1925,12 @@ static cf_pt rp_refine_s(const uint8_t *grey, int stride, int width, int height,
 			core *= rp_lids(&e, X0 - e.c0x, dy, &du, &dl) ? rp_ss(EU0, iEU, du) * rp_ss(EL0, iEL, dl) : 0;
 			if (core <= 0)
 				continue;
+			/* Grey levels 1/4 1/2 1/4 over the pixel row and its neighbours: a bright patch's or a lid's
+			 * edge across the rows is spread over two or three of them, so the edge points don't
+			 * change in steps as the eye moves by fractions of a row. */
 			const uint8_t *grow = grey + (size_t)py * (size_t)stride;
+			const uint8_t *gup = grey + (size_t)(py > 0 ? py - 1 : py) * (size_t)stride;
+			const uint8_t *gdn = grey + (size_t)(py + 1 < height ? py + 1 : py) * (size_t)stride;
 			float row[RP_MAXROW], mr[RP_MAXROW];
 			for (int i = lo_i; i <= hi_i; i++) {
 				mr[i] = rp_lids(&e, gx0 + (float)i * fs, dy, &du, &dl) ? rp_mask(du, dl, 1.0f) : 0;
@@ -1931,8 +1938,8 @@ static cf_pt rp_refine_s(const uint8_t *grey, int stride, int width, int height,
 					const int px0 = x0 + i * s, px1 = px0 + s > width ? width : px0 + s;
 					unsigned sum = 0;
 					for (int x = px0; x < px1; x++)
-						sum += grow[x];
-					const float gv = (float)sum / (float)(px1 - px0);
+						sum += 2u * grow[x] + gup[x] + gdn[x];
+					const float gv = 0.25f * (float)sum / (float)(px1 - px0);
 					row[i] = (1 - clampf((gv - th0) * ith, 0, 1)) * mr[i];
 				} else {
 					row[i] = 0;
