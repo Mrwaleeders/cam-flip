@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #define CF_MAX_EYE_POINTS 32
+#define CF_HIST 6
 #define CF_CALIB_SAMPLES 30
 #define CF_CALIB_MIN_SAMPLES 10
 #define CF_CALIB_TIMEOUT_FRAMES 300 /* about 10 s at 30 fps */
@@ -124,10 +125,20 @@ typedef struct {
 	float down_noise;       /* typical frame-to-frame change of the raw glance (eye widths): landmark noise */
 	float last_down_raw;
 	int have_down_raw;
-	int released;           /* a "closing" hold was just released as a glance: undone if a blink follows */
-	double released_t;
-	double released_down;   /* g->down and g->far_fade from before that release */
-	float released_far;
+	/* The last few frames' glance state, so a blink or half blink caught a frame or two late (the lids
+	 * dragging Vision's pupil point down on the way) can be undone back to before the lids moved. */
+	struct {
+		double t, down;
+		float far;
+		int ready;
+	} hist[CF_HIST];
+	int hist_n;
+	float r_slow;           /* relative openness, lightly smoothed (two-frame mean, then ~0.08 s) */
+	float r_slow_prev[2];   /* ... its values one and two frames ago (the level before a drop began) */
+	float last_r;
+	int past_gate;          /* consecutive frames the pupil read past the lid-cue gate */
+	int ease;               /* easing the output after a half-blink hold timed out (eyes still) */
+	double ease_min_until;
 	enum cf_calib_target calib_target;
 	float calib_open[64];
 	float calib_side[64];

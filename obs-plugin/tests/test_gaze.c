@@ -72,6 +72,21 @@ static float shift_px(const cf_eye *e)
 	return sqrtf(e->sx * e->sx + e->sy * e->sy);
 }
 
+/* Uniform noise: +-lid px on every outline point, +-pupil px on the pupils. */
+static void noisy(cf_face *f, float lid, float pupil)
+{
+	for (int k = 0; k < f->left_count; k++) {
+		f->left_eye[k].x += ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * lid;
+		f->left_eye[k].y += ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * lid;
+	}
+	for (int k = 0; k < f->right_count; k++) {
+		f->right_eye[k].x += ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * lid;
+		f->right_eye[k].y += ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * lid;
+	}
+	f->left_pupil.y += ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * pupil;
+	f->right_pupil.y += ((float)rand() / (float)RAND_MAX - 0.5f) * 2 * pupil;
+}
+
 /* Is the model holding (blink, half blink, closing lids or settling)? Only what the status shows is
  * public; this peeks at the state for the squint test. */
 static int holding_now(const cf_gaze *g, double t)
@@ -642,8 +657,10 @@ int main(void)
 		settle(&g, face_px(960, 500, 0, gpx, 16, 0, 2.0f), &pq, &t, 45, out);
 		/* Pupil reads 0.12 eye widths, just past the 0.112 limit (alone that would keep ~94% of the
 		 * correction), but the lids are down to 8 px: a keyboard glance the pupil under-reads.
-		 * (Changed from 0.10: the lid cue now only starts past 1.05 x the limit, see 15b.) */
-		const float s = settle(&g, face_px(960, 500, 0, 4.8f, 16, 0, 8.0f), &pq, &t, 30, out);
+		 * (Changed from 0.10: the lid cue now only starts past 1.05 x the limit, see 15b.)
+		 * (Settles over 2 s instead of 1 s: lids dropping fast to r 0.5 with the pupil barely moving
+		 * look exactly like a half blink, so they are held for 0.5 s and then eased off, see 19/20.) */
+		const float s = settle(&g, face_px(960, 500, 0, 4.8f, 16, 0, 8.0f), &pq, &t, 60, out);
 		CHECK(s < 0.2f, "far glance with the lids well down should be left alone (%.2f px)", s);
 		printf("ok: far glance read from the lids is released (%.2f px)\n", s);
 	}
@@ -879,6 +896,97 @@ int main(void)
 		}
 		CHECK(kb < 0.2f, "keyboard glance with deep lids was held (%.2f px corrected after the first frame)", kb);
 		printf("ok: keyboard glance with the lids at r 0.44 is not held (%.2f px after the first frame)\n", kb);
+	}
+
+	/* 20. A half-blink hold that times out (lids stay at r 0.5, the pupil under-reads a glance by
+	 * reading only 3 px further down) hands over gently: the eyes are still, so the output may not
+	 * jump when the hold lets go and the measurement takes over. */
+	{
+		const float gl = 0.04f, gpx = gl * 40.0f;
+		const cf_gaze_params pt = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		cf_gaze_init(&g);
+		settle(&g, face_px(960, 500, 0, gpx, 14, 0, 0), &pt, &t, 60, out);
+		float prev_s = -1, worst_step = 0, last = 0;
+		int was_half = 0, released_at = -1;
+		for (int i = 0; i < 60; i++, t += dt) {
+			n = update(&g, face_px(960, 500, 0, gpx + 3.0f, 8.0f, 0, 0), &pt, t, out);
+			const float s = n ? shift_px(&out[0]) : 0;
+			was_half |= g.half;
+			if (released_at < 0 && was_half && !g.half)
+				released_at = i;
+			if (i >= 2 && prev_s >= 0) /* from the third frame on the lids and pupil are still */
+				worst_step = fmaxf(worst_step, fabsf(s - prev_s));
+			prev_s = s;
+			last = s;
+		}
+		CHECK(was_half && released_at > 0, "the lid drop should be held as a half blink, then released");
+		CHECK(worst_step < 0.35f, "hold timeout changed the output by %.2f px in one frame (eyes still)", worst_step);
+		printf("ok: half-blink timeout hands over gently (largest step %.2f px/frame, released at frame %d, ends "
+		       "at %.2f px)\n",
+		       worst_step, released_at, last);
+	}
+
+	/* 21. Half blinks with noisy lid landmarks (+-1 px on every outline point, fixed seed): still
+	 * caught (held), so the correction neither drops nor overshoots; and smiling steadily with the
+	 * same noise rarely starts a hold. */
+	{
+		const float gl = 0.04f, gpx = gl * 40.0f;
+		const cf_gaze_params pn = {.strength = 1.0f, .max_glance = 0.15f, .baseline_open = 0.4f, .has_notes = 1,
+					   .notes_offset = -gl, .notes_open = 0.35f};
+		srand(21);
+		int blinks = 0, caught = 0, frames = 0, zero = 0, over = 0;
+		for (int smile = 0; smile < 2; smile++)
+			for (int depth = 0; depth < 2; depth++)
+				for (int slide = 0; slide <= 2; slide += 2) {
+					const float base = smile ? 11.0f : 14.0f, dh = (depth ? 0.5f : 0.42f) * 16.0f;
+					const float lids[] = {0.5f * (base + dh), dh, dh, dh, dh, 0.5f * (base + dh)};
+					cf_gaze_init(&g);
+					for (int rep = 0; rep < 25; rep++) {
+						int seen = 0;
+						for (int i = 0; i < 36 + 6; i++, t += dt) {
+							const int kb = i - 36; /* blink frames 0..5 */
+							const float h = kb >= 0 ? lids[kb] : base;
+							const float pd = gpx + (float)slide * (base - h) / (base - dh);
+							cf_face f = face_px(960, 500, 0, pd, h, 0, 0);
+							noisy(&f, 1.0f, 0.3f);
+							n = cf_gaze_update(&g, &f, &pn, t, out);
+							const float sv = n ? shift_px(&out[0]) : 0;
+							if (kb == 1)
+								blinks++;
+							if (kb >= 1 && kb <= 4 && !seen && holding_now(&g, t)) {
+								caught++;
+								seen = 1;
+							}
+							if (rep > 0 && (kb >= 0 || i >= 12)) {
+								frames++;
+								zero += sv < 0.5f * gpx;
+								over += sv > 1.3f * gpx;
+							}
+						}
+					}
+				}
+		/* Smiling steadily, same noise. */
+		cf_gaze_init(&g);
+		int held = 0, total = 0;
+		for (int i = 0; i < 3000; i++, t += dt) {
+			cf_face f = face_px(960, 500, 0, gpx, 10.0f, 0, 0);
+			noisy(&f, 1.0f, 0.3f);
+			cf_gaze_update(&g, &f, &pn, t, out);
+			if (i >= 60) {
+				held += holding_now(&g, t);
+				total++;
+			}
+		}
+		const float det = (float)caught / (float)blinks, fh = (float)held / (float)total;
+		CHECK(det > 0.95f, "noisy half blinks: only %.0f%% caught", 100 * det);
+		CHECK(zero <= frames / 500 && over <= frames / 150, "noisy half blinks: %d of %d frames lost the correction, %d "
+								    "over-corrected by 30%%+",
+		      zero, frames, over);
+		CHECK(fh < 0.05f, "smiling with noisy lids holds %.1f%% of the time", 100 * fh);
+		printf("ok: noisy half blinks: %.0f%% caught, %d of %d frames lost the correction, %d over-corrected; smiling "
+		       "holds %.1f%% of frames\n",
+		       100 * det, zero, frames, over, 100 * fh);
 	}
 
 	/* 13. Iris refinement: finds a dark iris offset from Vision's guess, partly under the lower lid. */
