@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-OBS_VERSION="${OBS_VERSION:-33.0.1}"
+OBS_VERSION="${OBS_VERSION:-31.0.0}"  # oldest OBS supported; newer OBS loads it too
 VERSION="${CAMFLIP_VERSION:-$(git describe --tags --always 2>/dev/null || echo dev)}"
 OBS_SRC="build/obs-studio-$OBS_VERSION"
 

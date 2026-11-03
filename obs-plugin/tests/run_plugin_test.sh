@@ -3,10 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OBS_APP="${OBS_APP:-/Applications/OBS.app}"
-OBS_VERSION="${OBS_VERSION:-33.0.1}"
+OBS_VERSION="${OBS_VERSION:-31.0.0}"  # oldest OBS supported; newer OBS loads it too
 OBS_SRC="build/obs-studio-$OBS_VERSION"
 FW="$OBS_APP/Contents/Frameworks"
-ls "$FW" | head -50
 clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -fobjc-arc \
   -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
   tests/test_plugin.m src/gaze.c src/warp.c \
@@ -14,3 +13,9 @@ clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -g -fobjc-arc \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
   -o build/test_plugin
 ./build/test_plugin
+
+# Real module load, exactly like OBS at startup.
+clang -arch "$(uname -m)" -mmacosx-version-min=13.0 \
+  -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include \
+  tests/test_load.c -F"$FW" -framework libobs -Wl,-rpath,"$FW" -o build/test_load
+./build/test_load "$PWD/build/cam-flip.plugin/Contents/MacOS/cam-flip"
