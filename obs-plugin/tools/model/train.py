@@ -189,7 +189,7 @@ class Session:
 class Pairs:
     """Samples (source, destination) pairs: same eye, same session, a few seconds apart, head still."""
 
-    def __init__(self, sessions, val=False, seed=0):
+    def __init__(self, sessions, val=False, seed=0, tol=0.04):
         self.items = []  # (session, src index, candidate dst indices)
         for s in sessions:
             # Held-out frames: every 6th 8-second block, so they cover the whole session (lens looks, dots
@@ -207,11 +207,12 @@ class Pairs:
                     cand = idx[lo:hi]
                     if val:
                         cand = cand[block[cand] == block[i]]
-                    # head still: corners within 6% of the eye width
-                    tol = 0.06 * s.eye_w[i]
+                    # head still: corners within `tol` of the eye width (each patch is cut on its own corners,
+                    # so more than that and the pair is misaligned: the model learns to paint, not move)
+                    tol_px = tol * s.eye_w[i]
                     d = np.maximum(np.hypot(s.ax[cand] - s.ax[i], s.ay[cand] - s.ay[i]),
                                    np.hypot(s.bx[cand] - s.bx[i], s.by[cand] - s.by[i]))
-                    cand = cand[d < tol]
+                    cand = cand[d < tol_px]
                     if len(cand):
                         self.items.append((s, i, cand))
         # The job in use: from wherever the eye looks (dots, reading) to the lens look. Pick those sources
@@ -328,6 +329,9 @@ def iris_centre(img, weight):
 
 # ---------------------------------------------------------------- training
 
+RES_WEIGHT = 0.05  # --res-weight: how much the brightness residual costs; higher pushes the model to move pixels
+
+
 def losses(model, src, dst, tgt, grid, wmap, edge):
     flow, res, mask = model(src, tgt)
     out = render(src, flow, res, mask, grid)
@@ -350,7 +354,7 @@ def losses(model, src, dst, tgt, grid, wmap, edge):
     # MAX_FLOW (every sample off the patch) and training froze. This term still pulls back from there.
     o = model.logits
     l_sat = (F.relu(o[:, 0:3].abs() - 2.0) ** 2).mean() + (F.relu((o[:, 3:4] + 2.0).abs() - 5.0) ** 2).mean()
-    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + 0.05 * l_res + 0.5 * l_edge + 0.1 * l_sat
+    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + RES_WEIGHT * l_res + 0.5 * l_edge + 0.1 * l_sat
     return total, out, l_pix
 
 
@@ -459,8 +463,14 @@ def main():
     ap.add_argument("--no-export", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--res-weight", type=float, default=0.05,
+                    help="cost of the brightness residual (higher: move pixels rather than paint them)")
+    ap.add_argument("--pair-tol", type=float, default=0.04,
+                    help="pairs only when the eye corners moved less than this fraction of the eye width")
     ap.add_argument("--selftest-export", metavar="PATH", help="with --selftest: also export the synthetic model here")
     a = ap.parse_args()
+    global RES_WEIGHT
+    RES_WEIGHT = a.res_weight
     dev = torch.device(a.device)
     torch.manual_seed(a.seed)
 
@@ -480,7 +490,7 @@ def main():
         opening = lens_open(sessions)
         print("looking into the lens, the iris sits at " +
               (f"({lens[0]:.1f}, {lens[1]:.1f}) and ({lens[2]:.1f}, {lens[3]:.1f}) patch px" if lens else "? (too few lens frames)"))
-        train, val = Pairs(sessions), Pairs(sessions, val=True, seed=1)
+        train, val = Pairs(sessions, tol=a.pair_tol), Pairs(sessions, val=True, seed=1, tol=a.pair_tol)
         print(f"training pairs from {len(train)} source frames, validation {len(val)}")
         if len(train) < 200 or len(val) < 20:
             sys.exit("not enough usable frames: record a full session (tools/model/capture.sh)")

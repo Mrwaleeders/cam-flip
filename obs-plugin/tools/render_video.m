@@ -719,7 +719,9 @@ int main(int argc, char **argv)
 						 * either way, so it handles jumps since the last tracking. */
 						float tgt[2][2], alpha[2];
 						for (int e = 0; e < n; e++) {
-							alpha[e] = ml_alpha * fminf(1.0f, st.factor / 0.3f);
+							/* Off while the gaze model says the lids are shut or closing: the model never saw a
+							 * blink and smudges it, and the lids hide the eye anyway. */
+							alpha[e] = st.blinking ? 0.0f : ml_alpha * fminf(1.0f, st.factor / 0.3f);
 							if (!ml_follow && cf_ml_lens_target(ml, eyes, n, e, tgt[e]))
 								continue;
 							const cf_pt c0 = centroid_of(fed.left_eye, fed.left_count),
