@@ -358,7 +358,8 @@ static void check_notes_locked(struct camflip *f)
  * (The gaze model doesn't use such notes; the panel asks for the camera look again.) */
 static bool look_seems_off_locked(const struct camflip *f)
 {
-	return f->lens_done && f->learnt.has && !cf_gaze_notes_valid(f->baseline, f->learnt.offset);
+	return f->lens_done && f->learnt.has && f->learnt.seconds >= CF_LOOK_READING_MIN &&
+	       !cf_gaze_look_fits_reading(f->baseline, f->learnt.offset);
 }
 
 /* A camera look taken by an older version (or without the nose in view): head tilt and lids are not

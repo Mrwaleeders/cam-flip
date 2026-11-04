@@ -181,14 +181,22 @@ typedef struct {
 /* Checks a finished lens calibration ("look at the camera") before it is used. reading: the learnt notes, or
  * NULL / has 0 when none are known yet. Returns CF_LOOK_OK, or why the look should be redone:
  *  CF_LOOK_UNSTEADY: the eyes or lids moved far more than a held look does (not just a bit unsteady);
- *  CF_LOOK_LOW: it is not clearly above where the eyes read (by CF_NOTES_MIN_GLANCE), so it was a look at the
- *    screen, not into the lens. Only said when the learnt notes rest on CF_LOOK_READING_MIN seconds of reading
- *    at least: a few seconds of it may be off. */
+ *  CF_LOOK_LOW: it is not above where the eyes read (cf_gaze_look_fits_reading()), so it was a look at the screen
+ *    or the notes, not into the lens. Only said when the learnt notes rest on CF_LOOK_READING_MIN seconds of
+ *    reading at least: a few seconds of it may be off. */
 #define CF_LOOK_OK 0
 #define CF_LOOK_UNSTEADY 1
 #define CF_LOOK_LOW 2
 #define CF_LOOK_READING_MIN 10.0f
 int cf_gaze_check_lens_look(const cf_calib_result *res, const cf_learnt_notes *reading);
+
+/* 1 when a camera look at `baseline` is above learnt reading at `reading_offset` by CF_LOOK_ABOVE_READING at
+ * least: what the panel and cf_gaze_check_lens_look() hold a camera look to. Gentler than cf_gaze_notes_valid():
+ * notes just under the camera read only ~0.015-0.025 below the lens at 0.5 m, and a look's own noise is ~0.005,
+ * so CF_NOTES_MIN_GLANCE would turn down (or doubt) a good look about one time in five. A look at the notes
+ * themselves still reads ~0 above them. */
+#define CF_LOOK_ABOVE_READING 0.005f
+int cf_gaze_look_fits_reading(float baseline, float reading_offset);
 
 typedef struct {
 	double value, deriv, t;

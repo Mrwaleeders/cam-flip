@@ -214,6 +214,7 @@
 #define LEARN_OPEN_R 0.6f       /* relative openness: lids lower than this are not reading (a keyboard look, a
 				 * squint) */
 #define LEARN_GLANCE_MAX 0.20f  /* eye widths below the lens (with a lens calibration): further down is the keyboard */
+#define LEARN_ABOVE_MAX 0.03f   /* eye widths above the lens: further up is not reading notes under the camera */
 #define LEARN_SIGMA_INIT 0.006f /* eye widths: the sideways noise assumed until it is measured ... */
 #define LEARN_BLOCK 1.0         /* s: ... as the robust SD over blocks this long, the 25th percentile of the last
 				 * CF_LEARN_BLOCKS of them (quiet ones: not those holding a return) */
@@ -1568,9 +1569,15 @@ int cf_gaze_check_lens_look(const cf_calib_result *res, const cf_learnt_notes *r
 	    !(res->open_spread <= LOOK_UNSTEADY_K * CALIB_OPEN_SPREAD_MAX))
 		return CF_LOOK_UNSTEADY;
 	if (reading && reading->has && reading->seconds >= CF_LOOK_READING_MIN &&
-	    !cf_gaze_notes_valid(res->offset, reading->offset))
+	    !cf_gaze_look_fits_reading(res->offset, reading->offset))
 		return CF_LOOK_LOW;
 	return CF_LOOK_OK;
+}
+
+int cf_gaze_look_fits_reading(float baseline, float reading_offset)
+{
+	const float above = baseline - reading_offset;
+	return isfinite(above) && above >= CF_LOOK_ABOVE_READING;
 }
 
 /* ---- Notes learnt from reading (see cf_learnt_notes)
@@ -2811,13 +2818,16 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	}
 
 	/* The notes learnt from reading (see "Notes learnt from reading"): the same readings, from frames that may be
-	 * reading. With a lens calibration the gaze must be below the lens and above the keyboard: the accepted glance
-	 * (last frame's), so the notes just under the lens aren't learnt from only the frames whose noise reads them
-	 * lower. */
+	 * reading. With a lens calibration the gaze must be above the keyboard, and not clearly above the lens: the
+	 * accepted glance (last frame's). Not "below the lens by CF_NOTES_MIN_GLANCE": notes just under the camera read
+	 * only ~0.015-0.025 below the lens look at ~0.5 m, with ~0.017 of scatter, so a quarter of such reading frames
+	 * read less than that. Dropping them broke every line into pieces, and real reading at that height was never
+	 * learnt. Whether the learnt notes are below the lens is for whoever uses them (cf_gaze_notes_valid(),
+	 * cf_gaze_look_fits_reading()). */
 	{
 		const float acc = g->down.ready ? (float)g->down.value : down_raw;
 		const int below = !(p->baseline_open > 0) ||
-				  (acc >= CF_NOTES_MIN_GLANCE && fmaxf(acc, down_raw) <= LEARN_GLANCE_MAX);
+				  (acc >= -LEARN_ABOVE_MAX && fmaxf(acc, down_raw) <= LEARN_GLANCE_MAX);
 		const int usable = !g->calibrating && !hold && abs_yaw < LEARN_YAW_MAX && abs_pitch < LEARN_PITCH_MAX &&
 				   r > LEARN_OPEN_R && below;
 		learn_frame(g, p, usable, p->baseline - down_raw, side, openness, vis ? -v_down : NAN, t);

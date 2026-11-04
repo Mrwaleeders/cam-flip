@@ -1712,7 +1712,7 @@ static void test_vision_tail(void)
 	       100.0 * n_vis / (n_vis_all ? n_vis_all : 1), w_a, w_b, w_c, w_co, n_cb, w_cb, w_d, 100.0f * w_e, w_lid);
 }
 
-/* ---- Notes learnt from reading (checks L1-L12)
+/* ---- Notes learnt from reading (checks L1-L13)
  *
  * Synthetic reading, shaped on the summary statistics of the user's clips (~0.5 m from a MacBook camera, eyes 75-88
  * px wide; units eye widths): at rest the refined points' sideways reading changes ~0.005 a frame (robust SD over
@@ -1723,6 +1723,11 @@ static void test_vision_tail(void)
  * landing short with a corrective saccade after. The upper lid follows the gaze down (half of it); Vision's points
  * move 0.6 of the eyes' movement. The noise is in pixels, so smaller eyes are noisier in eye widths. */
 #define RD_SLOW_TAU 0.4 /* s: the slow part of the landmark noise wanders this slowly */
+/* L13: the reading's height wandering slowly on top of the fixations' scatter (SD, eye widths; 0: none). On the
+ * user's clips the height read while reading drifts over seconds (the head settling, the lids), not only from one
+ * fixation to the next, so frames that read low come in runs. */
+static float rd_wander_sd;
+#define RD_WANDER_TAU 3.0
 enum { RD_READ, RD_LOOK, RD_HOLD };
 
 typedef struct {
@@ -1757,6 +1762,7 @@ typedef struct {
 	float kb_side, kb_glance;
 	float nz[2][4]; /* slow noise: eye x (refined x, y, Vision's x, y) */
 	int returns;
+	float wander; /* (see rd_wander_sd) */
 } rd_sim;
 
 static float rd_u(float a, float b)
@@ -1822,6 +1828,10 @@ static void rd_saccade(rd_sim *s, float side, float glance)
 static void rd_step(rd_sim *s, double dt)
 {
 	s->t += dt;
+	if (rd_wander_sd > 0) {
+		const float a = (float)(dt / RD_WANDER_TAU);
+		s->wander += -a * s->wander + rd_wander_sd * sqrtf(2.0f * a) * gauss(1.0f);
+	}
 	if (s->sac) {
 		s->side = s->to_side;
 		s->glance = s->to_glance;
@@ -1869,7 +1879,7 @@ static void rd_step(rd_sim *s, double dt)
 				s->correct_to = s->line_from;
 			}
 			s->returns++;
-			rd_saccade(s, land, s->level + gauss(s->scatter));
+			rd_saccade(s, land, s->level + s->wander + gauss(s->scatter));
 			return;
 		}
 		if (s->t >= s->next_fix) {
@@ -1880,7 +1890,7 @@ static void rd_step(rd_sim *s, double dt)
 				to = s->side - (float)s->dir * rd_u(0.003f, 0.008f); /* a step back */
 			s->next_fix = s->t + rd_u(0.18f, 0.32f);
 			s->side = to; /* (word steps: small, one frame) */
-			s->glance = s->level + gauss(s->scatter);
+			s->glance = s->level + s->wander + gauss(s->scatter);
 		}
 	} else if (s->mode == RD_LOOK) {
 		if (s->t >= s->next_fix) {
@@ -2489,23 +2499,50 @@ static void test_learn_notes(void)
 		printf("ok: L11 without a lens calibration the reading is still learnt\n");
 	}
 
-	/* L12. The lens look against the learnt notes: "too low" (CF_LOOK_LOW) only when it is not CF_NOTES_MIN_GLANCE
+	/* L12. The lens look against the learnt notes: "too low" (CF_LOOK_LOW) only when it is not CF_LOOK_ABOVE_READING
 	 * above them and they rest on CF_LOOK_READING_MIN seconds of reading at least. */
 	{
-		cf_calib_result look = {.target = CF_CALIB_LENS, .offset = -0.095f};
+		cf_calib_result look = {.target = CF_CALIB_LENS, .offset = -0.097f};
 		cf_learnt_notes rd = {.has = 1, .offset = -0.10f, .seconds = 30.0f};
 		const int low = cf_gaze_check_lens_look(&look, &rd);
 		rd.seconds = 5.0f;
 		const int few = cf_gaze_check_lens_look(&look, &rd);
 		rd.seconds = 30.0f;
-		look.offset = -0.085f;
+		look.offset = -0.092f; /* (0.008 above: notes just under the camera, a look as noisy as they come) */
 		const int above = cf_gaze_check_lens_look(&look, &rd);
-		look.offset = -0.095f;
+		look.offset = -0.097f;
 		const int none = cf_gaze_check_lens_look(&look, NULL);
 		CHECK(low == CF_LOOK_LOW && few == CF_LOOK_OK && above == CF_LOOK_OK && none == CF_LOOK_OK,
-		      "lens look against the reading: %d (low), %d (5 s of reading), %d (0.015 above), %d (none)", low, few,
-		      above, none);
+		      "lens look against the reading: %d (0.003 above), %d (5 s of reading), %d (0.008 above), %d (none)", low,
+		      few, above, none);
 		printf("ok: L12 a lens look is too low only against learnt notes resting on enough reading\n");
+	}
+
+	/* L13. Notes just under the camera: reading only 0.014 below the lens look, its height wandering slowly as on
+	 * the user's clips (so a quarter or more of its frames, in runs, read less than CF_NOTES_MIN_GLANCE below the
+	 * lens, some of them above it), is learnt with a lens calibration too, where the eyes read. (Real reading at
+	 * that height was never learnt while the learner left out frames less than CF_NOTES_MIN_GLANCE below the lens:
+	 * its lines fell apart.) */
+	{
+		const float SMALL = 0.014f;
+		rd_wander_sd = 0.006f;
+		int learnt = 0;
+		double tmax = 0;
+		float e_off = 0;
+		for (unsigned k = 0; k < 8; k++) {
+			const rd_result r = rd_session(&p0, RD_READ, W, SMALL, 141 + k, 90.0, 0, 0, 0);
+			if (!r.pubs)
+				continue;
+			learnt++;
+			tmax = fmax(tmax, r.t_first);
+			e_off = fmaxf(e_off, rd_err(&r.first, SMALL, 0));
+		}
+		rd_wander_sd = 0;
+		printf("    reading %.3f below the lens: learnt in %d of 8 sessions (within %.1f s), off by at most %.4f\n",
+		       SMALL, learnt, tmax, e_off);
+		CHECK(learnt >= 7 && e_off <= 0.008f, "reading just under the camera: learnt in %d of 8, off by %.4f", learnt,
+		      e_off);
+		printf("ok: L13 reading just under the camera (0.014 below the lens look) is learnt\n");
 	}
 }
 
