@@ -134,10 +134,8 @@ static void build_sequence(int quick)
 static void build_reading_sequence(int quick)
 {
 	add(ST_TEXT, 0, 0, 6, -1,
-	    "Sit as you do in calls. Keep your head still and follow the dot with your eyes only,
-"
-	    "like reading your notes. When the arrow points up, look straight into the camera lens.
-Starting…");
+	    "Sit as you do in calls. Keep your head still and follow the dot with your eyes only,\n"
+	    "like reading your notes. When the arrow points up, look straight into the camera lens.\nStarting…");
 	add(ST_LENS, 0, 0, 3, -1, "Look into the camera lens");
 	const double half = fmin(12.0, screen_w_cm / 2 - 0.8);
 	const double ys[] = {3, 4.5, 6, 7.5, 9, 10.5, 12};
