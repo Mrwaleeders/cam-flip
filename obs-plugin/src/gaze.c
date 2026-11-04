@@ -2959,8 +2959,10 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		};
 		snap_side = gate(&g->rb_side, &g->side, side, &gs, t, dt);
 		side_f = g->side.value;
+		g->diag_side_mode = snap_side;
 	} else {
 		side_f = g->side.ready ? g->side.value : side_c;
+		g->diag_side_mode = 0;
 		g->rb_side.steady_n = g->rb_side.held_big = g->rb_side.away = g->rb_side.followed = 0;
 		if (g->side.ready)
 			g->side.t = t;

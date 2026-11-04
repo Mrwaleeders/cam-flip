@@ -146,13 +146,14 @@ int main(int argc, char **argv)
 {
 	if (argc < 2) {
 		fprintf(stderr, "usage: replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength s] "
-				"[--scan-damp d] [--out f] [--learn]\n");
+				"[--scan-damp d] [--out f] [--learn] [--notes-learnt] [--trace f]\n");
 		return 2;
 	}
 	int lag = 0;
 	double lens[2] = {0, 0}, notes[2] = {0, 0};
 	float strength = 1.0f, scan_damp = 0.0f;
-	const char *outp = NULL;
+	const char *outp = NULL, *tracep = NULL;
+	int notes_learnt = 0;
 	float cal[5] = {0, 0, 0, 0, 0}; /* baseline, baseline_open, notes_offset, notes_side, notes_open */
 	float lids[2] = {0, 0}, vis[2] = {0, 0}; /* baseline_upper/lower; vis_baseline/notes */
 	int vis_opt = 0;
@@ -199,6 +200,10 @@ int main(int argc, char **argv)
 			vis[1] = (float)atof(argv[++i]), vis_opt |= 2;
 		else if (!strcmp(argv[i], "--learn"))
 			learn = 1;
+		else if (!strcmp(argv[i], "--notes-learnt")) /* the --notes-* given were learnt from reading */
+			notes_learnt = 1;
+		else if (!strcmp(argv[i], "--trace") && i + 1 < argc)
+			tracep = argv[++i];
 	}
 	row_t *rows;
 	const int n = parse(argv[1], &rows);
@@ -219,6 +224,7 @@ int main(int argc, char **argv)
 		p.notes_offset = cal[2];
 		p.notes_side = cal[3];
 		p.notes_open = cal[4];
+		p.notes_learnt = notes_learnt;
 	}
 	p.baseline_upper = lids[0];
 	p.baseline_lower = lids[1];
@@ -277,6 +283,13 @@ int main(int argc, char **argv)
 	FILE *of = outp ? fopen(outp, "w") : NULL;
 	if (of)
 		fprintf(of, "t,n,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,eye_cx0,eye_cy0,pupil_y0,vpupil_y0\n");
+	/* --trace: per analysed frame, the sideways path (local diagnostics: face-derived, keep it on the machine).
+	 * pupil x minus the eye outline's centroid x per eye (px, the refined point), the gate's mode, the shown
+	 * value, the lock and the centre the damping goes by (eye widths), how engaged it is, and the shift asked for
+	 * this very frame (px; lag 0). */
+	FILE *tf = tracep ? fopen(tracep, "w") : NULL;
+	if (tf)
+		fprintf(tf, "t,found,pupil_dx0,pupil_dx1,mode,shown,side_lock,side_centre,engage,lock_f,factor,sx0,sx1\n");
 
 	/* The notes learner (--learn): learnt notes fed back as the plugin saves them, unless notes were given. */
 	const int feed = learn && !(have_cal & 2) && !(notes[1] > notes[0]);
@@ -297,7 +310,15 @@ int main(int argc, char **argv)
 		while (fed < upto) {
 			fed++;
 			cf_eye tmp[2];
-			cf_gaze_update(&g, &rows[fed].face, &p, rows[fed].t, tmp);
+			const int nt = cf_gaze_update(&g, &rows[fed].face, &p, rows[fed].t, tmp);
+			if (tf) {
+				const cf_face *ff = &rows[fed].face;
+				const cf_pt l = centroid(ff->left_eye, ff->left_count), r = centroid(ff->right_eye, ff->right_count);
+				fprintf(tf, "%.4f,%d,%.2f,%.2f,%d,%.5f,%.5f,%.5f,%.3f,%.3f,%.3f,%.2f,%.2f\n", rows[fed].t, ff->found,
+					ff->left_pupil.x - l.x, ff->right_pupil.x - r.x, g.diag_side_mode, g.rb_side.shown,
+					g.side_lock, g.side_centre, g.engage_f, g.lock_f, g.factor, nt ? tmp[0].sx : 0.0,
+					nt > 1 ? tmp[1].sx : 0.0);
+			}
 			if (!learn)
 				continue;
 			const cf_notes_learner *L = &g.learn;
@@ -376,6 +397,8 @@ int main(int argc, char **argv)
 	}
 	if (of)
 		fclose(of);
+	if (tf)
+		fclose(tf);
 
 	int found = 0, warped = 0;
 	double ms = 0, conf = 0;
