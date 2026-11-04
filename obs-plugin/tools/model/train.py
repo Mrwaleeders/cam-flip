@@ -644,6 +644,12 @@ def main():
     ALIGN_MASK = ALIGN_MASKS[a.align_mask]
     dev = torch.device(a.device)
     torch.manual_seed(a.seed)
+    if a.selftest and dev.type == "cpu":
+        # The self-test gates CI, so make it repeatable: a fixed thread count (the order of the sums in
+        # each op depends on it) and deterministic kernels. Otherwise the same code gave a model that
+        # moved the iris 50% of the way on one run and enough on the next.
+        torch.set_num_threads(2)
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     if a.selftest:
         train, val = SyntheticPairs(a.seed), SyntheticPairs(1000 + a.seed)
