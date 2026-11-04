@@ -342,6 +342,68 @@ static void test_speed(void)
 	printf("ok speed: crop + apply %.2f ms per 1080p frame (two eyes, without the model)\n", ms);
 }
 
+/* A synthetic eye in a patch: sclera between two lid curves, an iris (dark centre, textured ring) at
+ * cx, cy, a catchlight up and right, skin texture, and noise. */
+static float iris_noise(unsigned *seed)
+{
+	float s = 0;
+	for (int k = 0; k < 4; k++) {
+		*seed = *seed * 1103515245u + 12345u;
+		s += (float)((*seed >> 8) & 0xffff) / 65535.0f - 0.5f;
+	}
+	return s * 0.7f; /* about unit variance */
+}
+
+static void iris_eye(float *p, float cx, float cy, float lid_down, float noise, unsigned *seed)
+{
+	for (int j = 0; j < CF_ML_H; j++)
+		for (int i = 0; i < CF_ML_W; i++) {
+			const float u = (float)(i - 64) / 40.0f, b = fmaxf(0.0f, 1.0f - u * u);
+			const float up = 34.0f - (15.0f - lid_down) * b, lo = 34.0f + 10.0f * powf(b, 1.2f);
+			float v = 0.62f + 0.04f * sinf((float)i * 0.11f) * cosf((float)j * 0.17f);
+			if ((float)j > up && (float)j < lo) {
+				v = 0.86f - 0.05f * ((float)j - up) / (lo - up + 1.0f);
+				const float r = hypotf((float)i - cx, (float)j - cy);
+				if (r < 15.0f) {
+					v = 0.33f + 0.05f * cosf(atan2f((float)j - cy, (float)i - cx) * 9.0f) + 0.02f * r / 15.0f;
+					if (r < 5.0f)
+						v = 0.08f;
+				}
+				if (hypotf((float)i - (cx + 3.0f), (float)j - (cy - 4.0f)) < 1.6f)
+					v = 0.95f;
+			}
+			p[j * CF_ML_W + i] = v + noise * iris_noise(seed);
+		}
+}
+
+/* cf_ml_iris_x finds the iris to well under a pixel from a guess that, like the tracked pupil, sees only
+ * half of a sideways move, at several lid heights; and reads a move at its full size. */
+static void test_iris_x(void)
+{
+	static float p[N];
+	unsigned seed = 3;
+	double se = 0, worst = 0;
+	int n = 0;
+	for (float lid = 0; lid <= 4.0f; lid += 2.0f)
+		for (float dx = -6.0f; dx <= 6.01f; dx += 0.25f) {
+			iris_eye(p, 64.0f + dx, 31.0f, lid, 0.02f, &seed);
+			const double e = cf_ml_iris_x(p, 64.0f + 0.5f * dx, 31.0f, 10.0f) - (64.0f + dx);
+			se += e * e;
+			worst = fmax(worst, fabs(e));
+			n++;
+		}
+	const double rms = sqrt(se / n);
+	CHECK(rms < 0.25 && worst < 0.6, "iris x error RMS %.3f px, worst %.3f px", rms, worst);
+	iris_eye(p, 62.0f, 31.0f, 0.0f, 0.02f, &seed);
+	const float a = cf_ml_iris_x(p, 63.0f, 31.0f, 10.0f);
+	iris_eye(p, 66.0f, 31.0f, 0.0f, 0.02f, &seed);
+	const float b = cf_ml_iris_x(p, 65.0f, 31.0f, 10.0f);
+	CHECK(fabsf(b - a - 4.0f) < 0.3f, "a 4 px move read as %.2f px", b - a);
+	CHECK(cf_ml_iris_x(p, 64.0f, 200.0f, 10.0f) == 64.0f, "off-patch band should return the guess");
+	printf("ok iris x: RMS %.3f px, worst %.3f px over +-6 px moves; a 4 px move reads %.2f px\n", rms, worst,
+	       b - a);
+}
+
 int main(void)
 {
 	for (int j = 0; j < CF_ML_H; j++)
@@ -357,6 +419,7 @@ int main(void)
 	test_residual_luma_only();
 	test_crop();
 	test_speed();
+	test_iris_x();
 	if (failures) {
 		printf("%d FAILED\n", failures);
 		return 1;

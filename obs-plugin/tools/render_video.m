@@ -47,6 +47,12 @@
  *                      upwards and a look up at the camera is followed within a few frames
  *   --steady-gain G    steady: ask the model for G times the move back to the held point (default 1);
  *                      the model delivers only part of what it's asked, so 1.5-2.5 makes up for that
+ *   --steady-iris M    steady: what measures where the eye looks sideways: tracker (the tracked pupil,
+ *                      default) or true (the iris itself, from its left-right symmetry in the frame;
+ *                      the tracker reads a sideways move at only about half its size, so the hold
+ *                      under-asks and part of the sweep stays)
+ *   --steady-iris-scale C  steady-iris true: ask the model for C times the true move back to the held
+ *                      point (default 0.86: the model moves the iris about 1.16 px per px asked)
  *   --steady-max-ask P steady: never ask the model to move the iris more than P eye-patch px (0 = no cap)
  *   --steady-dwell N   steady: frames a look must stay outside the band before it is followed (default 2;
  *                      1 follows a frame sooner but trips more easily on a noisy pupil)
@@ -454,6 +460,11 @@ int main(int argc, char **argv)
 	float steady_band[3] = {8.0f, 4.0f, 2.5f};
 	int steady_dwell = 2, ml_passes = 1;
 	float steady_gain = 1.0f, steady_max_ask = 0.0f;
+	int steady_iris = 0;               /* --steady-iris true */
+	float steady_iris_scale = 0.86f;
+	float tracker_x[2][3] = {{0}};     /* last three tracked pupil x per eye (patch px), for its median */
+	int tracker_n[2] = {0, 0};
+	static float iris_patch[CF_ML_H * CF_ML_W];
 	steady_eye steady[2];
 	memset(steady, 0, sizeof(steady));
 	int steady_snaps[3] = {0, 0, 0}; /* looks followed: sideways, down, up */
@@ -495,6 +506,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
 		else if (!strcmp(a, "--ml-passes")) { ml_passes = atoi(v) < 1 ? 1 : atoi(v) > 4 ? 4 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-max-ask")) { steady_max_ask = (float)atof(v); i++; }
+		else if (!strcmp(a, "--steady-iris")) { steady_iris = !strcmp(v, "true"); i++; }
+		else if (!strcmp(a, "--steady-iris-scale")) { steady_iris_scale = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-gain")) { steady_gain = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-dwell")) { steady_dwell = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f,%f", &steady_band[0], &steady_band[1], &steady_band[2]); i++; }
@@ -734,7 +747,7 @@ int main(int argc, char **argv)
 		 * yaw, pitch: the smoothed head pose (pose.c, degrees from the calibrated one) its fade used. */
 		fprintf(csv, "t,n,factor,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,in_ly,in_ry,out_ly,out_ry,"
 			     "l_open,l_ref,l_vis,r_open,r_ref,r_vis,yaw,pitch,"
-			     "ml_tx0,ml_ty0,ml_tx1,ml_ty1,ml_a0,ml_a1,ml_px0,ml_py0,ml_px1,ml_py1\n");
+			     "ml_tx0,ml_ty0,ml_tx1,ml_ty1,ml_a0,ml_a1,ml_px0,ml_py0,ml_px1,ml_py1,ml_ix0,ml_ix1\n");
 
 		size_t cap = 4096, nm = 0;
 		meas_t *m = calloc(cap, sizeof(meas_t));
@@ -842,7 +855,7 @@ int main(int argc, char **argv)
 				cf_eye eyes[2];
 				memset(eyes, 0, sizeof(eyes));
 				/* Eye model log for frames.csv, per eye in the image's order: target, effect, pupil seen. */
-				float mlt[2][2] = {{0}}, mla[2] = {0}, mlp[2][2] = {{0}};
+				float mlt[2][2] = {{0}}, mla[2] = {0}, mlp[2][2] = {{0}}, mli[2] = {0}; /* mli: true iris x (image px), --steady-iris true */
 				const int n = cf_gaze_predict(&gaze, &p, t, eyes);
 				cf_gaze_status st;
 				cf_gaze_get_status(&gaze, &st);
@@ -884,6 +897,26 @@ int main(int argc, char **argv)
 								 * elsewhere: follow it (see steady_update). */
 								float px, py;
 								cf_ml_to_patch(&fr, pu.x + (eyes[e].cx - c.x), pu.y + (eyes[e].cy - c.y), &px, &py);
+								/* --steady-iris true: hold on where the iris itself is (measured on the
+								 * uncorrected frame), and keep the tracked x's own median to ask from,
+								 * since the model reads its target on the tracker's scale. */
+								float tmed = px;
+								if (steady_iris) {
+									float *h = tracker_x[flip];
+									h[0] = h[1];
+									h[1] = h[2];
+									h[2] = px;
+									if (tracker_n[flip] < 3)
+										tracker_n[flip]++;
+									if (tracker_n[flip] == 3) {
+										const float a = h[0], b = h[1], d = h[2];
+										tmed = fmaxf(fminf(a, b), fminf(fmaxf(a, b), d));
+									}
+									cf_ml_crop(&ch[0], &fr, iris_patch);
+									px = cf_ml_iris_x(iris_patch, px, py, 10.0f);
+									float iy;
+									cf_ml_to_image(&fr, px, py, &mli[e], &iy);
+								}
 								const float *hd = steady_update(&steady[flip], px, py, t, st.blinking, steady_band,
 											       steady_dwell, steady_snaps);
 								/* The model moves the iris only part of the way it's asked (about 40-65%
@@ -893,13 +926,16 @@ int main(int argc, char **argv)
 								const float g = steady_gain;
 								float ask[2] = {se->med[0] + g * (hd[0] - se->med[0]),
 										se->med[1] + g * (hd[1] - se->med[1])};
+								if (steady_iris)
+									ask[0] = tmed + g * steady_iris_scale * (hd[0] - se->med[0]);
 								/* Big asks (right after a long line return) leave a thin dark rim at the
 								 * iris edge for a few frames: --steady-max-ask caps how far the iris is
 								 * asked to move from where it is, letting the rest of the jump through. */
-								const float ax = ask[0] - se->med[0], ay = ask[1] - se->med[1];
+								const float bx = steady_iris ? tmed : se->med[0];
+								const float ax = ask[0] - bx, ay = ask[1] - se->med[1];
 								const float al = hypotf(ax, ay);
 								if (steady_max_ask > 0 && al > steady_max_ask) {
-									ask[0] = se->med[0] + ax * steady_max_ask / al;
+									ask[0] = bx + ax * steady_max_ask / al;
 									ask[1] = se->med[1] + ay * steady_max_ask / al;
 								}
 								cf_ml_to_image(&fr, ask[0], ask[1], &tgt[e][0], &tgt[e][1]);
@@ -991,11 +1027,12 @@ int main(int argc, char **argv)
 					    &em[1][0], &em[1][1], &em[1][2]);
 				fprintf(csv,
 					"%.4f,%d,%.3f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-					"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f\n",
+					"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
 					t, n, st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
 					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1], em[0][0],
 					em[0][1], em[0][2], em[1][0], em[1][1], em[1][2], gaze.pose.yaw, gaze.pose.pitch,
-					mlt[0][0], mlt[0][1], mlt[1][0], mlt[1][1], mla[0], mla[1], mlp[0][0], mlp[0][1], mlp[1][0], mlp[1][1]);
+					mlt[0][0], mlt[0][1], mlt[1][0], mlt[1][1], mla[0], mla[1], mlp[0][0], mlp[0][1], mlp[1][0], mlp[1][1],
+					mli[0], mli[1]);
 
 				/* Writers, sized on the first frame. The close-up crop is fixed from the first face. */
 				if (!wfull) {

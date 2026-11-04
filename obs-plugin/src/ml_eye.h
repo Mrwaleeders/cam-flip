@@ -51,6 +51,13 @@ void cf_ml_to_image(const cf_ml_frame *f, float px, float py, float *x, float *y
  * to bottom (bilinear; outside the frame repeats the edge). */
 void cf_ml_crop(const cf_channel *luma, const cf_ml_frame *f, float *out);
 
+/* Where the iris centre sits across the eye in a cropped patch (patch x), from the iris's own left-right
+ * symmetry in a band of rows just below the pupil centre py: the x within +-search of x_guess about which
+ * the brightness profile is most mirror-like. Sub-pixel. Unlike the tracked pupil, which reads a sideways
+ * move at only about half its size on real eyes, this follows the iris itself. Returns x_guess if the band
+ * is off the patch. */
+float cf_ml_iris_x(const float *patch, float x_guess, float py, float search);
+
 /* The model's answer for one eye, each CF_ML_H x CF_ML_W, row major. */
 typedef struct {
 	const float *flow_x, *flow_y; /* patch px: output(p) = input(p + flow(p)) */

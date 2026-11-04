@@ -116,6 +116,54 @@ void cf_ml_crop(const cf_channel *luma, const cf_ml_frame *f, float *out)
 		}
 }
 
+float cf_ml_iris_x(const float *patch, float x_guess, float py, float search)
+{
+	/* Mean of rows py+1 .. py+5: through the iris, below the pupil's catchlight. */
+	const int y0 = (int)floorf(py + 1.0f), y1 = y0 + 4;
+	if (y0 < 0 || y1 >= CF_ML_H)
+		return x_guess;
+	float prof[CF_ML_W];
+	for (int i = 0; i < CF_ML_W; i++) {
+		float s = 0;
+		for (int j = y0; j <= y1; j++)
+			s += patch[j * CF_ML_W + i];
+		prof[i] = s / (float)(y1 - y0 + 1);
+	}
+	/* Asymmetry about x: mean |p(x+u) - p(x-u)| for u = 2..R (the iris, its edges and some white). */
+	enum { R = 20 };
+	float cost[129];
+	const float step = 0.5f;
+	int n = 0;
+	for (float x = x_guess - search; x <= x_guess + search + 1e-3f && n < 129; x += step, n++) {
+		float c = 0;
+		int m = 0;
+		for (int u = 2; u <= R; u++) {
+			const float a = x - (float)u, b = x + (float)u;
+			if (a < 0 || b > CF_ML_W - 1)
+				continue;
+			const int ia = (int)a, ib = (int)b;
+			const float fa = a - (float)ia, fb = b - (float)ib;
+			const float va = prof[ia] * (1 - fa) + prof[ia + 1 < CF_ML_W ? ia + 1 : ia] * fa;
+			const float vb = prof[ib] * (1 - fb) + prof[ib + 1 < CF_ML_W ? ib + 1 : ib] * fb;
+			c += fabsf(va - vb);
+			m++;
+		}
+		cost[n] = m ? c / (float)m : 1e9f;
+	}
+	int best = 0;
+	for (int k = 1; k < n; k++)
+		if (cost[k] < cost[best])
+			best = k;
+	float off = 0;
+	if (best > 0 && best < n - 1) {
+		const float a = cost[best - 1], b = cost[best], c = cost[best + 1];
+		const float d = a - 2 * b + c;
+		if (d > 1e-9f)
+			off = 0.5f * (a - c) / d;
+	}
+	return x_guess - search + ((float)best + off) * step;
+}
+
 /* Bilinear lookup in a patch-sized map; 0 outside. */
 static inline float map_at(const float *m, float px, float py)
 {
