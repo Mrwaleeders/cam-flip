@@ -118,7 +118,7 @@ def render(src, flow, res, mask, grid):
 def ellipse_map(cx, cy, rx, ry, inner, outer, device):
     ys, xs = torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij")
     r = torch.sqrt(((xs - cx) / rx) ** 2 + ((ys - cy) / ry) ** 2)
-    return (r < 1).float() * inner + (r >= 1).float() * outer
+    return ((r < 1).float() * inner + (r >= 1).float() * outer).to(device)
 
 
 # ---------------------------------------------------------------- data
