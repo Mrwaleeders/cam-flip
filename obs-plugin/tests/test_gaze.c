@@ -1137,10 +1137,12 @@ static void test_head_lids(void)
 		printf("ok: a blink holds the head and lid terms too\n");
 	}
 
-	/* H7. Strength over 100%: the iris (and the upper lid that follows it) is lifted proportionally more,
-	 * the lids are restored no further than the lens opening, and the warp's cap still holds. */
+	/* H7. Strength over 100%: the eyes' share of the iris lift (and the upper lid that follows it) is lifted
+	 * proportionally more, the head's share (measured from the head, not under-read like the pupil) at most
+	 * once, the lids are restored no further than the lens opening, and the warp's cap still holds (eyes twice
+	 * the notes glance with the head 14 deg down: further down, the head counts as looking past the notes). */
 	{
-		float iris[2], lid_x[2], low[2];
+		float iris[2], lid_x[2], low[2], head_px = 0;
 		for (int k = 0; k < 2; k++) {
 			cf_gaze_params ps = p;
 			ps.strength = k ? 2.0f : 1.0f;
@@ -1154,6 +1156,8 @@ static void test_head_lids(void)
 			iris[k] = o.iris;
 			lid_x[k] = o.lid - HL_LID_SHIFT * o.iris;
 			low[k] = o.low;
+			if (!k)
+				head_px = HL_EYE_K * sinf(fmaxf(g.pose.pitch, 0) * 0.017453293f) * (float)g.rx[0].value;
 		}
 		cf_gaze_params ps = p;
 		ps.strength = 5.0f; /* clamped to 2 */
@@ -1161,17 +1165,18 @@ static void test_head_lids(void)
 		double t = 800.0;
 		int n = 0;
 		for (int i = 0; i < 90; i++, t += dt) {
-			const hl_state s = {.glance = 0.04f, .pitch = 18, .up_drop = 0.02f, .lo_rise = 0.01f};
+			const hl_state s = {.glance = 0.04f, .pitch = 14, .up_drop = 0.02f, .lo_rise = 0.01f};
 			n = update(&g, face_hl(s, 0), &ps, t, out);
 		}
 		float ext_y = 0;
 		for (int k = 0; k < out[0].aperture_count; k++)
 			ext_y = fmaxf(ext_y, fabsf(out[0].aperture[k][1] - out[0].cy));
 		const float cap = fminf(0.38f * out[0].ry, 0.5f * (out[0].ry - ext_y)), big = hl_read(n, &out[0]).iris;
-		printf("    strength 100%% -> 200%%: iris %.2f -> %.2f px, lid restore %.2f -> %.2f, lower lid %.2f -> %.2f; "
-		       "500%% far down: %.2f px (cap %.2f)\n",
-		       iris[0], iris[1], lid_x[0], lid_x[1], low[0], low[1], big, cap);
-		CHECK(fabsf(iris[1] - 2.0f * iris[0]) < 0.05f * iris[0] && fabsf(lid_x[1] - lid_x[0]) < 0.05f &&
+		const float want2 = 2.0f * (iris[0] - head_px) + head_px;
+		printf("    strength 100%% -> 200%%: iris %.2f -> %.2f px (want %.2f: the head's %.2f once), lid restore %.2f -> "
+		       "%.2f, lower lid %.2f -> %.2f; 500%% far down: %.2f px (cap %.2f)\n",
+		       iris[0], iris[1], want2, head_px, lid_x[0], lid_x[1], low[0], low[1], big, cap);
+		CHECK(fabsf(iris[1] - want2) < 0.05f * iris[0] && fabsf(lid_x[1] - lid_x[0]) < 0.05f &&
 			      fabsf(low[1] - low[0]) < 0.05f,
 		      "strength 200%%: iris %.2f vs %.2f, lids %.2f vs %.2f, %.2f vs %.2f", iris[1], iris[0], lid_x[1], lid_x[0],
 		      low[1], low[0]);
@@ -1181,8 +1186,8 @@ static void test_head_lids(void)
 	}
 
 	/* H8. The head turned while reading, the eyes turning back in the head to the notes: half of the turn is
-	 * made up for sideways (the sideways damping acts on the eyes plus half the head). Eyes alone scanning
-	 * a line are damped exactly as before. */
+	 * made up for sideways, by HEAD_DAMP (0.65; the eyes' own scanning by READ_DAMP, 0.95). Eyes alone
+	 * scanning a line are damped by READ_DAMP. */
 	{
 		const float yaw = 8.0f;
 		float h[2];
@@ -1201,16 +1206,16 @@ static void test_head_lids(void)
 			h[k] = o.side;
 			if (k) {
 				const float eyes = -HL_EYE_K * sinf(1.2f * yaw * 0.017453293f);
-				const float want = -0.65f * (eyes + 0.5f * HL_EYE_K * sinf(meas * 0.017453293f)) * HW;
+				const float want = -(0.95f * eyes + 0.65f * 0.5f * HL_EYE_K * sinf(meas * 0.017453293f)) * HW;
 				printf("    head turned %.0f deg (reads %.1f), eyes back on the notes: sideways shift %.2f px (%.2f "
 				       "expected, %.2f without the head)\n",
-				       yaw, meas, h[1], want, -0.65f * eyes * HW);
+				       yaw, meas, h[1], want, -0.95f * eyes * HW);
 				CHECK(fabsf(h[1] - want) < 0.15f + 0.05f * fabsf(want), "head turn: sideways %.2f px, want %.2f", h[1],
 				      want);
 			} else {
 				printf("    eyes 0.08 sideways on a line: sideways shift %.2f px (%.2f expected)\n", h[0],
-				       -0.65f * 0.08f * HW);
-				CHECK(fabsf(h[0] + 0.65f * 0.08f * HW) < 0.15f, "eyes scanning: sideways %.2f px", h[0]);
+				       -0.95f * 0.08f * HW);
+				CHECK(fabsf(h[0] + 0.95f * 0.08f * HW) < 0.15f, "eyes scanning: sideways %.2f px", h[0]);
 			}
 		}
 		printf("ok: half the head's turn is made up for sideways, the eyes' scanning damped as before\n");
@@ -1264,6 +1269,189 @@ static void test_head_lids(void)
 	}
 	hl_head_noise = 0.5f;
 	printf("ok: head and lid terms add no visible jitter\n");
+
+	/* H10. To the keyboard (0.17 eye widths past the notes, ~34 deg down in all) with the head following
+	 * part of the way. Eyes first: they jump down, then turn back up in the head as the head tilts down to 28
+	 * deg, ending 0.04 down in the head, inside the reading band; the gate takes that slow turn in one step,
+	 * like a look back up. Head first: the head tilts to 22 deg with the eyes still in the head, then the eyes
+	 * jump down. Either way the correction lets go and stays let go: under 0.5 px over the last second, and
+	 * it never grows by more than the head term's slew in a frame while looking away. */
+	{
+		const float s6 = sinf(6.0f * 0.017453293f);
+		for (int c = 0; c < 2; c++) {
+			const float head_to = c ? 22.0f : 28.0f;
+			cf_gaze_init(&g);
+			double t = 1300.0;
+			const hl_state rd = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+			hl_out o = {0, 0, 0, 0};
+			for (int i = 0; i < 60; i++, t += dt)
+				o = hl_read(update(&g, face_hl(rd, 0), &p, t, out), &out[0]);
+			const float before = o.iris;
+			float rise = 0, late = 0, prev = o.iris;
+			for (int i = 0; i < 75; i++, t += dt) {
+				/* the head: 6 deg -> head_to over 0.5 s (eyes first: from the 3rd frame; head first: at once) */
+				const int h0 = c ? 0 : 2, e0 = c ? 21 : 0;
+				const float kh = fminf(fmaxf((float)(i - h0) / 15.0f, 0.0f), 1.0f);
+				const float ke = fminf(fmaxf((float)(i - e0) / 2.0f, 0.0f), 1.0f);
+				const float pitch = hl_lerp(6, head_to, kh * kh * (3 - 2 * kh));
+				/* the eyes in the head: from the notes to the keyboard, less what the head tilted further than
+				 * reading (before they jump, head first, they ride with the head) */
+				const float kbd = 0.19f - HL_EYE_K * (sinf(pitch * 0.017453293f) - s6);
+				const hl_state s = {hl_lerp(0.02f, kbd, ke), 0, pitch, 0, hl_lerp(0.01f, 0.04f, ke), hl_lerp(0.01f, 0.0f, ke), 0};
+				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+				rise = fmaxf(rise, o.iris - prev);
+				prev = o.iris;
+				if (i >= 45)
+					late = fmaxf(late, o.iris);
+			}
+			printf("    keyboard, %s (head to %.0f deg): %.2f px before; while away it grew by %.2f px a frame at most, "
+			       "%.2f px at most over the last second\n",
+			       c ? "head first" : "eyes first", head_to, before, rise, late);
+			CHECK(late < 0.5f && rise < HL_HEAD_SLEW_PX + 0.1f, "keyboard %s: %.2f px left, grew %.2f px in a frame",
+			      c ? "head first" : "eyes first", late, rise);
+		}
+		printf("ok: a look past the notes carried by the head lets go and stays let go\n");
+	}
+
+	/* H11. From reading (head 6 deg down) to someone 25 deg to the side at lens height: the eyes turn up in
+	 * the head by the head's tilt, the head stays down for 0.3 s, then comes up level over 0.5 s, the eyes
+	 * turning back down in it. The pupil reads only 0.65 of that turn up (as a real one may), and is noisy.
+	 * At the lens the head term and the eyes' turn up then cancel only to about 0: that must not engage the
+	 * sideways damping (it would pull the whole side look back towards the middle for a few frames). Over 20
+	 * noise seeds the sideways shift stays under 1.5 px. */
+	{
+		float worst = 0;
+		for (int sd = 0; sd < 20; sd++) {
+			cf_gaze_init(&g);
+			rng_seed(500 + 31 * sd);
+			double t = 1400.0;
+			const hl_state rd = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+			for (int i = 0; i < 60; i++, t += dt)
+				update(&g, face_hl(rd, 0.3f), &p, t, out);
+			for (int i = 0; i < 45; i++, t += dt) {
+				const float k = fminf(fmaxf((float)(i - 9) / 15.0f, 0.0f), 1.0f), pitch = 6.0f * (1 - k * k * (3 - 2 * k));
+				const hl_state s = {-0.65f * HL_EYE_K * sinf(pitch * 0.017453293f), 0.16f, pitch, 0, 0, 0, 0};
+				const hl_out o = hl_read(update(&g, face_hl(s, 0.3f), &p, t, out), &out[0]);
+				worst = fmaxf(worst, fabsf(o.side));
+			}
+		}
+		printf("    side look at lens height, head coming up level: sideways shift %.2f px at most over 20 seeds\n", worst);
+		CHECK(worst < 1.5f, "side look at the lens: sideways shift %.2f px", worst);
+		printf("ok: a look to the side at lens height is not damped back\n");
+	}
+}
+
+/* ---- Reading scan (check S1)
+ *
+ * Eyes reading lines on the notes: 8 fixations 0.3 s apart sweep the iris 6 px along a 75 px eye, then a
+ * return saccade. The refined points take in 86% of a sideways move (as cf_refine_pupil does on rendered
+ * eyes, 60-120 px wide), with 0.5 px noise; Vision's points follow `rvs` of it (0.3 px noise), while up
+ * and down they follow 0.6 (the calibrations' gain). The eyes as seen (true position plus the sideways
+ * shift; the warp's own shortfall not counted) over the last 6 of 14 lines: the middle 90% of their range
+ * against the true one, their regression on it, and the largest frame-to-frame move. */
+#define SC_W 75.0f
+static cf_face sc_face(float glance, float side_px, float rvs)
+{
+	cf_face f;
+	memset(&f, 0, sizeof(f));
+	f.found = 1;
+	f.image_width = 1920;
+	f.image_height = 1080;
+	f.face_width = 380;
+	f.has_pose = 1;
+	const float gpx = glance * SC_W, h = 23.0f;
+	const float cx[2] = {960 - 1.5f * SC_W, 960 + 1.5f * SC_W};
+	for (int e = 0; e < 2; e++) {
+		cf_pt *pts = e == 0 ? f.left_eye : f.right_eye;
+		for (int i = 0; i < 16; i++) {
+			const float a = (float)i / 16.0f * 6.2831853f, sn = sinf(a);
+			pts[i].x = cx[e] + 0.5f * SC_W * cosf(a);
+			pts[i].y = 500 + 0.5f * h * sn + (sn < -1e-3f ? 0.5f * gpx * -sn : 0.0f);
+		}
+		const cf_pt pupil = {cx[e] + 0.86f * side_px + gauss(0.5f), 500 + gpx + gauss(0.5f)};
+		const cf_pt vp = {cx[e] + rvs * side_px + gauss(0.3f), 500 + 0.6f * gpx + gauss(0.3f)};
+		if (e == 0) {
+			f.left_count = 16;
+			f.left_pupil = pupil;
+			f.left_pupil_vision = vp;
+		} else {
+			f.right_count = 16;
+			f.right_pupil = pupil;
+			f.right_pupil_vision = vp;
+		}
+	}
+	f.has_vision_pupils = 1;
+	return f;
+}
+
+static int sc_cmp(const void *a, const void *b)
+{
+	const float x = *(const float *)a, y = *(const float *)b;
+	return x < y ? -1 : x > y;
+}
+
+static float sc_range90(const float *v, int n)
+{
+	float c[600];
+	memcpy(c, v, sizeof(float) * (size_t)n);
+	qsort(c, (size_t)n, sizeof(float), sc_cmp);
+	return c[(int)(0.95 * (n - 1))] - c[(int)(0.05 * (n - 1))];
+}
+
+static void test_side_scan(void)
+{
+	const float rvs[3] = {0.6f, 0.15f, 0.04f};
+	for (int c = 0; c < 3; c++) {
+		cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = 23.0f / SC_W,
+				    .has_notes = 1, .notes_offset = -0.10f, .notes_side = 0.0f,
+				    .notes_open = (23.0f - 0.05f * SC_W) / SC_W, .has_vis_calib = 1, .vis_baseline = 0,
+				    .vis_notes = -0.06f};
+		cf_gaze g;
+		cf_gaze_init(&g);
+		cf_eye out[2];
+		rng_seed(77 + (unsigned)c);
+		const double dt = 1.0 / 30;
+		const int line = 72, start = 180, lines = 14, from = start + 8 * line;
+		float tru[600], app[600], prev = 0, worst = 0;
+		int n = 0;
+		for (int i = 0; i < start + lines * line; i++) {
+			float side = -3.0f;
+			if (i >= start)
+				side = -3.0f + 6.0f * (float)(((i - start) % line) / 9) / 7.0f;
+			const cf_face f = sc_face(i < 90 ? 0.0f : 0.10f, side, rvs[c]);
+			const int k = cf_gaze_update(&g, &f, &p, 100.0 + i * dt, out);
+			const float a = side + (k ? 0.5f * (out[0].sx + out[1].sx) : 0.0f);
+			if (i >= from && n < 600) {
+				if (n)
+					worst = fmaxf(worst, fabsf(a - prev));
+				tru[n] = side;
+				app[n++] = a;
+			}
+			prev = a;
+		}
+		double mt = 0, ma = 0, sta = 0, stt = 0;
+		for (int i = 0; i < n; i++) {
+			mt += tru[i] / n;
+			ma += app[i] / n;
+		}
+		for (int i = 0; i < n; i++) {
+			sta += (tru[i] - mt) * (app[i] - ma);
+			stt += (tru[i] - mt) * (tru[i] - mt);
+		}
+		const float ratio = sc_range90(app, n) / sc_range90(tru, n), slope = (float)(sta / stt);
+		printf("    Vision following %.0f%% sideways: scan %.2f -> %.2f px (%.2f stays, regression %.2f), largest "
+		       "step %.2f px (the return is 6), Vision scaled x%.2f%s\n",
+		       100 * rvs[c], sc_range90(tru, n), sc_range90(app, n), ratio, slope, worst, g.svk,
+		       g.side_novis ? ", not used sideways" : "");
+		CHECK(ratio > 0.15f && ratio < 0.45f && slope > 0.1f && worst < 2.5f,
+		      "reading scan, Vision following %.0f%% sideways: %.2f of the scan stays (regression %.2f), step %.2f px",
+		      100 * rvs[c], ratio, slope, worst);
+		if (c == 1)
+			CHECK(fabsf(g.svk - 0.86f / 0.15f / (0.10f / 0.06f)) < 0.2f * 0.86f / 0.15f / (0.10f / 0.06f),
+			      "Vision's sideways scale %.2f", g.svk);
+	}
+	printf("ok: S1 reading scan damped to a quarter or a third, whatever Vision's sideways point follows, the line "
+	       "returns taken within the saccade\n");
 }
 
 int main(void)
@@ -3449,6 +3637,7 @@ int main(void)
 	}
 	test_pose();
 	test_head_lids();
+	test_side_scan();
 
 	if (failures) {
 		printf("%d FAILED\n", failures);
