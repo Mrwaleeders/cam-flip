@@ -41,8 +41,10 @@
  *                      you look like you're watching them, with no reading sweep or line returns;
  *                      lens: where your iris sits looking into the lens (if the model learnt it);
  *                      follow: the tracked pupil plus the classic warp's shift (keeps the sweep)
- *   --steady-band X,Y  steady: how far the pupil may move from the held point, in eye-patch px (eye
- *                      width 80), before it counts as a look elsewhere (default 8,4)
+ *   --steady-band X,D,U  steady: how far the pupil may move from the held point, in eye-patch px (eye
+ *                      width 80), before it counts as a look elsewhere: X either side, D down, U up
+ *                      (default 8,4,1.5). Reading only ever moves down a page, so any clear move up (to
+ *                      the camera, say) is followed at once
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
  *   --ml-alpha F       scale the model's effect (default 1)
  *   --learn            print the notes learnt from the reading as they are handed out (and the final
@@ -354,7 +356,7 @@ int main(int argc, char **argv)
 	enum cf_ml_compute ml_compute = CF_ML_ALL;
 	double ml_ms = 0, ml_ms_max = 0;
 	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
-	float steady_band[2] = {8.0f, 4.0f}, steady_hold[2][2] = {{0}}, steady_tau = 3.0f;
+	float steady_band[3] = {8.0f, 4.0f, 1.5f}, steady_hold[2][2] = {{0}}, steady_tau = 3.0f;
 	int steady_has[2] = {0, 0};
 	double steady_t[2] = {0, 0};
 	float ml_alpha = 1.0f;
@@ -393,7 +395,7 @@ int main(int argc, char **argv)
 			i++;
 		}
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
-		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f", &steady_band[0], &steady_band[1]); i++; }
+		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f,%f", &steady_band[0], &steady_band[1], &steady_band[2]); i++; }
 		else if (!strcmp(a, "--ml-res")) { ml_res = atoi(v); i++; }
 		else if (!strcmp(a, "--ml-alpha")) { ml_alpha = (float)atof(v); i++; }
 		else if (!strcmp(a, "--learn")) learn = 1;
@@ -772,13 +774,15 @@ int main(int argc, char **argv)
 								/* Steady: the pupil (no classic shift) in eye-patch px, so head moves
 								 * don't count. Within the band it is reading along a line or down the
 								 * notes: hold, drifting slowly to the middle of it. Outside, a real look
-								 * elsewhere: go there at once. Held through blinks. */
+								 * elsewhere: go there at once. The band is small upwards (reading never
+								 * goes up), so a look at the camera passes straight through. Held through
+								 * blinks. */
 								float px, py;
 								cf_ml_to_patch(&fr, pu.x + (eyes[e].cx - c.x), pu.y + (eyes[e].cy - c.y), &px, &py);
 								float *hd = steady_hold[flip];
 								const float dt = steady_has[flip] ? (float)fmax(0.0, t - steady_t[flip]) : 0.0f;
 								if (!steady_has[flip] || fabsf(px - hd[0]) > steady_band[0] ||
-								    fabsf(py - hd[1]) > steady_band[1]) {
+								    py - hd[1] > steady_band[1] || hd[1] - py > steady_band[2]) {
 									hd[0] = px;
 									hd[1] = py;
 									steady_has[flip] = 1;
