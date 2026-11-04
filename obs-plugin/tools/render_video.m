@@ -47,6 +47,7 @@
  *                      upwards and a look up at the camera is followed within a few frames
  *   --steady-gain G    steady: ask the model for G times the move back to the held point (default 1);
  *                      the model delivers only part of what it's asked, so 1.5-2.5 makes up for that
+ *   --steady-max-ask P steady: never ask the model to move the iris more than P eye-patch px (0 = no cap)
  *   --steady-dwell N   steady: frames a look must stay outside the band before it is followed (default 2;
  *                      1 follows a frame sooner but trips more easily on a noisy pupil)
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
@@ -450,7 +451,7 @@ int main(int argc, char **argv)
 	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
 	float steady_band[3] = {8.0f, 4.0f, 2.5f};
 	int steady_dwell = 2;
-	float steady_gain = 1.0f;
+	float steady_gain = 1.0f, steady_max_ask = 0.0f;
 	steady_eye steady[2];
 	memset(steady, 0, sizeof(steady));
 	int steady_snaps[3] = {0, 0, 0}; /* looks followed: sideways, down, up */
@@ -490,6 +491,7 @@ int main(int argc, char **argv)
 			i++;
 		}
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
+		else if (!strcmp(a, "--steady-max-ask")) { steady_max_ask = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-gain")) { steady_gain = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-dwell")) { steady_dwell = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f,%f", &steady_band[0], &steady_band[1], &steady_band[2]); i++; }
@@ -886,8 +888,17 @@ int main(int argc, char **argv)
 								 * (gain - 1) times again its distance from where the eye is. */
 								const steady_eye *se = &steady[flip];
 								const float g = steady_gain;
-								const float ask[2] = {se->med[0] + g * (hd[0] - se->med[0]),
-										      se->med[1] + g * (hd[1] - se->med[1])};
+								float ask[2] = {se->med[0] + g * (hd[0] - se->med[0]),
+										se->med[1] + g * (hd[1] - se->med[1])};
+								/* Big asks (right after a long line return) leave a thin dark rim at the
+								 * iris edge for a few frames: --steady-max-ask caps how far the iris is
+								 * asked to move from where it is, letting the rest of the jump through. */
+								const float ax = ask[0] - se->med[0], ay = ask[1] - se->med[1];
+								const float al = hypotf(ax, ay);
+								if (steady_max_ask > 0 && al > steady_max_ask) {
+									ask[0] = se->med[0] + ax * steady_max_ask / al;
+									ask[1] = se->med[1] + ay * steady_max_ask / al;
+								}
 								cf_ml_to_image(&fr, ask[0], ask[1], &tgt[e][0], &tgt[e][1]);
 							}
 						}
