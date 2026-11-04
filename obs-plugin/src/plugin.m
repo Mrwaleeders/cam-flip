@@ -340,6 +340,7 @@ static cf_gaze_params params_locked(const struct camflip *f)
 		p.notes_open = f->learnt.open;
 		p.has_vis_calib = (f->vis_cal & 1) && f->learnt.has_vis ? 1 : 0;
 		p.vis_notes = f->learnt.vis_offset;
+		p.notes_seconds = f->learnt.seconds; /* (how much reading they rest on: the weight they start with) */
 	}
 	return p;
 }
