@@ -14,6 +14,7 @@ struct cf_ml_model {
 	void *in_patch; /* MLMultiArray [2,1,H,W] float32, retained */
 	void *in_target;
 	int has_lens;
+	float open[2]; /* outline height / width looking into the lens (0: unknown) */
 	float lens[2][2]; /* iris looking into the lens, patch px: eye left in the image, mirrored eye */
 	float flow_x[2][PN], flow_y[2][PN], res[2][PN], mask[2][PN];
 };
@@ -94,6 +95,9 @@ cf_ml_model *cf_ml_load(const char *path, enum cf_ml_compute compute, char *err,
 		if (lens && sscanf(lens.UTF8String, "%f %f %f %f", &m->lens[0][0], &m->lens[0][1], &m->lens[1][0],
 				   &m->lens[1][1]) == 4)
 			m->has_lens = 1;
+		NSString *op = model.modelDescription.metadata[MLModelCreatorDefinedKey][@"camflip.open"];
+		if (op && sscanf(op.UTF8String, "%f %f", &m->open[0], &m->open[1]) != 2)
+			m->open[0] = m->open[1] = 0;
 		return m;
 	}
 }
@@ -208,6 +212,25 @@ int cf_ml_lens_target(const cf_ml_model *m, const cf_eye *eyes, int n, int e, fl
 	return 1;
 }
 
+/* 1 with the eye as open as looking into the lens, fading to 0 as it closes (a blink): the model was
+ * never shown a closing eye and smudges it. 1 if the model doesn't know the lens opening. */
+static float open_weight(const cf_ml_model *m, const cf_eye *e, int flip, const cf_ml_frame *fr)
+{
+	const float ref = m->open[flip];
+	if (ref <= 0 || e->aperture_count < 3)
+		return 1.0f;
+	float lo = 1e9f, hi = -1e9f;
+	for (int i = 0; i < e->aperture_count; i++) {
+		float px, py;
+		cf_ml_to_patch(fr, e->aperture[i][0], e->aperture[i][1], &px, &py);
+		lo = fminf(lo, py);
+		hi = fmaxf(hi, py);
+	}
+	const float r = (hi - lo) / (CF_ML_CORNER_R - CF_ML_CORNER_L) / ref;
+	const float t = fminf(1.0f, fmaxf(0.0f, (r - 0.45f) / (0.7f - 0.45f)));
+	return t * t * (3 - 2 * t);
+}
+
 int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *channels, int count,
 		  unsigned res_channels, const cf_eye *eyes, int n, const float (*target_img)[2], const float *alpha,
 		  double *ms)
@@ -227,7 +250,7 @@ int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *chan
 		if (!cf_ml_eye_frame(&eyes[e], flip, &fr[k]))
 			continue;
 		use[k] = eyes[e];
-		a[k] = alpha[e];
+		a[k] = alpha[e] * open_weight(m, &eyes[e], flip, &fr[k]);
 		cf_ml_crop(luma, &fr[k], patches[k]);
 		float px, py;
 		cf_ml_to_patch(&fr[k], target_img[e][0], target_img[e][1], &px, &py);

@@ -3,6 +3,7 @@
  * camera records at full quality. Head still, eyes only. About 4 minutes.
  *
  *   tools/model/capture.sh --distance 60          (centimetres from your eyes to the screen)
+ *   tools/model/capture.sh --distance 60 --reading   (reading-focused session, about 3 minutes)
  *
  * The sequence:
  *   1. a grid of dots over the whole screen (up to 20 cm either side of the camera and down to the
@@ -51,6 +52,7 @@ static void add(step_kind k, double x, double y, double dur, int line, const cha
 
 /* Screen geometry */
 static double pt_per_cm, cam_above_cm = 0.5, screen_w_cm, screen_h_cm;
+static int reading_mode;
 static NSRect screen_frame;
 
 static NSPoint cm_to_pt(double x_cm, double y_cm)
@@ -121,6 +123,50 @@ static void build_sequence(int quick)
 	add(ST_AWAY, 0, 0, 2.5, -1, "Look away to the left of the screen");
 	add(ST_LENS, 0, 0, 1.5, -1, NULL);
 	add(ST_LENS, 0, 0, 2.5, -1, "Look into the lens and blink twice");
+	add(ST_TEXT, 0, 0, 2, -1, "Done. Thank you!");
+}
+
+/*
+ * --reading: about 3 minutes of reading in the notes area, each line followed by a look into the lens, so
+ * every reading frame (along the line, the jump back, the next line) is within a couple of seconds of a
+ * lens look with the head in the same place. That is what the model needs most: reading to the lens.
+ */
+static void build_reading_sequence(int quick)
+{
+	add(ST_TEXT, 0, 0, 6, -1,
+	    "Sit as you do in calls. Keep your head still and follow the dot with your eyes only,
+"
+	    "like reading your notes. When the arrow points up, look straight into the camera lens.
+Starting…");
+	add(ST_LENS, 0, 0, 3, -1, "Look into the camera lens");
+	const double half = fmin(12.0, screen_w_cm / 2 - 0.8);
+	const double ys[] = {3, 4.5, 6, 7.5, 9, 10.5, 12};
+	const double widths[] = {7, 9, 11};
+	const double hop_t[] = {0.25, 0.32, 0.22};
+	int line = 0;
+	for (int round = 0; round < (quick ? 1 : 3); round++) {
+		const double w = fmin(widths[round], half), dt = hop_t[round];
+		const double hop = round == 1 ? 1.3 : 1.7;
+		for (size_t k = 0; k < sizeof(ys) / sizeof(ys[0]); k++, line++) {
+			const double y = ys[(k * 3 + (size_t)round) % (sizeof(ys) / sizeof(ys[0]))];
+			for (double x = -w; x <= w + 0.01; x += hop)
+				add(ST_READ, x, y, dt, line, NULL);
+			/* two lines in a row now and then: the jump back to the next line, as in real reading */
+			if (k % 3 == 1) {
+				line++;
+				for (double x = -w; x <= w + 0.01; x += hop)
+					add(ST_READ, x, y + 0.9, dt, line, NULL);
+			}
+			add(ST_LENS, 0, 0, 1.0, -1, NULL);
+		}
+	}
+	/* Single glances anywhere in the notes area, each back to the lens. */
+	srand(11);
+	for (int i = 0; i < (quick ? 4 : 24); i++) {
+		const double x = -half + 2 * half * (rand() / (double)RAND_MAX), y = 2 + 11 * (rand() / (double)RAND_MAX);
+		add(ST_DOT, x, y, 0.8, -1, NULL);
+		add(ST_LENS, 0, 0, 0.9, -1, NULL);
+	}
 	add(ST_TEXT, 0, 0, 2, -1, "Done. Thank you!");
 }
 
@@ -407,7 +453,10 @@ static void finish(void)
 	pt_per_cm = screen_w_cm > 1 ? screen_frame.size.width / screen_w_cm : 40;
 	printf("screen %.1f x %.1f cm, camera assumed %.1f cm above the top edge\n", screen_w_cm, screen_h_cm,
 	       cam_above_cm);
-	build_sequence(getenv("CAMFLIP_QUICK") != NULL);
+	if (reading_mode)
+		build_reading_sequence(getenv("CAMFLIP_QUICK") != NULL);
+	else
+		build_sequence(getenv("CAMFLIP_QUICK") != NULL);
 	double total = 0;
 	for (int i = 0; i < nsteps; i++)
 		total += steps[i].dur;
@@ -445,14 +494,15 @@ int main(int argc, char **argv)
 			else if (!strcmp(argv[i], "--out")) { out_dir = [NSString stringWithUTF8String:v]; i++; }
 			else if (!strcmp(argv[i], "--camera")) { camera = [NSString stringWithUTF8String:v]; i++; }
 			else if (!strcmp(argv[i], "--cam-above")) { cam_above_cm = atof(v); i++; }
+			else if (!strcmp(argv[i], "--reading")) reading_mode = 1;
 			else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
 		}
 		if (!out_dir) {
 			NSDateFormatter *df = [[NSDateFormatter alloc] init];
 			df.dateFormat = @"yyyy-MM-dd-HHmmss";
 			out_dir = [NSHomeDirectory() stringByAppendingPathComponent:
-				[NSString stringWithFormat:@"Downloads/camflip-diag/captures/%@-%.0fcm",
-					[df stringFromDate:[NSDate date]], distance_cm]];
+				[NSString stringWithFormat:@"Downloads/camflip-diag/captures/%@-%.0fcm%s",
+					[df stringFromDate:[NSDate date]], distance_cm, reading_mode ? "-reading" : ""]];
 		}
 		[[NSFileManager defaultManager] createDirectoryAtPath:out_dir withIntermediateDirectories:YES attributes:nil
 								error:nil];

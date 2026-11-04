@@ -416,7 +416,19 @@ def lens_look(sessions):
     return out
 
 
-def export_coreml(model, path, lens=None):
+def lens_open(sessions):
+    """How open each eye is looking into the lens (outline height / width, median): the plugin fades the
+    model out as the eye closes (blinks), where it has nothing sensible to do."""
+    out = []
+    for e in (0, 1):
+        v = np.concatenate([s.open[s.ok & (s.kind == "lens") & (s.flip == e)] for s in sessions])
+        if len(v) < 20:
+            return None
+        out.append(float(np.median(v)))
+    return out
+
+
+def export_coreml(model, path, lens=None, opening=None):
     import coremltools as ct
     m = Export(model).eval().cpu()
     ex = (torch.rand(2, 1, H, W), torch.rand(2, 2))
@@ -429,6 +441,8 @@ def export_coreml(model, path, lens=None):
     ml.short_description = "Cam Flip personal eye model (private: trained on one person's face)"
     if lens:
         ml.user_defined_metadata["camflip.lens"] = " ".join(f"{v:.3f}" for v in lens)
+    if opening:
+        ml.user_defined_metadata["camflip.open"] = " ".join(f"{v:.4f}" for v in opening)
     ml.save(path)
     print(f"exported {path}")
 
@@ -463,6 +477,7 @@ def main():
             ap.error("give one or more capture folders (or --selftest)")
         sessions = [Session(s) for s in a.sessions]
         lens = lens_look(sessions)
+        opening = lens_open(sessions)
         print("looking into the lens, the iris sits at " +
               (f"({lens[0]:.1f}, {lens[1]:.1f}) and ({lens[2]:.1f}, {lens[3]:.1f}) patch px" if lens else "? (too few lens frames)"))
         train, val = Pairs(sessions), Pairs(sessions, val=True, seed=1)
@@ -535,7 +550,7 @@ def main():
     torch.save(model.state_dict(), os.path.join(out_dir, "eye-model.pt"))
     save_preview(model, val, grid, os.path.join(out_dir, "preview"), dev)
     if not a.no_export:
-        export_coreml(model.cpu(), os.path.join(out_dir, "eye-model.mlpackage"), lens)
+        export_coreml(model.cpu(), os.path.join(out_dir, "eye-model.mlpackage"), lens, opening)
 
 
 if __name__ == "__main__":
