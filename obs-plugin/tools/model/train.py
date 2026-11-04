@@ -187,11 +187,18 @@ class Session:
               f"reading {np.sum(ok & (self.kind == 'read'))})")
 
 
-# Where to compare two frames of a pair to line them up: around the eye, not in it (brow, lid crease,
-# corners, cheek), since the eye itself is what differs.
+# Where to compare two frames of a pair to line them up. Only skin that stays put when the eyes move:
+# "corners" (default) is the two eye corners and the skin beside them. "ring" (round e1) also used the lid
+# crease, brow and cheek, but those move with the lids when you look down, so lining up on them shifted
+# the target lids onto the source's and the model stopped reshaping the lids.
 _ys, _xs = np.mgrid[0:H, 0:W].astype(np.float32)
-ALIGN_MASK = ((((_xs - 64) / 50) ** 2 + ((_ys - 30) / 21) ** 2) > 1) & (_xs > 6) & (_xs < W - 6) & (_ys > 4) & (_ys < H - 4)
+ALIGN_MASKS = {
+    "corners": ((((_xs >= 6) & (_xs <= 30)) | ((_xs >= W - 30) & (_xs <= W - 7))) & (_ys >= 20) & (_ys <= 48)),
+    "ring": ((((_xs - 64) / 50) ** 2 + ((_ys - 30) / 21) ** 2) > 1) & (_xs > 6) & (_xs < W - 6) & (_ys > 4) & (_ys < H - 4),
+}
+ALIGN_MASK = ALIGN_MASKS["corners"]  # set in main from --align-mask
 ALIGN_R = 4
+ALIGN_NAME = "corners"
 ALIGN = False  # set in main: real captures yes (unless --no-align), the synthetic self-test no
 
 
@@ -209,15 +216,27 @@ def maybe_align(data, d, t, grid):
     return d, t
 
 
+def report_offsets(sess, off):
+    """How far the line-up moves frames up or down, by what the eyes were doing. Head still, so a gap
+    between looking at the lens and reading means the line-up is following the lids, not the head."""
+    parts = []
+    for kind in ("lens", "dot", "read"):
+        m = sess.ok & (sess.kind == kind)
+        if m.sum() > 20:
+            parts.append(f"{kind} {np.median(off[m, 1]):+.2f}")
+    print(f"{os.path.basename(sess.folder)}: line-up ({ALIGN_NAME}) vertical shift, median px: " + ", ".join(parts))
+
+
 def session_offsets(sess, grid, device):
     """Each frame's offset from its eye's typical look (median of lens frames) around the eye, once per
     capture and cached next to it (align.npy). A pair's offset is then the difference of its two frames':
     if frame i sits o_i from the reference and frame j o_j, then dst(p + o_j - o_i) lines up on src(p)."""
-    cache = os.path.join(sess.folder, "align.npy")
+    cache = os.path.join(sess.folder, f"align-{ALIGN_NAME}.npy")
     src_t = os.path.getmtime(os.path.join(sess.folder, "patches.u8"))
     if os.path.exists(cache) and os.path.getmtime(cache) >= src_t:
         off = np.load(cache)
         if off.shape == (len(sess.t), 2):
+            report_offsets(sess, off)
             return off
     t0 = time.time()
     off = np.zeros((len(sess.t), 2), np.float32)
@@ -235,6 +254,7 @@ def session_offsets(sess, grid, device):
                 _, _, best = align_pairs(rf, fr, torch.zeros(len(ii), 2, device=device), grid)
             off[ii] = best.cpu().numpy()
     np.save(cache, off)
+    report_offsets(sess, off)
     print(f"{sess.folder}: lined up {len(off)} patches in {time.time() - t0:.0f} s "
           f"(offsets median {np.median(np.abs(off)):.2f} px, 95% within {np.percentile(np.abs(off), 95):.2f})")
     return off
@@ -572,13 +592,17 @@ def main():
     ap.add_argument("--res-weight", type=float, default=0.05,
                     help="cost of the brightness residual (higher: move pixels rather than paint them)")
     ap.add_argument("--no-align", action="store_true", help="don't line up each pair's frames around the eye")
+    ap.add_argument("--align-mask", choices=sorted(ALIGN_MASKS), default="corners",
+                    help="skin used to line frames up: eye corners only (default) or the whole ring around the eye")
     ap.add_argument("--pair-tol", type=float, default=0.04,
                     help="pairs only when the eye corners moved less than this fraction of the eye width")
     ap.add_argument("--selftest-export", metavar="PATH", help="with --selftest: also export the synthetic model here")
     a = ap.parse_args()
-    global RES_WEIGHT, ALIGN
+    global RES_WEIGHT, ALIGN, ALIGN_NAME, ALIGN_MASK
     RES_WEIGHT = a.res_weight
     ALIGN = not a.selftest and not a.no_align
+    ALIGN_NAME = a.align_mask
+    ALIGN_MASK = ALIGN_MASKS[a.align_mask]
     dev = torch.device(a.device)
     torch.manual_seed(a.seed)
 
