@@ -43,8 +43,10 @@
  *                      follow: the tracked pupil plus the classic warp's shift (keeps the sweep)
  *   --steady-band X,D,U  steady: how far the pupil may move from the held point, in eye-patch px (eye
  *                      width 80), before it counts as a look elsewhere: X either side, D down, U up
- *                      (default 8,4,1.5). Reading only ever moves down a page, so any clear move up (to
- *                      the camera, say) is followed at once
+ *                      (default 8,4,2.5). Reading only ever moves down a page, so the band is small
+ *                      upwards and a look up at the camera is followed within a few frames
+ *   --steady-dwell N   steady: frames a look must stay outside the band before it is followed (default 2;
+ *                      1 follows a frame sooner but trips more easily on a noisy pupil)
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
  *   --ml-alpha F       scale the model's effect (default 1)
  *   --learn            print the notes learnt from the reading as they are handed out (and the final
@@ -94,6 +96,68 @@ static cf_pt centroid_of(const cf_pt *p, int n)
 		c.y /= (float)n;
 	}
 	return c;
+}
+
+/* --ml-target steady, per eye (patch px). The held point drifts slowly (STEADY_TAU) to where the eye is,
+ * so reading along a line or down the notes stays on its middle. A look outside the band is followed:
+ * at once past twice the band, otherwise once it has stayed out for --steady-dwell frames, so a noisy pupil
+ * fix doesn't throw the hold. The pupil is a 3-frame median for both. Blinks and the moment after them
+ * leave the hold alone: the pupil fix is unreliable there. */
+#define STEADY_TAU 3.0
+#define STEADY_AFTER_BLINK 0.15
+typedef struct {
+	int has, out, nh;
+	float hold[2], hist[3][2];
+	double t, quiet_until;
+} steady_eye;
+
+static float med3(float a, float b, float c)
+{
+	return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+}
+
+static const float *steady_update(steady_eye *s, float px, float py, double t, int blinking, const float band[3],
+				  int dwell, int snaps[3])
+{
+	const double dt = s->has ? fmax(0.0, t - s->t) : 0.0;
+	s->t = t;
+	if (blinking) {
+		s->quiet_until = t + STEADY_AFTER_BLINK;
+		s->nh = 0;
+		s->out = 0;
+	}
+	if (s->has && t < s->quiet_until)
+		return s->hold;
+	memmove(s->hist[1], s->hist[0], sizeof(s->hist[0]) * 2);
+	s->hist[0][0] = px;
+	s->hist[0][1] = py;
+	if (s->nh < 3)
+		s->nh++;
+	float m[2] = {px, py};
+	if (s->nh == 3)
+		for (int k = 0; k < 2; k++)
+			m[k] = med3(s->hist[0][k], s->hist[1][k], s->hist[2][k]);
+	if (!s->has) {
+		s->hold[0] = m[0];
+		s->hold[1] = m[1];
+		s->has = 1;
+		return s->hold;
+	}
+	const float dx = fabsf(m[0] - s->hold[0]), dy = m[1] - s->hold[1];
+	const int outside = dx > band[0] || dy > band[1] || -dy > band[2];
+	const int far = dx > 2 * band[0] || dy > 2 * band[1] || -dy > 2 * band[2];
+	s->out = outside ? s->out + 1 : 0;
+	if (far || s->out >= dwell) {
+		snaps[dx > band[0] ? 0 : dy > 0 ? 1 : 2]++;
+		s->hold[0] = m[0];
+		s->hold[1] = m[1];
+		s->out = 0;
+	} else if (!outside) {
+		const float k = (float)fmin(1.0, dt / STEADY_TAU);
+		s->hold[0] += (m[0] - s->hold[0]) * k;
+		s->hold[1] += (m[1] - s->hold[1]) * k;
+	}
+	return s->hold;
 }
 
 /* Independent iris measure for the summary (not the plugin's refiner): darkness-weighted centroid
@@ -356,9 +420,11 @@ int main(int argc, char **argv)
 	enum cf_ml_compute ml_compute = CF_ML_ALL;
 	double ml_ms = 0, ml_ms_max = 0;
 	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
-	float steady_band[3] = {8.0f, 4.0f, 1.5f}, steady_hold[2][2] = {{0}}, steady_tau = 3.0f;
-	int steady_has[2] = {0, 0}, steady_snaps[3] = {0, 0, 0}; /* looks followed: sideways, down, up */
-	double steady_t[2] = {0, 0};
+	float steady_band[3] = {8.0f, 4.0f, 2.5f};
+	int steady_dwell = 2;
+	steady_eye steady[2];
+	memset(steady, 0, sizeof(steady));
+	int steady_snaps[3] = {0, 0, 0}; /* looks followed: sideways, down, up */
 	float ml_alpha = 1.0f;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
@@ -395,6 +461,7 @@ int main(int argc, char **argv)
 			i++;
 		}
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
+		else if (!strcmp(a, "--steady-dwell")) { steady_dwell = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f,%f", &steady_band[0], &steady_band[1], &steady_band[2]); i++; }
 		else if (!strcmp(a, "--ml-res")) { ml_res = atoi(v); i++; }
 		else if (!strcmp(a, "--ml-alpha")) { ml_alpha = (float)atof(v); i++; }
@@ -774,26 +841,11 @@ int main(int argc, char **argv)
 								/* Steady: the pupil (no classic shift) in eye-patch px, so head moves
 								 * don't count. Within the band it is reading along a line or down the
 								 * notes: hold, drifting slowly to the middle of it. Outside, a real look
-								 * elsewhere: go there at once. The band is small upwards (reading never
-								 * goes up), so a look at the camera passes straight through. Held through
-								 * blinks. */
+								 * elsewhere: follow it (see steady_update). */
 								float px, py;
 								cf_ml_to_patch(&fr, pu.x + (eyes[e].cx - c.x), pu.y + (eyes[e].cy - c.y), &px, &py);
-								float *hd = steady_hold[flip];
-								const float dt = steady_has[flip] ? (float)fmax(0.0, t - steady_t[flip]) : 0.0f;
-								if (!steady_has[flip] || fabsf(px - hd[0]) > steady_band[0] ||
-								    py - hd[1] > steady_band[1] || hd[1] - py > steady_band[2]) {
-									if (steady_has[flip])
-										steady_snaps[fabsf(px - hd[0]) > steady_band[0] ? 0 : py > hd[1] ? 1 : 2]++;
-									hd[0] = px;
-									hd[1] = py;
-									steady_has[flip] = 1;
-								} else if (!st.blinking) {
-									const float k = fminf(1.0f, dt / steady_tau);
-									hd[0] += (px - hd[0]) * k;
-									hd[1] += (py - hd[1]) * k;
-								}
-								steady_t[flip] = t;
+								const float *hd = steady_update(&steady[flip], px, py, t, st.blinking, steady_band,
+											       steady_dwell, steady_snaps);
 								cf_ml_to_image(&fr, hd[0], hd[1], &tgt[e][0], &tgt[e][1]);
 							}
 						}
@@ -1004,7 +1056,7 @@ int main(int argc, char **argv)
 		if (ml_runs)
 			printf("eye model: %.2f ms avg, %.2f ms max over %d frames\n", ml_ms / ml_runs, ml_ms_max, ml_runs);
 		if (ml && ml_steady)
-			printf("steady: looks followed at once (both eyes): %d sideways, %d down, %d up\n", steady_snaps[0],
+			printf("steady: looks followed (both eyes): %d sideways, %d down, %d up\n", steady_snaps[0],
 			       steady_snaps[1], steady_snaps[2]);
 		if (ml) {
 			int seen, faded, knows;
