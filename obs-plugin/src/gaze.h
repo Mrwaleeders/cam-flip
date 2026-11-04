@@ -334,6 +334,13 @@ typedef struct {
 	float vor_raw, vor_gap;          /* the raw glance (lightly smoothed), and how far the glance lagged it */
 	double vor_t;
 	int have_vor;
+	/* Vision's sideways gain (see side_vision_scale() in gaze.c): its sideways point is scaled by svk about
+	 * svk_ref before the sideways channel uses it, svk measured from how the refined and Vision's readings
+	 * move together (running means, the refined one's variance and their covariance, eye widths). */
+	float svk, svk_ref;
+	float svk_m, svk_v, svk_mm, svk_mv;
+	int have_svk;
+	int side_novis; /* Vision's point hardly moves sideways: not used there */
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);

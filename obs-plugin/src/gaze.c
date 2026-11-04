@@ -1039,6 +1039,7 @@ void cf_gaze_init(cf_gaze *g)
 	g->down_noise = g->noise_slow = DOWN_NOISE_INIT;
 	g->side_noise = DOWN_NOISE_INIT;
 	g->lid_noise = LID_NOISE_INIT;
+	g->svk = 1.0f;
 	cf_robust *rb[2] = {&g->rb_down, &g->rb_side};
 	for (int i = 0; i < 2; i++) {
 		rb[i]->lr_noise = LR_NOISE_INIT;
@@ -1538,6 +1539,72 @@ static float glide_catch_up(cf_gaze *g, float eye, float down_raw, int hold, dou
 	return g->vor_off;
 }
 
+/* ---- Vision's sideways gain
+ *
+ * Vision's own pupil point steadies the sideways reading and backs its saccades up (gate()), through the
+ * gain the calibrations measured: how far the refined point moves per move of Vision's. That is measured
+ * up and down, and sideways Vision's point can follow far less: then the damped reading took in under
+ * half of the eyes' scanning (each small move pulled back to where Vision's flat point said the eye was),
+ * and the return to the next line was not backed up, so it showed whole while the damping caught up over
+ * a quarter of a second (as on the user's clips). So how Vision's point moves with the refined one
+ * sideways is measured as the person reads: the regression of Vision's reading on the refined one (running
+ * variance and covariance, the refined reading's noise taken out; Vision's own noise doesn't bias it). Its
+ * sideways point is then scaled about a slow reference by svk, so that per refined move it moves as the
+ * gain says; one that hardly moves at all (under 1/SVK_MAX of that) is not used sideways (side_novis).
+ * Until the refined reading has spread clearly past its noise (the eyes scanning), svk stays as it is (1 at
+ * the start: as before). */
+#define SVK_TAU 6.0          /* s: memory of the readings' spread */
+#define SVK_REF_TAU 30.0     /* s: the reference Vision's point is scaled about follows it this slowly */
+#define SVK_FOLLOW 2.0       /* s: svk follows the measure this fast, once it is sure */
+#define SVK_SIG0 0.008f      /* eye widths: the refined reading's spread past its noise from which the measure */
+#define SVK_SIG1 0.016f      /* ... counts, fully from here (0.6-1.2 px on a 75 px eye) */
+#define SVK_MIN 0.33f
+#define SVK_MAX 6.0f
+
+/* Vision's sideways reading as the sideways channel takes it. */
+static float side_vision(const cf_gaze *g, float v)
+{
+	return g->have_svk ? g->svk_ref + g->svk * (v - g->svk_ref) : v;
+}
+
+/* One frame of the measure: m the refined sideways reading (both eyes combined), v Vision's (raw). */
+static void side_vision_scale(cf_gaze *g, int vis, float m, float v, int lr_out, int hold, double dt)
+{
+	if (!vis || hold || !isfinite(m) || !isfinite(v))
+		return;
+	if (!g->have_svk) {
+		g->svk_ref = g->svk_v = v;
+		g->svk_m = m;
+		g->svk_mm = g->svk_mv = 0;
+		g->have_svk = 1;
+		return;
+	}
+	if (lr_out)
+		return; /* one eye's reading replaced: not a clean pair */
+	const float a = (float)(1.0 - exp(-dt / SVK_TAU));
+	g->svk_m += a * (m - g->svk_m);
+	g->svk_v += a * (v - g->svk_v);
+	const float em = m - g->svk_m, ev = v - g->svk_v;
+	g->svk_mm += a * (em * em - g->svk_mm);
+	g->svk_mv += a * (em * ev - g->svk_mv);
+	/* The refined reading's own frame-to-frame noise (sd = 0.886 x the mean change, for white noise) taken
+	 * out of its spread: what is left is the eyes' movement. */
+	const float nm = 0.886f * g->side_noise;
+	const float sm2 = fmaxf(g->svk_mm - nm * nm, 0.0f);
+	const float sure = smoothstepf(SVK_SIG0, SVK_SIG1, sqrtf(sm2));
+	if (sure > 0 && g->rb_side.v_gain > 0) {
+		/* Vision's move per refined move, against what the gain says (1 / v_gain). */
+		const float b = g->svk_mv / sm2 * g->rb_side.v_gain;
+		const float k = sure * (float)(1.0 - exp(-dt / SVK_FOLLOW));
+		const float want = b > 1.0f / SVK_MAX ? clampf(1.0f / b, SVK_MIN, SVK_MAX) : SVK_MAX;
+		g->svk = expf(logf(g->svk) + k * (logf(want) - logf(g->svk)));
+		/* Hardly moving with the eyes at all: not used (back once it moves a third more than that). */
+		if (sure >= 1.0f)
+			g->side_novis = b < 1.0f / SVK_MAX ? 1 : (b > 1.33f / SVK_MAX ? 0 : g->side_novis);
+	}
+	g->svk_ref += (float)(1.0 - exp(-dt / SVK_REF_TAU)) * (v - g->svk_ref);
+}
+
 /* ---- Output */
 
 /* Fills out[] from the filtered state. The shifts before strength are in g->amount_unit
@@ -1692,13 +1759,16 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const int learn_lr = !holding(g, t);
 	const int vis = m[0].has_v && m[1].has_v;
 	const float v_down = vis ? -0.5f * (m[0].v_offset + m[1].v_offset) : 0.0f; /* down positive, like the glance */
-	const float v_side = vis ? 0.5f * (m[0].v_side + m[1].v_side) : 0.0f;
+	const float v_side_raw = vis ? 0.5f * (m[0].v_side + m[1].v_side) : 0.0f;
+	const int vis_side = vis && !g->side_novis; /* (see side_vision_scale()) */
+	const float v_side = vis_side ? side_vision(g, v_side_raw) : 0.0f; /* scaled to the refined reading's moves */
 	float e_down[2], e_side[2];
 	int lr_down, lr_side;
 	const float down_raw = lr_combine(&g->rb_down, &g->down, p->baseline - m[0].offset, p->baseline - m[1].offset,
 					  vis, v_down, learn_lr, t, dt, e_down, &lr_down);
 	const float side =
-		lr_combine(&g->rb_side, &g->side, m[0].side, m[1].side, vis, v_side, learn_lr, t, dt, e_side, &lr_side);
+		lr_combine(&g->rb_side, &g->side, m[0].side, m[1].side, vis_side, v_side, learn_lr, t, dt, e_side,
+			   &lr_side);
 	const float openness = fminf(m[0].openness, m[1].openness);
 	/* The noise band and saccade size of the glance follow the measured landmark noise: as tight as
 	 * clean tracking allows, wider when it is noisy. */
@@ -1860,6 +1930,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	}
 	g->last_side_raw = side;
 	g->have_side_raw = !hold;
+	side_vision_scale(g, vis, side, v_side_raw, lr_side, hold, dt);
 
 	/* Learn the open-eye openness when uncalibrated: follows wide-open quickly, closing slowly. */
 	if (p->baseline_open <= 0 && !hold && fabsf(down_raw) < 0.08f && r > 0.6f) {
@@ -1999,7 +2070,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 			.lo = side_lo,
 			.hi = side_hi,
 			.alpha = noise_alpha(SIDE_CUTOFF, dt),
-			.vis = vis,
+			.vis = vis_side,
 			.v = v_side,
 			.e = {e_side[0], e_side[1]},
 			.lr_out = lr_side,
