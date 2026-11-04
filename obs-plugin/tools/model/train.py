@@ -180,6 +180,7 @@ class Session:
             med = np.median(self.open[sel]) if sel.any() else np.median(self.open[self.flip == e])
             ok &= ~((self.flip == e) & (self.open < 0.6 * med))
         self.ok = ok
+        self.offsets = None  # set from session_offsets when pairs are lined up
         self.eye_w = np.hypot(self.bx - self.ax, self.by - self.ay)
         print(f"{folder}: {n} patches, {ok.sum()} usable "
               f"(lens {np.sum(ok & (self.kind == 'lens'))}, dots {np.sum(ok & (self.kind == 'dot'))}, "
@@ -194,12 +195,49 @@ ALIGN_R = 4
 ALIGN = False  # set in main: real captures yes (unless --no-align), the synthetic self-test no
 
 
-def maybe_align(s, d, t, grid):
-    if not ALIGN:
+def maybe_align(data, d, t, grid):
+    """Shifts each destination by the pair's offset (session_offsets): lined up on its source."""
+    off = getattr(data, "last_off", None)
+    if not ALIGN or off is None:
         return d, t
     with torch.no_grad():
-        d, t, _ = align_pairs(s, d, t, grid)
+        o = torch.from_numpy(off).to(d.device)
+        q = grid[None] + o[:, :, None, None]
+        g = torch.stack([q[:, 0] / (W - 1) * 2 - 1, q[:, 1] / (H - 1) * 2 - 1], -1)
+        d = sample(d, g)
+        t = t - o / torch.tensor([W, H], dtype=torch.float32, device=d.device)
     return d, t
+
+
+def session_offsets(sess, grid, device):
+    """Each frame's offset from its eye's typical look (median of lens frames) around the eye, once per
+    capture and cached next to it (align.npy). A pair's offset is then the difference of its two frames':
+    if frame i sits o_i from the reference and frame j o_j, then dst(p + o_j - o_i) lines up on src(p)."""
+    cache = os.path.join(sess.folder, "align.npy")
+    src_t = os.path.getmtime(os.path.join(sess.folder, "patches.u8"))
+    if os.path.exists(cache) and os.path.getmtime(cache) >= src_t:
+        off = np.load(cache)
+        if off.shape == (len(sess.t), 2):
+            return off
+    t0 = time.time()
+    off = np.zeros((len(sess.t), 2), np.float32)
+    rng = np.random.default_rng(0)
+    for e in (0, 1):
+        lens = np.where(sess.ok & (sess.flip == e) & (sess.kind == "lens"))[0]
+        pick = rng.choice(lens, min(400, len(lens)), replace=False) if len(lens) else np.where(sess.flip == e)[0][:400]
+        ref = np.median(sess.patches[pick].astype(np.float32) / 255.0, axis=0)
+        idx = np.where(sess.flip == e)[0]
+        for k in range(0, len(idx), 256):
+            ii = idx[k:k + 256]
+            fr = torch.from_numpy(sess.patches[ii].astype(np.float32) / 255.0)[:, None].to(device)
+            rf = torch.from_numpy(ref)[None, None].to(device).expand_as(fr).contiguous()
+            with torch.no_grad():
+                _, _, best = align_pairs(rf, fr, torch.zeros(len(ii), 2, device=device), grid)
+            off[ii] = best.cpu().numpy()
+    np.save(cache, off)
+    print(f"{sess.folder}: lined up {len(off)} patches in {time.time() - t0:.0f} s "
+          f"(offsets median {np.median(np.abs(off)):.2f} px, 95% within {np.percentile(np.abs(off), 95):.2f})")
+    return off
 
 
 def align_pairs(src, dst, tgt, grid):
@@ -290,6 +328,7 @@ class Pairs:
         src = np.zeros((batch, 1, H, W), np.float32)
         dst = np.zeros((batch, 1, H, W), np.float32)
         tgt = np.zeros((batch, 2), np.float32)
+        off = np.zeros((batch, 2), np.float32)
         for b in range(batch):
             r = self.rng.random()
             if 0.1 <= r < 0.7 and self.to_lens:  # a look somewhere else, to the lens look
@@ -302,6 +341,9 @@ class Pairs:
             src[b, 0] = s.patches[i] / 255.0
             dst[b, 0] = s.patches[j] / 255.0
             tgt[b] = (s.px[j] / W, s.py[j] / H)
+            if s.offsets is not None:
+                off[b] = s.offsets[j] - s.offsets[i]
+        self.last_off = off
         return src, dst, tgt
 
 
@@ -427,7 +469,7 @@ def evaluate(model, data, grid, wmap, edge, device, batches=20, seed=123):
     with torch.no_grad():
         for _ in range(batches):
             s, d, t = [torch.from_numpy(x).to(device) for x in data.sample(32)]
-            d, t = maybe_align(s, d, t, grid)
+            d, t = maybe_align(data, d, t, grid)
             _, out, lp = losses(model, s, d, t, grid, wmap, edge)
             l_model += lp.item()
             l_copy += (torch.abs(s - d) * wmap).mean().item()
@@ -443,7 +485,7 @@ def save_preview(model, data, grid, folder, device, n=12):
     os.makedirs(folder, exist_ok=True)
     data.rng = np.random.default_rng(7)
     s, d, t = [torch.from_numpy(x).to(device) for x in data.sample(n)]
-    d, t = maybe_align(s, d, t, grid)
+    d, t = maybe_align(data, d, t, grid)
     with torch.no_grad():
         flow, res, mask = model(s, t)
         out = render(s, flow, res, mask, grid)
@@ -568,6 +610,9 @@ def main():
     if a.resume and out_dir and os.path.exists(os.path.join(out_dir, "eye-model.pt")):
         model.load_state_dict(torch.load(os.path.join(out_dir, "eye-model.pt"), map_location=dev))
     grid = base_grid(dev)
+    if ALIGN and not a.selftest:
+        for sess in sessions:
+            sess.offsets = session_offsets(sess, grid, dev)
     mid = (CORNER_L + CORNER_R) / 2
     wmap = ellipse_map(mid, CORNER_Y - 2, 50, 22, 1.0, 0.25, dev)[None, None]
     edge = 1 - ellipse_map(mid, CORNER_Y - 2, 60, 30, 1.0, 0.0, dev)[None, None]
@@ -579,7 +624,7 @@ def main():
     t0 = time.time()
     for step in range(1, a.steps + 1):
         s, d, t = [torch.from_numpy(x).to(dev) for x in train.sample(a.batch)]
-        d, t = maybe_align(s, d, t, grid)
+        d, t = maybe_align(train, d, t, grid)
         s, d, t = augment(s, d, t, rng, dev)
         loss, _, _ = losses(model, s, d, t, grid, wmap, edge)
         opt.zero_grad()
