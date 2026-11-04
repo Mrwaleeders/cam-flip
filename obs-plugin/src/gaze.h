@@ -81,6 +81,12 @@ typedef struct {
 	 * Damping is centred on where the eyes have been lately (seconds), never on a calibrated spot, so it
 	 * never adds a sideways offset the eyes don't have. */
 	float scan_damp;
+
+	/* 1 when has_notes / notes_* / vis_notes come from cf_gaze_take_learnt_notes() (the notes learnt from the
+	 * reading itself), not from a notes calibration. Learnt notes only ever widen the correction: the glance
+	 * limit is never below max_glance, and Vision's gain from them is only re-applied when it moved by more than
+	 * a small tolerance (they are refined as the user reads). A model with nothing learnt yet starts from them. */
+	int notes_learnt;
 } cf_gaze_params;
 
 /* "Eye contact strength" goes up to this (200%): over 1 the correction overshoots, so it can make up for
@@ -144,7 +150,38 @@ typedef struct {
 	int blinking;
 	float glance;    /* how far below the lens the gaze is, same units as baseline */
 	float factor;    /* 0..1, current correction strength after fades */
+	/* Plain-word reasons the correction is (mostly) off, for the panel. Each is 0 unless the face is found. */
+	int too_far;     /* the face is too small in the picture (the face-size fade is below half) */
+	int turned;      /* the head is turned or tilted away from the camera (its fades are below half) */
+	int reading;     /* the eyes are reading right now (the notes learner's detector) */
 } cf_gaze_status;
+
+/* ---- Notes learnt from reading (no notes step)
+ *
+ * While the model runs it watches for reading: the eyes sweeping along a line, then jumping back to the start
+ * of the next one (a sawtooth sideways), with the gaze held below the lens. From those frames it learns the same
+ * measures a notes calibration takes, and keeps following them when they move (the laptop tilted, the notes
+ * moved, a new seat). The caller saves what it learns and passes it back in the params (has_notes, notes_offset,
+ * notes_side, notes_open, vis_notes, with notes_learnt 1), so it survives restarts. */
+typedef struct {
+	int has;          /* 1 once enough reading has been seen */
+	float offset;     /* gaze offset while reading (same units as baseline, like cf_calib_result.offset) */
+	float side;       /* sideways gaze while reading (eye widths, like cf_calib_result.side) */
+	float open;       /* eye openness while reading (like cf_calib_result.openness) */
+	int has_vis;      /* Vision's own pupil point was given while reading ... */
+	float vis_offset; /* ... and its offset then (like cf_calib_result.vis_offset) */
+	float seconds;    /* how much reading the estimate rests on (s) */
+	unsigned serial;  /* changes each time the estimate moved enough to be worth saving */
+} cf_learnt_notes;
+
+/* Checks a finished lens calibration ("look at the camera") before it is used. reading: the learnt notes, or
+ * NULL / has 0 when none are known yet. Returns CF_LOOK_OK, or why the look should be redone:
+ *  CF_LOOK_UNSTEADY: the eyes or lids moved far more than a held look does (not just a bit unsteady);
+ *  CF_LOOK_LOW: it is not clearly above where the eyes read, so it was a look at the screen, not into the lens. */
+#define CF_LOOK_OK 0
+#define CF_LOOK_UNSTEADY 1
+#define CF_LOOK_LOW 2
+int cf_gaze_check_lens_look(const cf_calib_result *res, const cf_learnt_notes *reading);
 
 typedef struct {
 	double value, deriv, t;
@@ -372,6 +409,13 @@ typedef struct {
 	int have_head_full;
 	float engage_f; /* how far the sideways damping (and the lid restoration) is engaged, 0..1 */
 	int have_engage;
+
+	/* ---- Status reasons (cf_gaze_status.too_far / turned) and the notes learnt from reading. The learner's
+	 * own state goes here too (see "Notes learnt from reading" in gaze.c). */
+	float st_size_f, st_turn_f; /* this frame's face-size fade and head-turn fade (f_size, f_yaw x f_pitch) */
+	int st_reading;
+	cf_learnt_notes learnt;     /* the current estimate */
+	unsigned learnt_taken;      /* the serial last handed out by cf_gaze_take_learnt_notes() */
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);
@@ -403,6 +447,14 @@ void cf_gaze_start_calibration(cf_gaze *g, enum cf_calib_target target);
 /* Returns 1 once (and clears the flag) when a calibration has just finished, -1 once when it gave
  * up because no steady, front-facing face was seen for CF_CALIB_TIMEOUT_FRAMES, otherwise 0. */
 int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out);
+/* Drops a calibration that is running (nothing is taken from it). */
+void cf_gaze_cancel_calibration(cf_gaze *g);
+
+/* Returns 1 (copying them to out) when the learnt notes (see cf_learnt_notes) changed enough to be saved since
+ * the last call, else 0. Rare by design: at most every few seconds while learning, and only on a real change. */
+int cf_gaze_take_learnt_notes(cf_gaze *g, cf_learnt_notes *out);
+/* Forgets what was learnt (the notes are learnt afresh). The caller also stops passing the old ones. */
+void cf_gaze_forget_learnt_notes(cf_gaze *g);
 
 #ifdef __cplusplus
 }

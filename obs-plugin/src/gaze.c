@@ -161,6 +161,7 @@
 #define LEARN_N 6             /* readings averaged in after a backed saccade before its size is learnt from ... */
 #define LEARN_MIN_HI 2.0f     /* ... if it moved this x the saccade size at least: a smaller one is only taken when
 			       * its reading overshot (noise past the saccade size), and would teach a gain too big */
+#define VIS_CAL_LEARNT_TOL 0.10f /* (log ratio) learnt notes' gain re-applied only past this change */
 #define VIS_CAL_DR_ERR 0.004f /* eye widths: typical error of the refined move between the two calibrations */
 #define VIS_OFF_TAU 3.0       /* s: memory of the refined-minus-Vision offset between changes (see gate()) ... */
 #define VIS_RES_TAU 0.5       /* ... unless the readings' recent mean (over this) keeps off it ... */
@@ -1234,6 +1235,7 @@ void cf_gaze_init(cf_gaze *g)
 	g->side_noise = DOWN_NOISE_INIT;
 	g->lid_noise = LID_NOISE_INIT;
 	g->svk = 1.0f;
+	g->st_size_f = g->st_turn_f = 1.0f;
 	cf_robust *rb[2] = {&g->rb_down, &g->rb_side};
 	for (int i = 0; i < 2; i++) {
 		rb[i]->lr_noise = LR_NOISE_INIT;
@@ -1295,6 +1297,10 @@ static void use_vis_calib(cf_gaze *g, const cf_gaze_params *p)
 		return; /* Vision's point barely moved: no usable gain */
 	const float gain = dr / dv;
 	if (!(gain >= VIS_GAIN_MIN && gain <= VIS_GAIN_MAX) || gain == g->vis_gain_cal)
+		return;
+	/* Learnt notes are refined as the user reads: a small change of the gain they give is not worth starting
+	 * the levels afresh for. */
+	if (p->notes_learnt && g->vis_gain_cal > 0 && fabsf(logf(gain / g->vis_gain_cal)) < VIS_CAL_LEARNT_TOL)
 		return;
 	g->vis_gain_cal = gain;
 	cf_robust *rb[2] = {&g->rb_down, &g->rb_side};
@@ -1481,6 +1487,45 @@ int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out)
 	out->upper = g->calib_upper_result; /* head and lids */
 	out->lower = g->calib_lower_result;
 	return 1;
+}
+
+void cf_gaze_cancel_calibration(cf_gaze *g)
+{
+	g->calibrating = 0;
+	g->calib_done = 0;
+	g->calib_failed = 0;
+}
+
+/* A lens calibration ("look at the camera") worth redoing: far less steady than CF_CALIB_HINT_UNSTEADY's limits
+ * (those only say it may be a little off), or not above where the eyes read. */
+#define LOOK_UNSTEADY_K 2.0f
+int cf_gaze_check_lens_look(const cf_calib_result *res, const cf_learnt_notes *reading)
+{
+	if (!(res->spread <= LOOK_UNSTEADY_K * CALIB_SPREAD_MAX) ||
+	    !(res->drift <= LOOK_UNSTEADY_K * fmaxf(CALIB_DRIFT_MAX, 2.0f * res->spread)) ||
+	    !(res->open_spread <= LOOK_UNSTEADY_K * CALIB_OPEN_SPREAD_MAX))
+		return CF_LOOK_UNSTEADY;
+	if (reading && reading->has && !cf_gaze_notes_valid(res->offset, reading->offset))
+		return CF_LOOK_LOW;
+	return CF_LOOK_OK;
+}
+
+/* ---- Notes learnt from reading (see cf_learnt_notes) */
+
+int cf_gaze_take_learnt_notes(cf_gaze *g, cf_learnt_notes *out)
+{
+	if (!g->learnt.has || g->learnt.serial == g->learnt_taken)
+		return 0;
+	g->learnt_taken = g->learnt.serial;
+	*out = g->learnt;
+	return 1;
+}
+
+void cf_gaze_forget_learnt_notes(cf_gaze *g)
+{
+	memset(&g->learnt, 0, sizeof(g->learnt));
+	g->learnt_taken = 0;
+	g->st_reading = 0;
 }
 
 /* ---- Blinks */
@@ -2326,9 +2371,12 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * corrected), else the manual setting. */
 	const int notes = p->has_notes; /* sanitize() cleared it if the notes aren't below the lens */
 	const float notes_glance = p->baseline - p->notes_offset;
-	const float limit = notes ? fmaxf(1.4f * notes_glance,
-					  notes_glance + fmaxf(FAR_MARGIN, FAR_NOISE_K * g->noise_slow))
-				  : p->max_glance;
+	float limit = notes ? fmaxf(1.4f * notes_glance, notes_glance + fmaxf(FAR_MARGIN, FAR_NOISE_K * g->noise_slow))
+			    : p->max_glance;
+	/* Notes learnt from reading only ever widen it: they are where the user reads most, not the edge of
+	 * everything they look at below the camera (the screen further down stays corrected). */
+	if (notes && p->notes_learnt)
+		limit = fmaxf(limit, p->max_glance);
 	const float band = fmaxf(0.5f * limit, 0.04f);
 	/* Second cue: lids drop when looking down. When the pupil already reads close to the limit, a big
 	 * lid drop means a far glance (keyboard) even if the pupil landmark under-reads it. It can only
@@ -2381,6 +2429,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * glance), and switching the factor off there made every glance at the notes start from 0 and
 	 * ease in over half a second, so the eyes visibly dipped and climbed back each time. */
 	const float target = f_yaw * f_pitch * f_size;
+	g->st_size_f = f_size; /* (plain-word reasons for the panel, see cf_gaze_status) */
+	g->st_turn_f = f_yaw * f_pitch;
 	if (hold) {
 		/* Blink: hold the correction steady (the gaze terms are held too). Only head-based fades
 		 * (reliable while the eyes are closed) may lower it; eyes closed for long fade out. */
@@ -2603,6 +2653,9 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 	 * shift is 0 there anyway, and a factor that dropped to 0 whenever the glance read <= 0 looked like
 	 * fades switching on and off in logs. */
 	out->factor = g->factor * g->lock_f;
+	out->too_far = g->face_found && g->st_size_f < 0.5f;
+	out->turned = g->face_found && !out->too_far && g->st_turn_f < 0.5f;
+	out->reading = g->face_found && g->st_reading;
 }
 
 /* ---- Iris centre refinement
