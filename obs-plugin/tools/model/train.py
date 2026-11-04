@@ -339,6 +339,14 @@ class Pairs:
         # more often than the capture's mix would (it is about 40% lens looks, which barely need moving).
         self.to_lens = [k for k, (s, i, cand) in enumerate(self.items)
                         if s.kind[i] != "lens" and np.any(s.kind[cand] == "lens")]
+        # Pairs where the iris really moves (at least MOVE_MIN px): the job of holding a reading eye still
+        # is a shift of several px, but most nearby frames are within a px, so the model learns to under-do
+        # big shifts. --move-share draws this share of each batch from them.
+        self.moving = []
+        for k, (s, i, cand) in enumerate(self.items):
+            far = cand[np.hypot(s.px[cand] - s.px[i], s.py[cand] - s.py[i]) >= MOVE_MIN]
+            if len(far):
+                self.moving.append((k, far))
         self.rng = np.random.default_rng(seed)
 
     def __len__(self):
@@ -351,7 +359,11 @@ class Pairs:
         off = np.zeros((batch, 2), np.float32)
         for b in range(batch):
             r = self.rng.random()
-            if 0.1 <= r < 0.7 and self.to_lens:  # a look somewhere else, to the lens look
+            if 0.7 <= r < 0.7 + MOVE_SHARE and self.moving:  # a look elsewhere nearby, iris moving
+                k, far = self.moving[self.rng.integers(len(self.moving))]
+                s, i, _ = self.items[k]
+                j = self.rng.choice(far)
+            elif 0.1 <= r < 0.7 and self.to_lens:  # a look somewhere else, to the lens look
                 s, i, cand = self.items[self.to_lens[self.rng.integers(len(self.to_lens))]]
                 j = self.rng.choice(cand[s.kind[cand] == "lens"])
             else:
@@ -454,6 +466,9 @@ def iris_centre(img, weight):
 # ---------------------------------------------------------------- training
 
 RES_WEIGHT = 0.05  # --res-weight: how much the brightness residual costs; higher pushes the model to move pixels
+MOVE_SHARE = 0.0  # --move-share: share of each batch from pairs whose iris moves at least MOVE_MIN px
+MOVE_MIN = 2.0
+IRIS_WEIGHT = 0.0  # --iris-weight: pull the output's iris centre onto the real look's (px)
 LID_WEIGHT = 0.0  # --lid-weight: extra pull on the target's horizontal edges (the lid margins), see losses()
 
 
@@ -490,7 +505,10 @@ def losses(model, src, dst, tgt, grid, wmap, edge):
     # MAX_FLOW (every sample off the patch) and training froze. This term still pulls back from there.
     o = model.logits
     l_sat = (F.relu(o[:, 0:3].abs() - 2.0) ** 2).mean() + (F.relu((o[:, 3:4] + 2.0).abs() - 5.0) ** 2).mean()
-    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + RES_WEIGHT * l_res + 0.5 * l_edge + 0.1 * l_sat + LID_WEIGHT * l_lid
+    l_iris = 0.0
+    if IRIS_WEIGHT > 0:
+        l_iris = torch.abs(iris_centre(out, wmap) - iris_centre(dst, wmap)).sum(1).mean()
+    total = IRIS_WEIGHT * l_iris + l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + RES_WEIGHT * l_res + 0.5 * l_edge + 0.1 * l_sat + LID_WEIGHT * l_lid
     return total, out, l_pix
 
 
@@ -603,6 +621,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--res-weight", type=float, default=0.05,
                     help="cost of the brightness residual (higher: move pixels rather than paint them)")
+    ap.add_argument("--move-share", type=float, default=0.0,
+                    help="share of each batch (0-0.3) from pairs whose iris moves 2 px or more; try 0.2-0.3")
+    ap.add_argument("--iris-weight", type=float, default=0.0,
+                    help="pull the corrected iris centre onto the real look's, per px; try 0.01")
     ap.add_argument("--lid-weight", type=float, default=0.0,
                     help="extra pull on the lid margins (horizontal edges of the real look); try 2-4")
     ap.add_argument("--no-align", action="store_true", help="don't line up each pair's frames around the eye")
@@ -612,9 +634,11 @@ def main():
                     help="pairs only when the eye corners moved less than this fraction of the eye width")
     ap.add_argument("--selftest-export", metavar="PATH", help="with --selftest: also export the synthetic model here")
     a = ap.parse_args()
-    global RES_WEIGHT, LID_WEIGHT, ALIGN, ALIGN_NAME, ALIGN_MASK
+    global RES_WEIGHT, LID_WEIGHT, MOVE_SHARE, IRIS_WEIGHT, ALIGN, ALIGN_NAME, ALIGN_MASK
     RES_WEIGHT = a.res_weight
     LID_WEIGHT = a.lid_weight
+    MOVE_SHARE = min(max(a.move_share, 0.0), 0.3)
+    IRIS_WEIGHT = a.iris_weight
     ALIGN = not a.selftest and not a.no_align
     ALIGN_NAME = a.align_mask
     ALIGN_MASK = ALIGN_MASKS[a.align_mask]
@@ -638,7 +662,8 @@ def main():
         print("looking into the lens, the iris sits at " +
               (f"({lens[0]:.1f}, {lens[1]:.1f}) and ({lens[2]:.1f}, {lens[3]:.1f}) patch px" if lens else "? (too few lens frames)"))
         train, val = Pairs(sessions, tol=a.pair_tol), Pairs(sessions, val=True, seed=1, tol=a.pair_tol)
-        print(f"training pairs from {len(train)} source frames, validation {len(val)}")
+        print(f"training pairs from {len(train)} source frames ({len(train.to_lens)} with a lens look nearby, "
+              f"{len(train.moving)} with the iris moving {MOVE_MIN:.0f}+ px), validation {len(val)}")
         if len(train) < 200 or len(val) < 20:
             sys.exit("not enough usable frames: record a full session (tools/model/capture.sh)")
         out_dir = a.out
