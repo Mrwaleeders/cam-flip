@@ -871,6 +871,30 @@ static void test_extract_luma(void)
 	free_frame(&a);
 }
 
+/* An iris looking to the side (the end of a line while reading: 12 px off the middle of a 75 x 23 eye) gets
+ * most of the shift, and its far side not much less than its near side: the iris layer used to be a hill
+ * across the eye, so an iris off to the side sat on its slope (here 72% of the shift at its centre, its far
+ * edge 55% of its near edge's sideways shift; now 78% and 60%), and on a rendered eye its round far edge was
+ * pulled straight, as if cut. */
+static void test_aperture_side_iris(void)
+{
+	for (int side = -1; side <= 1; side += 2) {
+		const float sx = -7.0f * (float)side, sy = -3.7f, ix = 200.0f + 12.0f * (float)side, iy = 200.0f;
+		const cf_eye e = make_eye(200, 200, 75, 23, sx, sy);
+		float dx[3], dy[3], sl, sc;
+		const float xs[3] = {ix - 8.0f, ix, ix + 8.0f}; /* the iris' near edge, centre, far edge (8 px out) */
+		for (int k = 0; k < 3; k++)
+			cf_warp_debug_field(&e, xs[k], iy, &dx[k], &dy[k], &sl, &sc);
+		const float centre = dy[1] / sy, near_far = (side > 0 ? dx[2] / dx[0] : dx[0] / dx[2]);
+		printf("    iris 12 px %s of the middle, shift (%.0f, %.1f): centre gets %.0f%% (%.2f, %.2f), far side %.0f%% "
+		       "of the near side's sideways shift\n",
+		       side > 0 ? "right" : "left", sx, sy, 100 * centre, dx[1], dy[1], 100 * near_far);
+		CHECK(centre > 0.76f && fabsf(dx[1]) > 0.76f * fabsf(sx) && near_far > 0.57f,
+		      "iris off to the side: centre %.0f%%, far side %.0f%% of near", 100 * centre, 100 * near_far);
+	}
+	printf("ok: an iris looking to the side moves with its whole width\n");
+}
+
 int main(void)
 {
 	srand(42);
@@ -895,6 +919,7 @@ int main(void)
 	test_aperture_delivery_range(70, 24);
 	test_aperture_delivery_range(80, 28);
 	test_aperture_lid();
+	test_aperture_side_iris();
 	test_temporal_smoothness();
 	test_aperture_slope();
 	test_low_lid_identity();

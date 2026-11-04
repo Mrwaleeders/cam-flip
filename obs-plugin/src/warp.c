@@ -297,6 +297,7 @@ static inline float pin_gain(float room, float tm)
  * 3 px, about 0.4 px with 5 px, and nothing with 6 px (tests/test_warp.c).
  */
 #define CF_LOW_SLOPE 0.395f
+#define CF_COL_FLOOR 0.6f /* see field_aperture() */
 static void blend_low(const cf_field *f, float *fx, float *fy, const float *bx, const float *by)
 {
 	const int gw = f->gw, gh = f->gh;
@@ -442,8 +443,21 @@ static int field_aperture(cf_field *f, const cf_eye *e)
 	if (has_low)
 		for (size_t k = 0; k < cells; k++)
 			bpeak = wb[k] > bpeak ? wb[k] : bpeak;
-	/* Renormalise so the middle of the opening gets the full shift. */
-	const float inv_peak = peak > 0.05f ? 1.0f / peak : 0.0f;
+	/* Renormalise so the middle of the opening gets the full shift: each node column by its own peak, down to
+	 * CF_COL_FLOOR of the eye's (the scratch rows are free now). By the eye's peak alone, the blurred iris
+	 * weight follows the opening's height along the eye, a hill in the middle of it: an iris looking to the
+	 * side (reading the end of a line) sat on its slope: on a rendered 75 px eye with the iris 12 px off the
+	 * middle and a (-7, -3.7) shift its pupil moved (-5.4, -2.7), its far side less than its near one, so
+	 * its round edge there was pulled straight, as if cut. Per column: (-5.8, -3.0); the middle of the eye
+	 * is unchanged. Columns nearer the corners (peak under CF_COL_FLOOR) keep the hill, which with the
+	 * corner pins keeps the slope within bounds (0.32-0.39 in the same cases, no scaling). */
+	float *inv_col = stop;
+	for (int i = 0; i < gw; i++) {
+		float cpk = 0;
+		for (int j = 0; j < gh; j++)
+			cpk = fmaxf(cpk, wi[(size_t)j * gw + i]);
+		inv_col[i] = peak > 0.05f ? 1.0f / fmaxf(cpk, CF_COL_FLOOR * peak) : 0.0f;
+	}
 	const float inv_lpeak = lpeak > 0.05f ? 1.0f / lpeak : 0.0f;
 	const float inv_bpeak = bpeak > 0.05f ? 1.0f / bpeak : 0.0f;
 
@@ -456,7 +470,7 @@ static int field_aperture(cf_field *f, const cf_eye *e)
 		const float dyn = (py - e->cy) * iry;
 		for (int i = 0; i < gw; i++) {
 			const size_t k = (size_t)j * gw + i;
-			float a = wi[k] * inv_peak;
+			float a = wi[k] * inv_col[i];
 			a = a < 1.0f ? a : 1.0f;
 			float b = wl[k] * inv_lpeak;
 			b = (b < 1.0f ? b : 1.0f) * (1.0f - a);

@@ -1548,7 +1548,8 @@ static obs_properties_t *camflip_properties(void *data)
 	obs_property_float_set_suffix(p, "%");
 	obs_property_set_long_description(
 		p, "100% cancels the glance at your notes as it is measured. If you still look like you're reading, "
-		   "go higher (up to 200%) to lift your eyes further; lower keeps some of the natural movement.");
+		   "go higher (up to 200%) to lift your eyes further; lower keeps some of the natural movement. "
+		   "The damping of your eyes' sideways scanning along a line doesn't change with it (above 25%).");
 
 	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 5.0, 30.0, 1.0);
 	obs_property_float_set_suffix(p, "%");
