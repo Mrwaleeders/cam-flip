@@ -357,7 +357,7 @@ int main(int argc, char **argv)
 	double ml_ms = 0, ml_ms_max = 0;
 	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
 	float steady_band[3] = {8.0f, 4.0f, 1.5f}, steady_hold[2][2] = {{0}}, steady_tau = 3.0f;
-	int steady_has[2] = {0, 0};
+	int steady_has[2] = {0, 0}, steady_snaps[3] = {0, 0, 0}; /* looks followed: sideways, down, up */
 	double steady_t[2] = {0, 0};
 	float ml_alpha = 1.0f;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
@@ -783,6 +783,8 @@ int main(int argc, char **argv)
 								const float dt = steady_has[flip] ? (float)fmax(0.0, t - steady_t[flip]) : 0.0f;
 								if (!steady_has[flip] || fabsf(px - hd[0]) > steady_band[0] ||
 								    py - hd[1] > steady_band[1] || hd[1] - py > steady_band[2]) {
+									if (steady_has[flip])
+										steady_snaps[fabsf(px - hd[0]) > steady_band[0] ? 0 : py > hd[1] ? 1 : 2]++;
 									hd[0] = px;
 									hd[1] = py;
 									steady_has[flip] = 1;
@@ -1001,6 +1003,9 @@ int main(int argc, char **argv)
 			       shake5(buf[2], okw, nn), shake5(buf[3], okw, nn), shake5(buf[8], okw, nn), shake5(buf[0], okw, nn));
 		if (ml_runs)
 			printf("eye model: %.2f ms avg, %.2f ms max over %d frames\n", ml_ms / ml_runs, ml_ms_max, ml_runs);
+		if (ml && ml_steady)
+			printf("steady: looks followed at once (both eyes): %d sideways, %d down, %d up\n", steady_snaps[0],
+			       steady_snaps[1], steady_snaps[2]);
 		if (ml) {
 			int seen, faded, knows;
 			cf_ml_stats(ml, &seen, &faded, &knows);
