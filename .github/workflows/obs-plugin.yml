@@ -30,6 +30,7 @@ jobs:
         run: |
           clang -O2 -Wall -Werror -Isrc tests/test_warp.c src/warp.c -o build_test_warp && ./build_test_warp
           clang -O2 -Wall -Werror -Isrc tests/test_gaze.c src/gaze.c src/warp.c src/pose.c -o build_test_gaze && ./build_test_gaze
+          clang -O2 -Wall -Wextra -Werror -Isrc tests/test_ml_eye.c src/ml_eye.c src/warp.c -o build_test_ml_eye && ./build_test_ml_eye
 
       - name: Build plugin
         run: CAMFLIP_VERSION="1.0.${{ github.run_number }}" ./build.sh
@@ -60,6 +61,27 @@ jobs:
             if [ -n "$missing" ]; then echo "Missing in $app: $missing"; exit 1; fi
           done
           echo "All OBS symbols resolve in both versions."
+
+      - name: Build the diagnostic and eye-model tools (render, capture, extract)
+        run: |
+          FW=/Applications/OBS.app/Contents/Frameworks
+          INC="-Ibuild/obs-studio-$OBS_VERSION/libobs -Ibuild/simde -Ibuild/include -Isrc"
+          FWK="-framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO -framework AVFoundation -framework CoreMedia"
+          clang -O2 -fobjc-arc $INC tools/render_video.m src/gaze.c src/warp.c src/pose.c src/ml_eye.c src/ml_model.m \
+            -F"$FW" -framework libobs -Wl,-rpath,"$FW" $FWK -framework CoreML -o build/render_video
+          clang -O2 -fobjc-arc $INC tools/model/extract_patches.m src/gaze.c src/warp.c src/pose.c src/ml_eye.c \
+            -F"$FW" -framework libobs -Wl,-rpath,"$FW" $FWK -o build/extract_patches
+          clang -O2 -Wall -fobjc-arc tools/model/capture_pairs.m -framework AppKit -framework AVFoundation \
+            -framework CoreMedia -framework QuartzCore -o build/capture_pairs
+
+      - name: Eye model, trained on synthetic eyes, through Core ML and the pixel code
+        run: |
+          python3 -m venv build/venv
+          build/venv/bin/pip install -q -r tools/model/requirements.txt
+          build/venv/bin/python tools/model/train.py --selftest --device cpu --selftest-export build/selftest.mlpackage
+          clang -O2 -Wall -fobjc-arc -Isrc tests/test_ml_model.m src/ml_model.m src/ml_eye.c src/warp.c \
+            -framework CoreML -framework Foundation -o build/test_ml_model
+          ./build/test_ml_model build/selftest.mlpackage
 
       - name: Run filter against real libobs + Apple Vision (latest OBS)
         run: OBS_APP=/Applications/OBS.app ./tests/run_plugin_test.sh

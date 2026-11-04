@@ -30,11 +30,17 @@
  *   --measure          also track the corrected output and report how much the iris seen by the
  *                      viewer shakes (RMS of value minus its centred 5-frame mean, pixels)
  *   --zoom Z           compare.mov enlargement (default 3)
+ *   --engine E         classic (default): the hand-built warp (warp.c); model: the personal eye model
+ *                      (ml_eye.c + ml_model.m), driven by the same gaze model and fades
+ *   --model PATH       the model for --engine model (default ~/Library/Application Support/cam-flip/
+ *                      eye-model.mlpackage)
+ *   --ml-compute U     where the model runs: all (default), cpu, gpu (CPU + GPU), ane (CPU + Neural Engine)
  *
  * Nothing leaves this Mac. tools/render.sh builds and runs it.
  */
 #define CAMFLIP_TEST 1
 #include "../src/plugin.m"
+#include "../src/ml_model.h"
 
 #import <AVFoundation/AVFoundation.h>
 
@@ -330,6 +336,11 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	int lag = 1, measure = 0, zoom = 3;
+	int engine_model = 0;
+	const char *model_path = NULL;
+	enum cf_ml_compute ml_compute = CF_ML_ALL;
+	double ml_ms = 0, ml_ms_max = 0;
+	int ml_runs = 0;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
 	int vis_opt = 0; /* --vis-baseline (1) and --vis-notes (2) given */
@@ -357,9 +368,27 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--scan-damp")) { p.scan_damp = (float)atof(v); i++; }
 		else if (!strcmp(a, "--zoom")) { zoom = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--measure")) measure = 1;
+		else if (!strcmp(a, "--engine")) { engine_model = !strcmp(v, "model"); i++; }
+		else if (!strcmp(a, "--model")) { model_path = v; i++; }
+		else if (!strcmp(a, "--ml-compute")) {
+			ml_compute = !strcmp(v, "cpu") ? CF_ML_CPU : !strcmp(v, "gpu") ? CF_ML_CPU_GPU
+				   : !strcmp(v, "ane") ? CF_ML_CPU_ANE : CF_ML_ALL;
+			i++;
+		}
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
 	}
 	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
+	cf_ml_model *ml = NULL;
+	if (engine_model) {
+		char err[512] = "";
+		const char *mp = model_path ? model_path : cf_ml_default_path();
+		ml = cf_ml_load(mp, ml_compute, err, sizeof(err));
+		if (!ml) {
+			fprintf(stderr, "cannot load the eye model %s: %s\n", mp, err);
+			return 1;
+		}
+		printf("engine: personal eye model %s\n", mp);
+	}
 	if (lag < 0)
 		lag = 0;
 
@@ -549,6 +578,8 @@ int main(int argc, char **argv)
 
 		cf_gaze gaze;
 		cf_gaze_init(&gaze);
+		cf_face fed; /* the newest face the gaze model has seen (lag frames old) */
+		memset(&fed, 0, sizeof(fed));
 		enum { QMAX = 16 };
 		cf_face q[QMAX]; /* faces waiting to be fed, newest last */
 		double qt[QMAX];
@@ -643,6 +674,7 @@ int main(int argc, char **argv)
 				while (qn > lag) {
 					cf_eye tmp[2];
 					cf_gaze_update(&gaze, &q[0], &p, qt[0], tmp);
+					fed = q[0];
 					memmove(q, q + 1, sizeof(q[0]) * (QMAX - 1));
 					memmove(qt, qt + 1, sizeof(qt[0]) * (QMAX - 1));
 					qn--;
@@ -659,7 +691,32 @@ int main(int argc, char **argv)
 					const uint32_t ls[2] = {(uint32_t)dys, (uint32_t)duvs};
 					cf_channel ch[8];
 					const int cc = cf_channels(CF_FMT_NV12, planes, ls, w, h, ch);
-					cf_warp_frame(ch, cc, eyes, n);
+					if (ml) {
+						/* The model gets where the iris should end up: where the gaze model last saw it
+						 * (moved with the eye since, as predicted) plus the shift the classic warp
+						 * would apply. It sees this frame's pixels, so it handles jumps since then. */
+						float tgt[2][2], alpha[2];
+						for (int e = 0; e < n; e++) {
+							const cf_pt c0 = centroid_of(fed.left_eye, fed.left_count),
+								    c1 = centroid_of(fed.right_eye, fed.right_count);
+							const float d0 = hypotf(c0.x - eyes[e].cx, c0.y - eyes[e].cy),
+								    d1 = hypotf(c1.x - eyes[e].cx, c1.y - eyes[e].cy);
+							const int right = fed.right_count && (!fed.left_count || d1 < d0);
+							const cf_pt c = right ? c1 : c0, pu = right ? fed.right_pupil : fed.left_pupil;
+							tgt[e][0] = pu.x + (eyes[e].cx - c.x) + eyes[e].sx;
+							tgt[e][1] = pu.y + (eyes[e].cy - c.y) + eyes[e].sy;
+							alpha[e] = fminf(1.0f, st.factor / 0.3f);
+						}
+						double ms = 0;
+						if (cf_ml_correct(ml, &ch[0], ch, cc, cf_ml_residual_channels(CF_FMT_NV12), eyes, n,
+								  (const float(*)[2])tgt, alpha, &ms)) {
+							ml_ms += ms;
+							ml_ms_max = fmax(ml_ms_max, ms);
+							ml_runs++;
+						}
+					} else {
+						cf_warp_frame(ch, cc, eyes, n);
+					}
 					warped++;
 				}
 
@@ -854,6 +911,9 @@ int main(int argc, char **argv)
 		if (f_out)
 			printf("SEEN by tracking the corrected video (px): y L %.2f R %.2f, x L %.2f (original y L %.2f, same frames)\n",
 			       shake5(buf[2], okw, nn), shake5(buf[3], okw, nn), shake5(buf[8], okw, nn), shake5(buf[0], okw, nn));
+		if (ml_runs)
+			printf("eye model: %.2f ms avg, %.2f ms max over %d frames\n", ml_ms / ml_runs, ml_ms_max, ml_runs);
+		cf_ml_free(ml);
 		printf("wrote %s/{corrected.mov,compare.mov,frames.csv}\n", argv[2]);
 		camflip_destroy(f);
 		if (f_out)
