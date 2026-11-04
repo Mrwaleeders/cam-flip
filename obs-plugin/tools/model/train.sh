@@ -11,4 +11,6 @@ if [ ! -x build/venv/bin/python ]; then
   build/venv/bin/pip install -q --upgrade pip
   build/venv/bin/pip install -q -r tools/model/requirements.txt
 fi
+# Anything Apple's GPU can't run falls back to the CPU instead of stopping training.
+export PYTORCH_ENABLE_MPS_FALLBACK=1
 exec build/venv/bin/python tools/model/train.py "$@"

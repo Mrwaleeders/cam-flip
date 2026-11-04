@@ -99,12 +99,19 @@ def base_grid(device):
     return torch.stack([xs, ys]).to(device)  # 2,H,W patch px
 
 
+def sample(img, g):
+    """grid_sample with border padding, written so Apple's GPU (MPS) runs it: MPS has no "border" mode,
+    but with align_corners=True, clamping the grid to the image and padding with zeros is the same,
+    values and gradients alike."""
+    return F.grid_sample(img, g.clamp(-1, 1), mode="bilinear", padding_mode="zeros", align_corners=True)
+
+
 def render(src, flow, res, mask, grid):
     """What the plugin does (ml_eye.c), in patch space: output(p) = src(p + flow(p)) + mask * res."""
     q = grid[None] + flow
     gx = q[:, 0] / (W - 1) * 2 - 1
     gy = q[:, 1] / (H - 1) * 2 - 1
-    warped = F.grid_sample(src, torch.stack([gx, gy], -1), mode="bilinear", padding_mode="border", align_corners=True)
+    warped = sample(src, torch.stack([gx, gy], -1))
     return warped + mask * res
 
 
@@ -263,12 +270,15 @@ def augment(src, dst, tgt, rng, device):
     th[:, 0, 2] = tx
     th[:, 1, 2] = ty
     grid = F.affine_grid(th, src.shape, align_corners=True)
-    src = F.grid_sample(src, grid, padding_mode="border", align_corners=True)
-    dst = F.grid_sample(dst, grid, padding_mode="border", align_corners=True)
+    src = sample(src, grid)
+    dst = sample(dst, grid)
     # target: input coords -> output coords (inverse of theta)
     n = torch.stack([tgt[:, 0] * W / (W - 1) * 2 - 1, tgt[:, 1] * H / (H - 1) * 2 - 1], 1)
-    A = th[:, :, :2]
-    out = torch.linalg.solve(A, (n - th[:, :, 2])[..., None])[..., 0]
+    # 2x2 inverse by hand (torch.linalg.solve isn't on every MPS build)
+    a, b_, c, d = th[:, 0, 0], th[:, 0, 1], th[:, 1, 0], th[:, 1, 1]
+    r = n - th[:, :, 2]
+    det = a * d - b_ * c
+    out = torch.stack([(d * r[:, 0] - b_ * r[:, 1]) / det, (-c * r[:, 0] + a * r[:, 1]) / det], 1)
     tgt = torch.stack([(out[:, 0] + 1) / 2 * (W - 1) / W, (out[:, 1] + 1) / 2 * (H - 1) / H], 1)
     gain = torch.tensor(rng.uniform(0.85, 1.15, (b, 1, 1, 1)), dtype=torch.float32, device=device)
     gamma = torch.tensor(rng.uniform(0.85, 1.2, (b, 1, 1, 1)), dtype=torch.float32, device=device)
