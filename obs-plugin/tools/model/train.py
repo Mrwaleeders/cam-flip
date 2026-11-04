@@ -454,6 +454,7 @@ def iris_centre(img, weight):
 # ---------------------------------------------------------------- training
 
 RES_WEIGHT = 0.05  # --res-weight: how much the brightness residual costs; higher pushes the model to move pixels
+LID_WEIGHT = 0.0  # --lid-weight: extra pull on the target's horizontal edges (the lid margins), see losses()
 
 
 def losses(model, src, dst, tgt, grid, wmap, edge):
@@ -471,6 +472,17 @@ def losses(model, src, dst, tgt, grid, wmap, edge):
     gy = lambda x: x[..., 1:, :] - x[..., :-1, :]
     l_grad = (torch.abs(gx(out) - gx(dst)) * wmap[..., :, 1:]).mean() + (torch.abs(gy(out) - gy(dst)) * wmap[..., 1:, :]).mean()
     l_tv = torch.abs(gx(flow)).mean() + torch.abs(gy(flow)).mean()
+    # The lid margins are long horizontal edges that move a pixel or two between reading and the lens
+    # look. In the plain losses that is a small share next to the iris, so the model leaves the lids as
+    # they are. This compares the vertical gradient where the target has strong horizontal edges, at full
+    # and half resolution (the half gives a pull from a couple of pixels away).
+    l_lid = 0.0
+    if LID_WEIGHT > 0:
+        for k in (1, 2):
+            o2, d2, w2 = (F.avg_pool2d(x, k) if k > 1 else x for x in (out, dst, wmap.expand_as(out)))
+            ed = torch.abs(gy(d2))
+            ed = ed / (ed.mean((-2, -1), keepdim=True) + 1e-4)
+            l_lid = l_lid + (torch.abs(gy(o2) - gy(d2)) * ed.clamp(max=8.0) * w2[..., 1:, :]).mean()
     l_res = torch.abs(mask * res).mean()
     l_edge = ((torch.abs(flow).sum(1, keepdim=True) / MAX_FLOW + torch.abs(mask * res) / MAX_RES) * edge).mean()
     # Keep the outputs out of tanh / sigmoid saturation. Saturated, they pass no gradient, and the
@@ -478,7 +490,7 @@ def losses(model, src, dst, tgt, grid, wmap, edge):
     # MAX_FLOW (every sample off the patch) and training froze. This term still pulls back from there.
     o = model.logits
     l_sat = (F.relu(o[:, 0:3].abs() - 2.0) ** 2).mean() + (F.relu((o[:, 3:4] + 2.0).abs() - 5.0) ** 2).mean()
-    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + RES_WEIGHT * l_res + 0.5 * l_edge + 0.1 * l_sat
+    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + RES_WEIGHT * l_res + 0.5 * l_edge + 0.1 * l_sat + LID_WEIGHT * l_lid
     return total, out, l_pix
 
 
@@ -591,6 +603,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--res-weight", type=float, default=0.05,
                     help="cost of the brightness residual (higher: move pixels rather than paint them)")
+    ap.add_argument("--lid-weight", type=float, default=0.0,
+                    help="extra pull on the lid margins (horizontal edges of the real look); try 2-4")
     ap.add_argument("--no-align", action="store_true", help="don't line up each pair's frames around the eye")
     ap.add_argument("--align-mask", choices=sorted(ALIGN_MASKS), default="corners",
                     help="skin used to line frames up: eye corners only (default) or the whole ring around the eye")
@@ -598,8 +612,9 @@ def main():
                     help="pairs only when the eye corners moved less than this fraction of the eye width")
     ap.add_argument("--selftest-export", metavar="PATH", help="with --selftest: also export the synthetic model here")
     a = ap.parse_args()
-    global RES_WEIGHT, ALIGN, ALIGN_NAME, ALIGN_MASK
+    global RES_WEIGHT, LID_WEIGHT, ALIGN, ALIGN_NAME, ALIGN_MASK
     RES_WEIGHT = a.res_weight
+    LID_WEIGHT = a.lid_weight
     ALIGN = not a.selftest and not a.no_align
     ALIGN_NAME = a.align_mask
     ALIGN_MASK = ALIGN_MASKS[a.align_mask]
