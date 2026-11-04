@@ -293,13 +293,20 @@ def losses(model, src, dst, tgt, grid, wmap, edge):
     flow, res, mask = model(src, tgt)
     out = render(src, flow, res, mask, grid)
     l_pix = (torch.abs(out - dst) * wmap).mean()
+    # Coarse versions of the same comparison: a sharp-image loss only "sees" an iris that is already
+    # within a pixel or two of the right place, so on its own training can stall or slide back to
+    # "change nothing". Blurred copies give a pull from several pixels away.
+    l_coarse = 0.0
+    for k in (4, 8):
+        po, pd, pw = (F.avg_pool2d(x, k) for x in (out, dst, wmap.expand_as(out)))
+        l_coarse = l_coarse + (torch.abs(po - pd) * pw).mean()
     gx = lambda x: x[..., :, 1:] - x[..., :, :-1]
     gy = lambda x: x[..., 1:, :] - x[..., :-1, :]
     l_grad = (torch.abs(gx(out) - gx(dst)) * wmap[..., :, 1:]).mean() + (torch.abs(gy(out) - gy(dst)) * wmap[..., 1:, :]).mean()
     l_tv = torch.abs(gx(flow)).mean() + torch.abs(gy(flow)).mean()
     l_res = torch.abs(mask * res).mean()
     l_edge = ((torch.abs(flow).sum(1, keepdim=True) / MAX_FLOW + torch.abs(mask * res) / MAX_RES) * edge).mean()
-    total = l_pix + 0.5 * l_grad + 0.02 * l_tv + 0.05 * l_res + 0.5 * l_edge
+    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + 0.05 * l_res + 0.5 * l_edge
     return total, out, l_pix
 
 
@@ -377,14 +384,18 @@ def main():
     ap.add_argument("--resume", action="store_true", help="start from eye-model.pt in --out")
     ap.add_argument("--no-export", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--selftest-export", metavar="PATH", help="with --selftest: also export the synthetic model here")
     a = ap.parse_args()
     dev = torch.device(a.device)
-    torch.manual_seed(0)
+    torch.manual_seed(a.seed)
 
     if a.selftest:
-        train, val = SyntheticPairs(0), SyntheticPairs(1)
-        a.steps = min(a.steps, 600)
+        train, val = SyntheticPairs(a.seed), SyntheticPairs(1000 + a.seed)
+        # Small batches, more steps: same compute as 600 x 48, but more updates to get past the
+        # start, where the model hasn't found the iris yet.
+        a.steps = min(a.steps, 1200)
+        a.batch = min(a.batch, 24)
         out_dir = None
     else:
         if not a.sessions:
@@ -407,7 +418,7 @@ def main():
     edge = 1 - ellipse_map(mid, CORNER_Y - 2, 60, 30, 1.0, 0.0, dev)[None, None]
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=a.steps, pct_start=0.05)
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(a.seed)
     best = None
     t0 = time.time()
     for step in range(1, a.steps + 1):
