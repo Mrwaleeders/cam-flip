@@ -22,6 +22,7 @@ Your face is in all of these: keep them on this Mac.
 Needs: pip install torch numpy coremltools (coremltools only for the export).
 """
 import argparse
+import copy
 import csv
 import json
 import math
@@ -407,6 +408,7 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=a.steps, pct_start=0.05)
     rng = np.random.default_rng(0)
+    best = None
     t0 = time.time()
     for step in range(1, a.steps + 1):
         s, d, t = [torch.from_numpy(x).to(dev) for x in train.sample(a.batch)]
@@ -414,13 +416,19 @@ def main():
         loss, _, _ = losses(model, s, d, t, grid, wmap, edge)
         opt.zero_grad()
         loss.backward()
+        # A single bad batch (e.g. a mislabelled pair) must not throw training off: clip its step.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         opt.step()
         sched.step()
         if step % max(1, a.steps // 10) == 0 or step == a.steps:
             lm, lc, em, ec = evaluate(model, val, grid, wmap, edge, dev, batches=5 if a.selftest else 20)
             print(f"step {step}/{a.steps} ({time.time() - t0:.0f} s): held-out difference to the real look "
                   f"{lm:.4f} (uncorrected {lc:.4f}); iris off by {em:.2f} px (uncorrected {ec:.2f})")
+            if best is None or lm < best[0]:  # keep the best model seen on held-out frames
+                best = (lm, copy.deepcopy(model.state_dict()))
 
+    if best is not None:
+        model.load_state_dict(best[1])
     lm, lc, em, ec = evaluate(model, val, grid, wmap, edge, dev)
     if a.selftest:
         ok = em < 0.6 * ec and lm < 0.8 * lc
