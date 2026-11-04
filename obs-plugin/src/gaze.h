@@ -505,6 +505,7 @@ typedef struct {
 	int have_head_full;
 	float engage_f; /* how far the sideways damping (and the lid restoration) is engaged, 0..1 */
 	int have_engage;
+	float d_engage; /* the shown glance d averaged over ENGAGE_TAU: where the gaze has been lately (see engage) */
 
 	/* ---- Status reasons (cf_gaze_status.too_far / turned) and the notes learnt from reading. The learner's
 	 * own state goes here too (see "Notes learnt from reading" in gaze.c). */

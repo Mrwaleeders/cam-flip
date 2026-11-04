@@ -2633,6 +2633,45 @@ static void test_learn_notes(void)
 		      "learnt notes engage reading just under the camera %.2f, a notes step %.2f", e_learnt, e_step);
 		printf("ok: L15 learnt notes engage the sideways damping and the lids as a notes step does\n");
 	}
+
+	/* L16. Reading just under the camera is engaged nearly fully (the glance averaged over a second against the
+	 * learnt notes: one frame's glance there is mostly the fixations' scatter, which left it 0.65 engaged), and
+	 * holding the lens look afterwards hardly more than before (0.15 here from one frame's glance alone: the lens
+	 * calibration's own error and the noise, the glance being clipped at 0). */
+	{
+		const float SMALL = 0.014f;
+		double e_read = 0, e_lens = 0;
+		for (unsigned k = 0; k < 4; k++) {
+			cf_calib_result nc;
+			cf_gaze_params p = rd_params(W, SMALL, &nc);
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(171 + k);
+			rd_sim s;
+			rd_init(&s, W, RD_READ, SMALL, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 90.0, 1, &lg);
+			double sum = 0;
+			for (int i = 0; i < 30 * 30; i++) {
+				rd_run(&g, &p, &s, 1.0 / 30.0, 1, &lg);
+				sum += g.engage_f;
+			}
+			e_read += sum / (30 * 30) / 4.0;
+			rd_init(&s, W, RD_HOLD, 0.0f, s.t);
+			rd_run(&g, &p, &s, 2.0, 1, &lg);
+			sum = 0;
+			for (int i = 0; i < 30 * 30; i++) {
+				rd_run(&g, &p, &s, 1.0 / 30.0, 1, &lg);
+				sum += g.engage_f;
+			}
+			e_lens += sum / (30 * 30) / 4.0;
+		}
+		printf("    reading %.3f below the lens with learnt notes: engaged %.2f; then holding the lens look: %.2f\n", SMALL,
+		       e_read, e_lens);
+		CHECK(e_read >= 0.85 && e_lens <= 0.2, "reading just under the camera engaged %.2f, the lens look after %.2f",
+		      e_read, e_lens);
+		printf("ok: L16 reading just under the camera engages nearly fully, the lens look after it hardly\n");
+	}
 }
 
 int main(void)

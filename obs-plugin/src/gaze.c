@@ -202,6 +202,12 @@
 #define HEAD_FAR_MAX 40.0f    /* ... up to here (the far cue, see cf_gaze_update()) */
 #define ENGAGE_UP_MARGIN 0.02f /* eye widths: sideways damping engages this much later with the eyes up in the head */
 #define ENGAGE_SLEW 0.15f      /* per 1/30 s: how fast it engages or lets go without a look (at once with one) */
+#define ENGAGE_TAU 1.0         /* s: with notes, it also engages by the glance averaged over this ... */
+#define ENGAGE_LO 0.35f        /* ... from this share of the notes' glance below the lens ... */
+#define ENGAGE_HI 0.85f        /* ... fully at this share (the user's: reading 0.014 below the lens look, each
+				* fixation's height scattered by 0.017, so one frame's glance says little: averaged
+				* over a second it says reading, 0.89 engaged against 0.65, while holding the lens
+				* look after it stays 0.16 engaged, 0.15 before; tests L15, L16) */
 
 /* ---- Tuning: notes learnt from reading (see "Notes learnt from reading"). The reading numbers are the user's
  * clips (~0.5 m from a MacBook camera, eyes 75-88 px wide). */
@@ -3165,7 +3171,19 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * from reading the far limit is widened to max_glance, which for notes just under the lens (a glance of
 	 * 0.014 on the user's clip) left it a quarter engaged while reading. */
 	const float e0 = fminf(-fminf(g->up_lock, 0.0f), ENGAGE_UP_MARGIN);
-	const float engage_t = smoothstepf(e0, e0 + fmaxf(0.35f * engage_limit, 0.01f), d);
+	float engage_t = smoothstepf(e0, e0 + fmaxf(0.35f * engage_limit, 0.01f), d);
+	/* With notes, also where the gaze has been over the last second against where the user reads: notes just
+	 * under the lens are only a pixel or two below it, less than the height of one fixation scatters while
+	 * reading, so that frame's glance alone left reading there partly engaged. (It lets go a second after the gaze
+	 * leaves the notes: what it damps then is a second of looking around, and the lids it restores are back
+	 * where they were at the lens by then.) */
+	if (!g->have_engage)
+		g->d_engage = d;
+	else if (!hold)
+		g->d_engage += (float)(1.0 - exp(-dt / ENGAGE_TAU)) * (d - g->d_engage);
+	if (notes && notes_glance > 0)
+		engage_t = fmaxf(engage_t, smoothstepf(e0 + ENGAGE_LO * notes_glance, e0 + ENGAGE_HI * notes_glance,
+						       g->d_engage));
 	if (!g->have_engage || (sacc && !catching_up)) {
 		g->engage_f = engage_t;
 	} else {
