@@ -52,6 +52,8 @@
  *                      1 follows a frame sooner but trips more easily on a noisy pupil)
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
  *   --ml-alpha F       scale the model's effect (default 1)
+ *   --ml-passes N      run the model N times per frame (1-4, default 1), each on the corrected pixels
+ *                      with the same target, so it gets nearer the target each time; ms is the total
  *   --learn            print the notes learnt from the reading as they are handed out (and the final
  *                      estimate) and, unless the notes are given (--notes, --notes-offset), pass them back
  *                      in the params the way the plugin saves them (as tools/replay.c --learn)
@@ -450,7 +452,7 @@ int main(int argc, char **argv)
 	double ml_ms = 0, ml_ms_max = 0;
 	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
 	float steady_band[3] = {8.0f, 4.0f, 2.5f};
-	int steady_dwell = 2;
+	int steady_dwell = 2, ml_passes = 1;
 	float steady_gain = 1.0f, steady_max_ask = 0.0f;
 	steady_eye steady[2];
 	memset(steady, 0, sizeof(steady));
@@ -491,6 +493,7 @@ int main(int argc, char **argv)
 			i++;
 		}
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
+		else if (!strcmp(a, "--ml-passes")) { ml_passes = atoi(v) < 1 ? 1 : atoi(v) > 4 ? 4 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-max-ask")) { steady_max_ask = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-gain")) { steady_gain = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-dwell")) { steady_dwell = atoi(v) < 1 ? 1 : atoi(v); i++; }
@@ -908,10 +911,23 @@ int main(int argc, char **argv)
 							mla[e] = alpha[e];
 						}
 						double ms = 0;
-						if (cf_ml_correct(ml, &ch[0], ch, cc, ml_res ? cf_ml_residual_channels(CF_FMT_NV12) : 0u, eyes, n,
-								  (const float(*)[2])tgt, alpha, &ms)) {
-							ml_ms += ms;
-							ml_ms_max = fmax(ml_ms_max, ms);
+						/* --ml-passes: the model moves the iris only about two thirds of the way per run,
+						 * so later runs, on the already corrected pixels and with the same target, ask
+						 * only for what is left (each ask stays the size it was trained on). The
+						 * brightness residual is applied on the first run only, so nothing is painted
+						 * twice. */
+						double ms_all = 0;
+						int ran = 0;
+						for (int pass = 0; pass < ml_passes; pass++) {
+							const unsigned rc = ml_res && pass == 0 ? cf_ml_residual_channels(CF_FMT_NV12) : 0u;
+							if (!cf_ml_correct(ml, &ch[0], ch, cc, rc, eyes, n, (const float(*)[2])tgt, alpha, &ms))
+								break;
+							ms_all += ms;
+							ran = 1;
+						}
+						if (ran) {
+							ml_ms += ms_all;
+							ml_ms_max = fmax(ml_ms_max, ms_all);
 							ml_runs++;
 						}
 					} else {
