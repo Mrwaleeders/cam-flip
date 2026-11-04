@@ -744,6 +744,23 @@ static obs_data_t *set_up_settings(void)
 	return s;
 }
 
+/* A pending forget of the learnt notes (camflip_update sets one when the settings lose them, as a check's
+ * restore does) passed on to the gaze model, as the tracking thread does before its next frame (process_frame).
+ * No frames come during these checks, so a check that takes learnt notes clears it first: else
+ * take_learnt_notes drops the notes as being from before the forget. */
+static void pass_forget(struct camflip *f)
+{
+	pthread_mutex_lock(&f->lock);
+	const bool forget = f->forget_learnt;
+	f->forget_learnt = false;
+	pthread_mutex_unlock(&f->lock);
+	if (forget) {
+		pthread_mutex_lock(&f->gaze_lock);
+		cf_gaze_forget_learnt_notes(&f->gaze);
+		pthread_mutex_unlock(&f->gaze_lock);
+	}
+}
+
 /*
  * Notes learnt from the reading (a synthetic cf_learnt_notes, taken the way the tracking thread takes
  * them): passed to the gaze model, saved without rebuilding an open panel (except the first time,
@@ -891,6 +908,7 @@ static void run_learnt_notes(struct camflip *f, obs_data_t *restore)
 
 	obs_data_release(s);
 	camflip_update(f, restore);
+	pass_forget(f); /* (the restored settings have no learnt notes) */
 }
 
 /* "Look at the camera" is checked before it is used (cf_gaze_check_lens_look): a look with the eyes
@@ -902,6 +920,7 @@ static void run_lens_look(struct camflip *f, obs_data_t *restore)
 	obs_data_t *s = set_up_settings();
 	obs_data_set_double(s, S_BASELINE, 0.01); /* the previous camera look */
 	camflip_update(f, s);
+	pass_forget(f);
 
 	cf_calib_result look;
 	memset(&look, 0, sizeof(look));
@@ -945,7 +964,7 @@ static void run_lens_look(struct camflip *f, obs_data_t *restore)
 	if (learnt)
 		obs_data_release(learnt);
 	cf_calib_result low = look;
-	low.offset = -0.045f;
+	low.offset = -0.048f; /* 0.002 above the reading: under CF_LOOK_ABOVE_READING */
 	begin_step(f, CALIB_LENS);
 	taken = finish_step(f, 1, &low, &changes);
 	pthread_mutex_lock(&f->lock);
@@ -1024,6 +1043,7 @@ static void run_lens_look_second_try(struct camflip *f, obs_data_t *restore)
 	obs_data_t *s = set_up_settings();
 	obs_data_set_double(s, S_BASELINE, 0.01); /* the previous camera look */
 	camflip_update(f, s);
+	pass_forget(f);
 	pthread_mutex_lock(&f->lock);
 	f->look_low_prev = false;
 	pthread_mutex_unlock(&f->lock);
@@ -1043,7 +1063,7 @@ static void run_lens_look_second_try(struct camflip *f, obs_data_t *restore)
 	cf_calib_result low;
 	memset(&low, 0, sizeof(low));
 	low.target = CF_CALIB_LENS;
-	low.offset = -0.045f; /* level with the reading */
+	low.offset = -0.048f; /* level with the reading (0.002 above it) */
 	low.openness = 0.31f;
 	low.head = (cf_head_ref){.ok = 1, .side = 0.01f, .vert = 0.5f, .eyes = 0.0f, .tilt = 0.1f};
 	low.upper = 0.2f;
@@ -1058,9 +1078,9 @@ static void run_lens_look_second_try(struct camflip *f, obs_data_t *restore)
 	begin_step(f, CALIB_LENS);
 	const bool taken = finish_step(f, 1, &low, &changes);
 	pthread_mutex_lock(&f->lock);
-	const bool used = fabsf(f->baseline + 0.045f) < 1e-6f && f->look_bad == CF_LOOK_OK && f->lens_done && !f->learnt.has;
+	const bool used = fabsf(f->baseline + 0.048f) < 1e-6f && f->look_bad == CF_LOOK_OK && f->lens_done && !f->learnt.has;
 	pthread_mutex_unlock(&f->lock);
-	check(taken && used && changes && fabs(obs_data_get_double(changes, S_BASELINE) + 0.045) < 1e-6 &&
+	check(taken && used && changes && fabs(obs_data_get_double(changes, S_BASELINE) + 0.048) < 1e-6 &&
 		      obs_data_has_user_value(changes, S_LEARNT) && !obs_data_get_bool(changes, S_LEARNT) &&
 		      cue_is(f, CUE_DONE),
 	      "a second camera look running level with the reading is taken, and the learnt notes are forgotten");
@@ -1069,14 +1089,7 @@ static void run_lens_look_second_try(struct camflip *f, obs_data_t *restore)
 
 	/* A look turned down for another reason in between starts the count again. (The forget is passed on to
 	 * the gaze model as the tracking thread does before its next frame, and notes are learnt again.) */
-	pthread_mutex_lock(&f->lock);
-	const bool forget = f->forget_learnt;
-	f->forget_learnt = false;
-	pthread_mutex_unlock(&f->lock);
-	pthread_mutex_lock(&f->gaze_lock);
-	if (forget)
-		cf_gaze_forget_learnt_notes(&f->gaze);
-	pthread_mutex_unlock(&f->gaze_lock);
+	pass_forget(f);
 	learnt = take_learnt_notes(f, &reading);
 	if (learnt)
 		obs_data_release(learnt);
