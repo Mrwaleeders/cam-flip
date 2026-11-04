@@ -15,11 +15,15 @@
  *
  * Pixels are processed in the camera's own format, with no conversion, so nothing outside the
  * eyes changes.
+ *
+ * The settings panel sets itself up: one look into the camera ("Look at the camera"), and the notes
+ * are learnt from the reading itself (gaze.c). Everything else is under "Show advanced settings".
  */
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
 #import <Vision/Vision.h>
+#import <objc/message.h>
 
 #include <obs-module.h>
 #include <math.h>
@@ -63,15 +67,15 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_NOTES_SIDE "notes_side"
 #define S_HAS_NOTES "has_notes"
 #define S_NOTES_OPEN "notes_open"
-/* The face looking into the camera, learnt by step 1 (pose.c's cf_head_ref): head turns and tilts are
- * measured from it. No S_HEAD_REF (step 1 done by an older version): a typical face is assumed. */
+/* The face looking into the camera, learnt by the camera look (pose.c's cf_head_ref): head turns and
+ * tilts are measured from it. No S_HEAD_REF (a look by an older version): a typical face is assumed. */
 #define S_HEAD_REF "head_ref"
 #define S_HEAD_SIDE "head_side"
 #define S_HEAD_VERT "head_vert"
 #define S_HEAD_EYES "head_eyes"
 #define S_HEAD_TILT "head_tilt"
-/* The lids looking into the camera, learnt by step 1 (upper lid above / lower lid below the eye corners'
- * line, eye widths): what reading narrows is restored from these. 0 (older step 1): not restored. */
+/* The lids looking into the camera, learnt by the camera look (upper lid above / lower lid below the eye
+ * corners' line, eye widths): what reading narrows is restored from these. 0 (older look): not restored. */
 #define S_BASELINE_UPPER "baseline_upper"
 #define S_BASELINE_LOWER "baseline_lower"
 #define S_CALIB_VERSION "calib_version"
@@ -82,9 +86,27 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_VIS_BASELINE "vis_baseline"
 #define S_VIS_NOTES "vis_notes"
 
+/* "Show advanced settings": the panel shows only what everyone needs unless this is on. */
+#define S_ADVANCED "advanced"
+/* The notes learnt from the user's reading (cf_learnt_notes), saved so they survive a restart. */
+#define S_LEARNT "learnt"
+#define S_LEARNT_OFFSET "learnt_offset"
+#define S_LEARNT_SIDE "learnt_side"
+#define S_LEARNT_OPEN "learnt_open"
+#define S_LEARNT_HAS_VIS "learnt_has_vis"
+#define S_LEARNT_VIS "learnt_vis"
+#define S_LEARNT_SECONDS "learnt_seconds"
+/* Version 1: the panel that sets itself up (see migrate_setup). No default, like S_CALIB_VERSION. */
+#define S_SETUP_VERSION "setup_version"
+#define SETUP_VERSION 1
+
 /* Version 2: gaze offsets are in eye widths. Older calibrations are in other units. */
 #define CALIB_VERSION 2
 #define DEFAULT_BASELINE 0.0 /* eye widths; pupil level with the eye corners */
+
+/* macOS system sounds played when a step finishes (see play_cue) */
+#define CUE_DONE "Glass"   /* it worked */
+#define CUE_FAILED "Basso" /* it didn't: the panel says why */
 
 /* Internal hotkey name for a filter with the default name; other filters add their own name,
  * see hotkey_names(). Key bindings are saved under this name, so it must stay stable. */
@@ -126,7 +148,8 @@ struct camflip {
 	/* settings */
 	bool mirror;
 	bool eye_contact;
-	bool show_eyes;
+	bool advanced;  /* "Show advanced settings" */
+	bool show_eyes; /* the tracked-eyes overlay: only while the advanced settings are shown */
 	float strength;
 	float scan_damp;
 	float max_glance;
@@ -135,29 +158,30 @@ struct camflip {
 	float notes_offset;
 	float notes_side;
 	float notes_open; /* eye openness at the notes; 0 = unknown (calibrated by an older version) */
-	cf_head_ref head_ref; /* the face looking into the camera; ok 0 = not learnt (older step 1) */
-	float baseline_upper, baseline_lower; /* lids looking into the camera; 0 = not learnt (older step 1) */
-	bool has_notes;
+	cf_head_ref head_ref; /* the face looking into the camera; ok 0 = not learnt (older camera look) */
+	float baseline_upper, baseline_lower; /* lids looking into the camera; 0 = not learnt (older camera look) */
+	bool has_notes;   /* the notes step ("Look at your notes"): used before learnt notes while valid */
 	bool notes_stale; /* notes no longer below the (newer) lens calibration: not used until redone */
 	bool lens_done;
-	bool needs_recalib; /* old settings in old units were reset */
+	/* The notes learnt from the user's reading (S_LEARNT), and a forget the worker still has to pass on to
+	 * the gaze model before its next update (see camflip_forget_notes_clicked). */
+	cf_learnt_notes learnt;
+	bool forget_learnt;
 
 	/* calibration requests (from the panel) and progress (from the worker) */
 	int calib_request; /* 0 none, else CALIB_LENS / CALIB_NOTES */
 	int calib_running; /* CALIB_IDLE / CALIB_LENS / CALIB_NOTES */
 	int calib_failed;  /* CALIB_IDLE or the step that gave up */
 	bool calib_notes_bad; /* last notes calibration was not below the camera: rejected */
+	int look_bad;         /* last camera look turned down: CF_LOOK_UNSTEADY / CF_LOOK_LOW, else CF_LOOK_OK */
 	bool calib_no_frames; /* last calibration gave up: no camera frames arrived */
 	bool frames_flipped;  /* the camera sends upside-down frames (frame->flip): not tracked */
 	bool calib_cancel;    /* worker: drop the calibration the gaze model may still be running */
 	uint64_t calib_progress_ns; /* when the calibration was requested or last got a frame */
-	const char *calib_done_msg;
 
-	/* Vision's pupil point at the calibrations (see S_VIS_CAL), and whether calib_done_msg is a hint that
-	 * the last calibration may be off (cf_gaze_calib_hints) */
+	/* Vision's pupil point at the calibrations (see S_VIS_CAL) */
 	int vis_cal;
 	float vis_baseline, vis_notes;
-	bool calib_hint;
 
 	/* frame hand-off: two buffers, the worker owns `busy`, the newest waiting one is `pending` */
 	grey_frame frames[2];
@@ -165,8 +189,9 @@ struct camflip {
 	int pending;
 	bool stop;
 
-	/* status for the panel */
+	/* status for the panel (cf_gaze_status of the last analysed frame) */
 	bool st_face;
+	bool st_too_far, st_turned, st_reading;
 	float st_factor;
 	double ema_vision_ms, ema_warp_ms, ema_fps;
 	double last_frame_t; /* worker, for the analysed-fps estimate */
@@ -190,6 +215,7 @@ struct camflip {
 	float dbg_conf;
 	cf_face seen_face; /* what Vision saw on the last analysed frame (full-resolution pixels) */
 	bool test_clock;   /* detect_face times re-detection by frame timestamps, not the wall clock */
+	const char *last_cue; /* the sound play_cue would have played last (CUE_DONE / CUE_FAILED) */
 #endif
 
 	obs_hotkey_id hotkey;
@@ -289,33 +315,92 @@ static cf_gaze_params params_locked(const struct camflip *f)
 	p.max_glance = f->max_glance;
 	p.baseline = f->baseline;
 	p.baseline_open = f->baseline_open;
-	p.has_notes = f->has_notes && !f->notes_stale ? 1 : 0;
-	p.notes_offset = f->notes_offset;
-	p.notes_side = f->notes_side;
-	p.notes_open = f->notes_open;
 	p.head_ref = f->head_ref;
-	/* Vision's gain from both calibrations, once both steps were taken with Vision's point */
-	p.has_vis_calib = (f->vis_cal & 3) == 3 ? 1 : 0;
 	p.vis_baseline = f->vis_baseline;
-	p.vis_notes = f->vis_notes;
 	p.baseline_upper = f->baseline_upper;
 	p.baseline_lower = f->baseline_lower;
+	if (f->has_notes && !f->notes_stale) {
+		/* The notes step: the user said where the notes are, so it comes before what was learnt. */
+		p.has_notes = 1;
+		p.notes_offset = f->notes_offset;
+		p.notes_side = f->notes_side;
+		p.notes_open = f->notes_open;
+		/* Vision's gain from both steps, once both were taken with Vision's point */
+		p.has_vis_calib = (f->vis_cal & 3) == 3 ? 1 : 0;
+		p.vis_notes = f->vis_notes;
+	} else if (f->learnt.has) {
+		/* The notes learnt from the reading. The gaze model also starts its learning from them after every
+		 * cf_gaze_init, so they carry over restarts and eye contact being switched off. */
+		p.has_notes = 1;
+		p.notes_learnt = 1;
+		p.notes_offset = f->learnt.offset;
+		p.notes_side = f->learnt.side;
+		p.notes_open = f->learnt.open;
+		p.has_vis_calib = (f->vis_cal & 1) && f->learnt.has_vis ? 1 : 0;
+		p.vis_notes = f->learnt.vis_offset;
+	}
 	return p;
 }
 
 /* Notes are only usable while they are clearly below the lens. A newer camera calibration can
- * move the lens baseline past them: they are then ignored (and the panel asks to redo step 2)
- * until step 2 is redone or the camera calibration moves back. */
+ * move the lens baseline past them: they are then ignored (and the panel asks to redo the notes
+ * step) until it is redone or the camera calibration moves back. */
 static void check_notes_locked(struct camflip *f)
 {
 	f->notes_stale = f->has_notes && !cf_gaze_notes_valid(f->baseline, f->notes_offset);
 }
 
+/* Notes learnt from the reading that are not below the camera look. They come from the reading
+ * itself, so it is the camera look that is off: most likely a look at the screen, not into the lens.
+ * (The gaze model doesn't use such notes; the panel asks for the camera look again.) */
+static bool look_seems_off_locked(const struct camflip *f)
+{
+	return f->lens_done && f->learnt.has && !cf_gaze_notes_valid(f->baseline, f->learnt.offset);
+}
+
+/* A camera look taken by an older version (or without the nose in view): head tilt and lids are not
+ * measured for this face, so the correction is weaker than it could be. */
+static bool redo_lens_locked(const struct camflip *f)
+{
+	return f->lens_done && (!f->head_ref.ok || !(f->baseline_upper > 0 && f->baseline_lower > 0));
+}
+
+/*
+ * A short macOS sound when a step finishes, so the user can keep looking into the lens instead of
+ * watching the panel: CUE_DONE when it worked, CUE_FAILED when it didn't. NSSound is AppKit's, which
+ * OBS (a Cocoa app) has loaded: it is looked up at run time, so the plugin doesn't link AppKit, and
+ * played on the main thread, where AppKit expects it. Never called with a lock held. Tests and tools
+ * have no main run loop: they only record the cue.
+ */
+static void play_cue(struct camflip *f, const char *name)
+{
+#ifdef CAMFLIP_TEST
+	pthread_mutex_lock(&f->lock);
+	f->last_cue = name;
+	pthread_mutex_unlock(&f->lock);
+#else
+	(void)f;
+	NSString *sound = [NSString stringWithUTF8String:name];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		Class cls = NSClassFromString(@"NSSound");
+		if (!cls)
+			return;
+		/* Through objc_msgSend with the selectors looked up by name: no AppKit header is included, and
+		 * performSelector: would warn under ARC (it can't tell what the result's ownership is). */
+		id player = ((id (*)(Class, SEL, NSString *))objc_msgSend)(cls, NSSelectorFromString(@"soundNamed:"),
+									   sound);
+		if (player)
+			((BOOL (*)(id, SEL))objc_msgSend)(player, NSSelectorFromString(@"play"));
+	});
+#endif
+}
+
 /*
  * A calibration that gets no camera frames (camera off or in use elsewhere, source hidden) would
- * say "Calibrating…" forever: give up after CALIB_STALL_NS without a frame. Checked by the worker
- * (which wakes up for this while a calibration is pending) and whenever the panel is built.
- * Returns true if it gave up just now; the worker then drops any half-done calibration.
+ * say "Look into the camera lens…" forever: give up after CALIB_STALL_NS without a frame. Checked
+ * by the worker (which wakes up for this while a calibration is pending) and whenever the panel is
+ * built. Returns true if it gave up just now: the caller logs it and plays the failure sound, and
+ * the worker drops any half-done calibration.
  */
 static bool calib_stall_check_locked(struct camflip *f, uint64_t now)
 {
@@ -358,22 +443,28 @@ static bool calib_cancel_flipped(struct camflip *f)
 		f->calib_cancel = true;
 	}
 	pthread_mutex_unlock(&f->lock);
-	if (cancel)
+	if (cancel) {
 		log_calib_stalled(true);
+		play_cue(f, CUE_FAILED);
+	}
 	return cancel;
 }
 
 /* ------------------------------------------------- settings written from other threads */
 
 /*
- * Calibration results and the hotkey change settings outside the settings panel. They are
- * written on OBS's UI thread (where the panel itself writes them), through obs_source_update,
- * so the saved settings, this filter and an open panel all agree. Holds only a weak reference,
- * so it is safe if the filter is deleted before the task runs.
+ * Calibration results, learnt notes and the hotkey change settings outside the settings panel.
+ * They are written on OBS's UI thread (where the panel itself writes them), through
+ * obs_source_update, so the saved settings, this filter and an open panel all agree. Holds only a
+ * weak reference, so it is safe if the filter is deleted before the task runs.
  */
 struct ui_task {
 	obs_weak_source_t *weak;
 	obs_data_t *changes; /* may be NULL: just refresh the panel */
+	/* Rebuild an open settings panel. Saving alone doesn't need it, and a rebuild drops a slider the
+	 * user is dragging, so the learnt notes (saved every few seconds while learning) are saved
+	 * without one unless what the panel shows changed. */
+	bool refresh;
 };
 
 static void ui_task_run(void *param)
@@ -383,7 +474,8 @@ static void ui_task_run(void *param)
 	if (src) {
 		if (t->changes)
 			obs_source_update(src, t->changes);
-		obs_source_update_properties(src);
+		if (t->refresh)
+			obs_source_update_properties(src);
 		obs_source_release(src);
 	}
 	if (t->changes)
@@ -398,10 +490,11 @@ static void ui_task_hop(void *param)
 	obs_queue_task(OBS_TASK_UI, ui_task_run, param, false);
 }
 
-/* Takes ownership of `changes`. */
-static void queue_ui(struct camflip *f, obs_data_t *changes)
+/* Saves `changes` (may be NULL) and, if `refresh`, rebuilds an open settings panel. Takes ownership
+ * of `changes`. */
+static void queue_ui(struct camflip *f, obs_data_t *changes, bool refresh)
 {
-	if (!f->context) { /* tests: no OBS source */
+	if (!f->context || (!changes && !refresh)) { /* (tests have no OBS source) */
 		if (changes)
 			obs_data_release(changes);
 		return;
@@ -409,6 +502,7 @@ static void queue_ui(struct camflip *f, obs_data_t *changes)
 	struct ui_task *t = bzalloc(sizeof(*t));
 	t->weak = obs_source_get_weak_source(f->context);
 	t->changes = changes;
+	t->refresh = refresh;
 	/* Never run it inline on the UI thread: OBS's UI task handler and its "update_properties"
 	 * handler are direct calls there, so a button callback (or a hotkey handled on the UI thread)
 	 * would rebuild the settings panel while Qt is still inside the clicked widget, which frees
@@ -764,26 +858,53 @@ static void detect_face(struct camflip *f, const grey_frame *g, cf_face *face, b
 
 /* Short code for "what the status panel shows", so it is refreshed only on real changes.
  * Only discrete states: each refresh rebuilds the whole panel (and drops a slider the user is
- * dragging), so it must not follow values that change while you look around. */
+ * dragging), so it must not follow values that change while you look around. Reading comes and
+ * goes as you read, so it only counts while the panel shows it ("Learning your notes…", in the
+ * advanced details, until the notes are learnt). */
 static unsigned int status_sig_locked(const struct camflip *f)
 {
-	return (unsigned)f->calib_running | ((unsigned)f->calib_failed << 2) | ((unsigned)f->st_face << 4) |
-	       ((unsigned)f->lens_done << 5) | ((unsigned)f->has_notes << 6) | ((unsigned)f->eye_contact << 7) |
-	       ((unsigned)f->calib_notes_bad << 8) | ((unsigned)f->calib_no_frames << 9) |
-	       ((unsigned)f->notes_stale << 10) | ((unsigned)(f->lens_done && !f->head_ref.ok) << 11);
+	const bool manual = f->has_notes && !f->notes_stale;
+	const bool learning = f->advanced && !manual && !f->learnt.has && f->st_reading;
+	return (unsigned)f->calib_running | ((unsigned)f->calib_failed << 2) | ((unsigned)f->look_bad << 4) |
+	       ((unsigned)f->st_face << 6) | ((unsigned)f->st_too_far << 7) | ((unsigned)f->st_turned << 8) |
+	       ((unsigned)learning << 9) | ((unsigned)f->lens_done << 10) | ((unsigned)f->has_notes << 11) |
+	       ((unsigned)f->eye_contact << 12) | ((unsigned)f->calib_notes_bad << 13) |
+	       ((unsigned)f->calib_no_frames << 14) | ((unsigned)f->notes_stale << 15) |
+	       ((unsigned)(f->learnt.has != 0) << 16) | ((unsigned)look_seems_off_locked(f) << 17) |
+	       ((unsigned)redo_lens_locked(f) << 18);
+}
+
+/* Whether to rebuild an open settings panel now: at once for a step that just finished (`event`,
+ * which also plays a sound), otherwise only when what it shows changed, at most every REFRESH_NS.
+ * So saving the learnt notes alone never rebuilds it, but learning them the first time does. */
+static bool refresh_due_locked(struct camflip *f, bool event, uint64_t now)
+{
+	const unsigned int sig = status_sig_locked(f);
+	if (!event && (sig == f->last_sig || now - f->last_refresh < REFRESH_NS))
+		return false;
+	f->last_sig = sig;
+	f->last_refresh = now;
+	return true;
 }
 
 /*
- * Takes a finished calibration. Returns the settings to save, or NULL if it was rejected: a notes
- * calibration that isn't clearly below the camera (looked elsewhere, or notes above the lens)
- * would be ignored by the gaze logic, so it is refused instead of claiming it worked.
+ * Takes a finished calibration. Returns the settings to save, or NULL if it was turned down, keeping
+ * the previous one (the reason is left in look_bad / calib_notes_bad for the panel):
+ *  - a camera look that cf_gaze_check_lens_look() finds unsteady, or not above where the user reads
+ *    (a look at the screen): every correction is measured from it, so a bad one makes all of it worse;
+ *  - a notes calibration that isn't clearly below the camera (looked elsewhere, or notes above the
+ *    lens): the gaze logic would ignore it, so it is refused instead of claiming it worked.
  */
-static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_result *res, bool *notes_bad)
+static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_result *res)
 {
-	*notes_bad = res->target == CF_CALIB_NOTES && !cf_gaze_notes_valid(f->baseline, res->offset);
-	if (*notes_bad) {
-		f->calib_notes_bad = true;
-		return NULL;
+	if (res->target == CF_CALIB_NOTES) {
+		f->calib_notes_bad = !cf_gaze_notes_valid(f->baseline, res->offset);
+		if (f->calib_notes_bad)
+			return NULL;
+	} else {
+		f->look_bad = cf_gaze_check_lens_look(res, f->learnt.has ? &f->learnt : NULL);
+		if (f->look_bad != CF_LOOK_OK)
+			return NULL;
 	}
 	obs_data_t *changes = obs_data_create();
 	if (res->target == CF_CALIB_NOTES) {
@@ -795,7 +916,6 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		obs_data_set_double(changes, S_NOTES_SIDE, res->side);
 		obs_data_set_double(changes, S_NOTES_OPEN, res->openness);
 		obs_data_set_bool(changes, S_HAS_NOTES, true);
-		f->calib_done_msg = "Notes calibrated.";
 	} else {
 		f->baseline = res->offset;
 		f->baseline_open = res->openness;
@@ -803,7 +923,7 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		obs_data_set_double(changes, S_BASELINE, res->offset);
 		obs_data_set_double(changes, S_BASELINE_OPEN, res->openness);
 		/* The head as it was while looking into the camera: turns are measured from here. Not learnt
-		 * (no nose seen) leaves ok 0, a typical face, and the panel asks to redo the step. */
+		 * (no nose seen) leaves ok 0, a typical face, and the panel asks for the look once more. */
 		f->head_ref = res->head;
 		obs_data_set_bool(changes, S_HEAD_REF, res->head.ok != 0);
 		obs_data_set_double(changes, S_HEAD_SIDE, res->head.side);
@@ -815,10 +935,8 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		f->baseline_lower = res->lower;
 		obs_data_set_double(changes, S_BASELINE_UPPER, res->upper);
 		obs_data_set_double(changes, S_BASELINE_LOWER, res->lower);
-		f->calib_done_msg = "Camera calibrated.";
 	}
-	/* Vision's pupil point at this step, and a hint if the result may be off (the gaze or lids moved while
-	 * calibrating, or notes that read barely below the camera). */
+	/* Vision's pupil point at this step */
 	const int vis_bit = res->target == CF_CALIB_NOTES ? 2 : 1;
 	f->vis_cal = res->has_vis ? (f->vis_cal | vis_bit) : (f->vis_cal & ~vis_bit);
 	if (res->target == CF_CALIB_NOTES)
@@ -827,23 +945,124 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		f->vis_baseline = res->vis_offset;
 	obs_data_set_int(changes, S_VIS_CAL, f->vis_cal);
 	obs_data_set_double(changes, res->target == CF_CALIB_NOTES ? S_VIS_NOTES : S_VIS_BASELINE, res->vis_offset);
-	const int hints = cf_gaze_calib_hints(res, f->baseline);
-	f->calib_hint = hints != 0;
-	if (hints & CF_CALIB_HINT_UNSTEADY)
-		f->calib_done_msg = res->target == CF_CALIB_NOTES
-					    ? "Notes calibrated, but your eyes moved while calibrating: if the effect looks off, "
-					      "redo step 2, keeping your gaze on the middle of your notes."
-					    : "Camera calibrated, but your eyes moved while calibrating: if the effect looks off, "
-					      "redo step 1, looking straight into the lens.";
-	else if (hints & CF_CALIB_HINT_SMALL_GLANCE)
-		f->calib_done_msg = "Notes calibrated, but they read barely below the camera. If your notes are further "
-				    "down, redo step 1 looking straight into the lens (not at the screen), then step 2.";
 
 	/* A new camera calibration can leave the saved notes above (or level with) the lens. */
 	check_notes_locked(f);
-	f->needs_recalib = false;
 	obs_data_set_int(changes, S_CALIB_VERSION, CALIB_VERSION);
+	/* Stamped again with every save: the Defaults button clears it, and migrate_setup would then drop
+	 * a notes step taken since at the next start. */
+	obs_data_set_int(changes, S_SETUP_VERSION, SETUP_VERSION);
 	return changes;
+}
+
+/*
+ * A step that finished (calibrated 1, with its result) or gave up (-1), taken the way the tracking
+ * thread does: saved, or turned down with the reason kept for the panel, with a sound either way.
+ * Returns false, doing nothing, if the step was abandoned meanwhile for lack of frames: its result is
+ * from long after the click. *changes: the settings to save, or NULL.
+ */
+static bool finish_step(struct camflip *f, int calibrated, const cf_calib_result *res, obs_data_t **changes)
+{
+	*changes = NULL;
+	pthread_mutex_lock(&f->lock);
+	const int step = f->calib_running;
+	if (step == CALIB_IDLE) {
+		pthread_mutex_unlock(&f->lock);
+		return false;
+	}
+	f->calib_running = CALIB_IDLE;
+	const float baseline = f->baseline;     /* the camera look the step is measured from, and ... */
+	const float reading = f->learnt.offset; /* ... where the eyes read (for the log) */
+	const bool was_stale = f->notes_stale;
+	if (calibrated > 0)
+		*changes = apply_calibration_locked(f, res);
+	else
+		f->calib_failed = step;
+	const int look = f->look_bad;
+	const bool notes_bad = f->calib_notes_bad, became_stale = f->notes_stale && !was_stale;
+	pthread_mutex_unlock(&f->lock);
+
+	play_cue(f, *changes ? CUE_DONE : CUE_FAILED);
+	if (calibrated < 0) {
+		blog(LOG_WARNING, "[cam-flip] calibration gave up: no steady, front-facing face seen. "
+				  "Light your face, hold still and click the button again");
+	} else if (look == CF_LOOK_UNSTEADY) {
+		blog(LOG_WARNING,
+		     "[cam-flip] camera look not used: your eyes moved (spread %.4f, drift %.4f eye widths, lids %.4f). "
+		     "Click \"Look at the camera\" and hold your gaze on the lens",
+		     res->spread, res->drift, res->open_spread);
+	} else if (look != CF_LOOK_OK) {
+		blog(LOG_WARNING,
+		     "[cam-flip] camera look not used: it is not above where you read (%.3f, reading at %.3f eye "
+		     "widths), so it was a look at the screen. Click \"Look at the camera\" and look right into the lens",
+		     res->offset, reading);
+	} else if (notes_bad) {
+		blog(LOG_WARNING, "[cam-flip] notes calibration rejected: gaze %.3f eye widths below the camera (needs "
+				  "more than %.3f). Look at your notes below the camera and try again",
+		     baseline - res->offset, CF_NOTES_MIN_GLANCE);
+	} else {
+		if (res->target == CF_CALIB_NOTES)
+			blog(LOG_INFO, "[cam-flip] notes calibrated (offset %.3f, side %.3f eye widths)", res->offset,
+			     res->side);
+		else
+			blog(LOG_INFO,
+			     "[cam-flip] camera calibrated (baseline %.3f eye widths, openness %.3f; head %s: side %.3f "
+			     "vert %.3f eyes %.3f tilt %.3f)",
+			     res->offset, res->openness, res->head.ok ? "learnt" : "not learnt (no nose seen)",
+			     res->head.side, res->head.vert, res->head.eyes, res->head.tilt);
+		/* How steady it was (see cf_gaze_calib_hints) */
+		blog(LOG_INFO, "[cam-flip] calibration spread %.4f, drift %.4f eye widths, lids %.4f (hints %d)",
+		     res->spread, res->drift, res->open_spread, cf_gaze_calib_hints(res, baseline));
+		if (became_stale)
+			blog(LOG_WARNING, "[cam-flip] the notes step is no longer below the new camera look and is not "
+					  "used: do \"Look at your notes\" again, or \"Forget my notes\"");
+	}
+	return true;
+}
+
+/*
+ * Takes notes the gaze model learnt from the user's reading (cf_gaze_take_learnt_notes), the way the
+ * tracking thread does: used from the next frame on, and returned as the settings to save so they
+ * survive a restart. NULL if there is nothing to keep: notes taken while a "Forget my notes" is
+ * pending (they are from before it), or values that can't be saved (JSON has no NaN).
+ */
+static obs_data_t *take_learnt_notes(struct camflip *f, const cf_learnt_notes *l)
+{
+	if (!l->has || !isfinite(l->offset) || !isfinite(l->side) || !isfinite(l->open) || !isfinite(l->vis_offset) ||
+	    !isfinite(l->seconds))
+		return NULL;
+	pthread_mutex_lock(&f->lock);
+	const bool keep = !f->forget_learnt;
+	if (keep)
+		f->learnt = *l;
+	pthread_mutex_unlock(&f->lock);
+	if (!keep)
+		return NULL;
+	obs_data_t *changes = obs_data_create();
+	obs_data_set_bool(changes, S_LEARNT, true);
+	obs_data_set_double(changes, S_LEARNT_OFFSET, l->offset);
+	obs_data_set_double(changes, S_LEARNT_SIDE, l->side);
+	obs_data_set_double(changes, S_LEARNT_OPEN, l->open);
+	obs_data_set_bool(changes, S_LEARNT_HAS_VIS, l->has_vis != 0);
+	obs_data_set_double(changes, S_LEARNT_VIS, l->vis_offset);
+	obs_data_set_double(changes, S_LEARNT_SECONDS, l->seconds);
+	obs_data_set_int(changes, S_SETUP_VERSION, SETUP_VERSION); /* (see apply_calibration_locked) */
+	blog(LOG_INFO,
+	     "[cam-flip] notes learnt from %.0f s of reading (offset %.3f, side %.3f eye widths, openness %.3f)",
+	     l->seconds, l->offset, l->side, l->open);
+	return changes;
+}
+
+/* Settings changes `b` merged into `a` (either may be NULL); takes ownership of both. */
+static obs_data_t *merge_changes(obs_data_t *a, obs_data_t *b)
+{
+	if (!a)
+		return b;
+	if (b) {
+		obs_data_apply(a, b);
+		obs_data_release(b);
+	}
+	return a;
 }
 
 static void process_frame(struct camflip *f, const grey_frame *g)
@@ -852,26 +1071,32 @@ static void process_frame(struct camflip *f, const grey_frame *g)
 	const cf_gaze_params params = params_locked(f);
 	const bool cancel = f->calib_cancel;
 	f->calib_cancel = false;
+	/* A "Forget my notes" since the last frame is passed on again right before this update, whose params
+	 * (copied with it, under the same lock) no longer have the notes. The frame under way when it was
+	 * clicked handed the model the old notes, which a model with nothing learnt starts from again. */
+	const bool forget = f->forget_learnt;
+	f->forget_learnt = false;
 	const int start = f->calib_request;
 	f->calib_request = 0;
 	if (start) {
 		f->calib_running = start;
 		f->calib_failed = CALIB_IDLE;
 		f->calib_notes_bad = false;
+		f->look_bad = CF_LOOK_OK;
 		f->calib_no_frames = false;
-		f->calib_done_msg = NULL;
-		f->calib_hint = false;
 	}
 	if (f->calib_running)
 		f->calib_progress_ns = now_ns(); /* frames are arriving: not stalled */
 	pthread_mutex_unlock(&f->lock);
 
-	if (start || cancel) {
+	if (start || cancel || forget) {
 		pthread_mutex_lock(&f->gaze_lock);
+		if (forget)
+			cf_gaze_forget_learnt_notes(&f->gaze);
 		if (start)
 			cf_gaze_start_calibration(&f->gaze, start == CALIB_NOTES ? CF_CALIB_NOTES : CF_CALIB_LENS);
-		else
-			cf_gaze_init(&f->gaze); /* drop a calibration that gave up for lack of frames */
+		else if (cancel)
+			cf_gaze_cancel_calibration(&f->gaze); /* drop a calibration that gave up for lack of frames */
 		pthread_mutex_unlock(&f->gaze_lock);
 	}
 
@@ -883,16 +1108,18 @@ static void process_frame(struct camflip *f, const grey_frame *g)
 	cf_eye eyes[2];
 	cf_calib_result res;
 	memset(&res, 0, sizeof(res));
+	cf_learnt_notes learnt;
+	memset(&learnt, 0, sizeof(learnt));
 	cf_gaze_status st;
 	memset(&st, 0, sizeof(st));
 	pthread_mutex_lock(&f->gaze_lock);
 	cf_gaze_update(&f->gaze, &face, &params, g->t, eyes);
 	const int calibrated = cf_gaze_take_calibration(&f->gaze, &res);
+	const int learnt_new = cf_gaze_take_learnt_notes(&f->gaze, &learnt);
 	cf_gaze_get_status(&f->gaze, &st);
 	pthread_mutex_unlock(&f->gaze_lock);
 	const double ms = (double)(now_ns() - t0) / 1e6;
 
-	obs_data_t *changes = NULL;
 	pthread_mutex_lock(&f->lock);
 	f->vision_runs++;
 	if (did_full)
@@ -909,65 +1136,24 @@ static void process_frame(struct camflip *f, const grey_frame *g)
 		f->ema_fps = f->ema_fps > 0 ? f->ema_fps * 0.9 + 0.1 / dt : 1.0 / dt;
 	f->last_frame_t = g->t;
 	f->st_face = st.face_found != 0;
+	f->st_too_far = st.too_far != 0;
+	f->st_turned = st.turned != 0;
+	f->st_reading = st.reading != 0;
 	f->st_factor = st.factor;
 #ifdef CAMFLIP_TEST
 	f->seen_face = face;
 #endif
-
-	const int step = f->calib_running;
-	const bool was_stale = f->notes_stale;
-	const float notes_glance = f->baseline - res.offset;
-	bool notes_bad = false;
-	/* step is CALIB_IDLE only if the calibration gave up (no frames) while this frame was analysed:
-	 * its result is from long after the click, so it is dropped. */
-	const bool usable = calibrated != 0 && step != CALIB_IDLE;
-	if (usable)
-		f->calib_running = CALIB_IDLE;
-	if (usable && calibrated > 0)
-		changes = apply_calibration_locked(f, &res, &notes_bad);
-	else if (usable && calibrated < 0)
-		f->calib_failed = step;
-	const bool became_stale = f->notes_stale && !was_stale;
-
-	/* Refresh an open settings panel, at most once a second and only when something changed. */
-	bool refresh = false;
-	const unsigned int sig = status_sig_locked(f);
-	const uint64_t now = now_ns();
-	if (changes || notes_bad || (sig != f->last_sig && now - f->last_refresh >= REFRESH_NS)) {
-		f->last_sig = sig;
-		f->last_refresh = now;
-		refresh = true;
-	}
 	pthread_mutex_unlock(&f->lock);
 
-	if (notes_bad) {
-		blog(LOG_WARNING, "[cam-flip] notes calibration rejected: gaze %.3f eye widths below the camera (needs "
-				  "more than %.3f). Look at your notes below the camera and try again",
-		     notes_glance, CF_NOTES_MIN_GLANCE);
-	} else if (usable && calibrated > 0) {
-		if (res.target == CF_CALIB_NOTES)
-			blog(LOG_INFO, "[cam-flip] notes calibrated (offset %.3f, side %.3f eye widths)", res.offset,
-			     res.side);
-		else
-			blog(LOG_INFO,
-			     "[cam-flip] camera calibrated (baseline %.3f eye widths, openness %.3f; head %s: side %.3f "
-			     "vert %.3f eyes %.3f tilt %.3f)",
-			     res.offset, res.openness, res.head.ok ? "learnt" : "not learnt (no nose seen)", res.head.side,
-			     res.head.vert, res.head.eyes, res.head.tilt);
-		/* How steady it was, and the hint the panel shows (see cf_gaze_calib_hints) */
-		blog(LOG_INFO, "[cam-flip] calibration spread %.4f, drift %.4f eye widths, lids %.4f (hints %d)",
-		     res.spread, res.drift, res.open_spread, cf_gaze_calib_hints(&res, notes_glance + res.offset));
-		if (became_stale)
-			blog(LOG_WARNING, "[cam-flip] the notes calibration is no longer below the new camera "
-					  "calibration and is not used: please redo step 2 (notes)");
-	} else if (usable && calibrated < 0) {
-		blog(LOG_WARNING, "[cam-flip] calibration gave up: no steady, front-facing face seen. "
-				  "Light your face, hold still and click the calibration button again");
-	}
-	if (refresh)
-		queue_ui(f, changes); /* persists calibration immediately, then refreshes the panel */
-	else if (changes)
-		obs_data_release(changes);
+	obs_data_t *changes = NULL;
+	const bool finished = calibrated != 0 && finish_step(f, calibrated, &res, &changes);
+	if (learnt_new)
+		changes = merge_changes(changes, take_learnt_notes(f, &learnt));
+
+	pthread_mutex_lock(&f->lock);
+	const bool refresh = refresh_due_locked(f, finished, now_ns());
+	pthread_mutex_unlock(&f->lock);
+	queue_ui(f, changes, refresh); /* saves at once, then refreshes an open panel if due */
 }
 
 /* Waits on `wake` for at most a second. Called with `lock` held. */
@@ -1002,10 +1188,11 @@ static void *worker_main(void *data)
 				const bool flipped = f->frames_flipped;
 				pthread_mutex_unlock(&f->lock);
 				pthread_mutex_lock(&f->gaze_lock);
-				cf_gaze_init(&f->gaze); /* drop the half-done calibration */
+				cf_gaze_cancel_calibration(&f->gaze); /* drop the half-done calibration */
 				pthread_mutex_unlock(&f->gaze_lock);
 				log_calib_stalled(flipped);
-				queue_ui(f, NULL); /* show it in an open panel */
+				play_cue(f, CUE_FAILED);
+				queue_ui(f, NULL, true); /* show it in an open panel */
 				pthread_mutex_lock(&f->lock);
 				continue;
 			}
@@ -1116,7 +1303,9 @@ static void camflip_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&f->lock);
 	f->mirror = obs_data_get_bool(settings, S_MIRROR);
 	f->eye_contact = obs_data_get_bool(settings, S_EYE_CONTACT);
-	f->show_eyes = obs_data_get_bool(settings, S_SHOW_EYES);
+	f->advanced = obs_data_get_bool(settings, S_ADVANCED);
+	/* The overlay is an advanced setting: hiding them turns it off, so it can't be left on unseen. */
+	f->show_eyes = f->advanced && obs_data_get_bool(settings, S_SHOW_EYES);
 	f->strength = (float)obs_data_get_double(settings, S_STRENGTH) / 100.0f;
 	f->scan_damp = (float)obs_data_get_double(settings, S_SCAN_DAMP) / 100.0f;
 	f->max_glance = (float)obs_data_get_double(settings, S_MAX_GLANCE) / 100.0f; /* eye widths */
@@ -1138,20 +1327,29 @@ static void camflip_update(void *data, obs_data_t *settings)
 	f->head_ref.tilt = (float)obs_data_get_double(settings, S_HEAD_TILT);
 	f->baseline_upper = (float)obs_data_get_double(settings, S_BASELINE_UPPER);
 	f->baseline_lower = (float)obs_data_get_double(settings, S_BASELINE_LOWER);
+	memset(&f->learnt, 0, sizeof(f->learnt));
+	if (obs_data_get_bool(settings, S_LEARNT)) {
+		f->learnt.has = 1;
+		f->learnt.offset = (float)obs_data_get_double(settings, S_LEARNT_OFFSET);
+		f->learnt.side = (float)obs_data_get_double(settings, S_LEARNT_SIDE);
+		f->learnt.open = (float)obs_data_get_double(settings, S_LEARNT_OPEN);
+		f->learnt.has_vis = obs_data_get_bool(settings, S_LEARNT_HAS_VIS) ? 1 : 0;
+		f->learnt.vis_offset = (float)obs_data_get_double(settings, S_LEARNT_VIS);
+		f->learnt.seconds = (float)obs_data_get_double(settings, S_LEARNT_SECONDS);
+	}
 	check_notes_locked(f);
-	if (f->has_notes || f->lens_done)
-		f->needs_recalib = false;
 	pthread_mutex_unlock(&f->lock);
 }
 
-/* Calibrations saved by older versions use other units: drop them (once) and ask again. */
-static bool migrate_calibration(obs_data_t *settings)
+/* Calibrations saved by older versions use other units: drop them (once); the panel then asks for
+ * the camera look again. */
+static void migrate_calibration(obs_data_t *settings)
 {
 	/* No default for this key (OBS applies defaults before create), so a missing key really
 	 * means "saved by an older version or never calibrated". */
 	if (obs_data_has_user_value(settings, S_CALIB_VERSION) &&
 	    obs_data_get_int(settings, S_CALIB_VERSION) == CALIB_VERSION)
-		return false;
+		return;
 	const bool had_old = obs_data_has_user_value(settings, S_BASELINE);
 	obs_data_unset_user_value(settings, S_BASELINE);
 	obs_data_unset_user_value(settings, S_BASELINE_OPEN);
@@ -1173,8 +1371,37 @@ static bool migrate_calibration(obs_data_t *settings)
 		obs_data_unset_user_value(settings, S_MAX_GLANCE); /* also in different units now */
 	obs_data_set_int(settings, S_CALIB_VERSION, CALIB_VERSION);
 	if (had_old)
-		blog(LOG_INFO, "[cam-flip] calibration from an older version was reset; please calibrate again");
-	return had_old;
+		blog(LOG_INFO, "[cam-flip] calibration from an older version was reset; please click \"Look at the "
+			       "camera\" again");
+}
+
+/*
+ * Once, for settings saved before the panel set itself up: the hand-tuned settings go back to their
+ * defaults (strength, reading damping and glance limit), which work with the learnt notes, and a saved
+ * notes step is dropped: that step was unreliable, and the notes are now learnt from the reading. The
+ * camera look is kept. No default for S_SETUP_VERSION (OBS applies defaults before create), so a
+ * missing key really means "saved before this, or new".
+ */
+static void migrate_setup(obs_data_t *settings)
+{
+	if (obs_data_has_user_value(settings, S_SETUP_VERSION) &&
+	    obs_data_get_int(settings, S_SETUP_VERSION) >= SETUP_VERSION)
+		return;
+	const char *const reset[] = {S_STRENGTH,     S_SCAN_DAMP, S_MAX_GLANCE,  S_HAS_NOTES,
+				     S_NOTES_OFFSET, S_NOTES_SIDE, S_NOTES_OPEN, S_VIS_NOTES};
+	bool had = false;
+	for (size_t i = 0; i < sizeof(reset) / sizeof(reset[0]); i++) {
+		had = had || obs_data_has_user_value(settings, reset[i]);
+		obs_data_unset_user_value(settings, reset[i]);
+	}
+	const long long vis_cal = obs_data_get_int(settings, S_VIS_CAL);
+	if (vis_cal & 2) /* (Vision's point at the notes goes with them) */
+		obs_data_set_int(settings, S_VIS_CAL, vis_cal & ~2);
+	obs_data_set_int(settings, S_SETUP_VERSION, SETUP_VERSION);
+	if (had)
+		blog(LOG_INFO, "[cam-flip] settings simplified: strength, reading damping and glance limit are back to "
+			       "their defaults, and the notes step was dropped (your notes are now learnt as you read). "
+			       "Your camera look is kept");
 }
 
 static void camflip_renamed(void *data, calldata_t *cd);
@@ -1198,9 +1425,9 @@ static void *camflip_create(obs_data_t *settings, obs_source_t *source)
 		f->handler = (void *)CFBridgingRetain([[VNSequenceRequestHandler alloc] init]);
 	}
 
-	const bool reset = migrate_calibration(settings);
+	migrate_calibration(settings);
+	migrate_setup(settings);
 	camflip_update(f, settings);
-	f->needs_recalib = reset;
 	if (source)
 		signal_handler_connect(obs_source_get_signal_handler(source), "rename", camflip_renamed, f);
 
@@ -1258,9 +1485,10 @@ static void camflip_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_MIRROR, true);
 	obs_data_set_default_bool(settings, S_EYE_CONTACT, true);
+	obs_data_set_default_bool(settings, S_ADVANCED, false);
 	obs_data_set_default_bool(settings, S_SHOW_EYES, false);
-	/* Full strength: with the notes calibrated, anything less leaves part of every glance visible.
-	 * The slider stays so it can be turned down. */
+	/* Full strength: with the camera look and the notes known, anything less leaves part of every
+	 * glance visible. The slider stays so it can be turned down. */
 	obs_data_set_default_double(settings, S_STRENGTH, 100.0);
 	/* Off: tracking runs a frame behind, so taking out the scanning twitches the eyes at every line return. */
 	obs_data_set_default_double(settings, S_SCAN_DAMP, 0.0);
@@ -1281,7 +1509,15 @@ static void camflip_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, S_VIS_NOTES, 0.0);
 	obs_data_set_default_double(settings, S_BASELINE_UPPER, 0.0);
 	obs_data_set_default_double(settings, S_BASELINE_LOWER, 0.0);
-	/* S_CALIB_VERSION deliberately has no default, see migrate_calibration(). */
+	obs_data_set_default_bool(settings, S_LEARNT, false);
+	obs_data_set_default_double(settings, S_LEARNT_OFFSET, 0.0);
+	obs_data_set_default_double(settings, S_LEARNT_SIDE, 0.0);
+	obs_data_set_default_double(settings, S_LEARNT_OPEN, 0.0);
+	obs_data_set_default_bool(settings, S_LEARNT_HAS_VIS, false);
+	obs_data_set_default_double(settings, S_LEARNT_VIS, 0.0);
+	obs_data_set_default_double(settings, S_LEARNT_SECONDS, 0.0);
+	/* S_CALIB_VERSION and S_SETUP_VERSION deliberately have no default, see migrate_calibration() and
+	 * migrate_setup(). */
 }
 
 /* ---------------------------------------------------------------- Hotkey */
@@ -1301,7 +1537,7 @@ static void camflip_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, b
 
 	obs_data_t *changes = obs_data_create();
 	obs_data_set_bool(changes, S_EYE_CONTACT, on);
-	queue_ui(f, changes);
+	queue_ui(f, changes, true);
 }
 
 /*
@@ -1388,17 +1624,16 @@ static bool request_calibration(struct camflip *f, int step)
 	f->calib_running = step; /* shown straight away; the worker starts it on the next frame */
 	f->calib_failed = CALIB_IDLE;
 	f->calib_notes_bad = false;
+	f->look_bad = CF_LOOK_OK;
 	f->calib_no_frames = false;
 	f->calib_progress_ns = now_ns();
-	f->calib_done_msg = NULL;
-	f->calib_hint = false;
 	pthread_cond_signal(&f->wake); /* the worker starts watching for missing frames */
 	pthread_mutex_unlock(&f->lock);
 	blog(LOG_INFO, "[cam-flip] calibrating: %s for a second or two",
 	     step == CALIB_NOTES ? "look at the middle of your notes" : "look into the camera");
 	/* Returning true only re-lays out the panel's current properties; rebuild them so the status
-	 * shows "Calibrating…" straight away. */
-	queue_ui(f, NULL);
+	 * says where to look straight away. */
+	queue_ui(f, NULL, true);
 	return false;
 }
 
@@ -1416,6 +1651,8 @@ static bool camflip_calib_notes_clicked(obs_properties_t *props, obs_property_t 
 	return request_calibration(data, CALIB_NOTES);
 }
 
+/* "Forget my notes": the notes step and the notes learnt from the reading, which are then learnt
+ * afresh. */
 static bool camflip_forget_notes_clicked(obs_properties_t *props, obs_property_t *property, void *data)
 {
 	(void)props;
@@ -1431,93 +1668,138 @@ static bool camflip_forget_notes_clicked(obs_properties_t *props, obs_property_t
 	f->vis_cal &= ~2; /* (Vision's point at the notes goes with them) */
 	f->notes_stale = false;
 	f->calib_notes_bad = false;
-	f->calib_done_msg = NULL;
-	f->calib_hint = false;
+	memset(&f->learnt, 0, sizeof(f->learnt));
+	f->forget_learnt = true; /* passed on to the model again before the next frame's update (process_frame) */
+	const int vis_cal = f->vis_cal;
 	pthread_mutex_unlock(&f->lock);
+	pthread_mutex_lock(&f->gaze_lock);
+	cf_gaze_forget_learnt_notes(&f->gaze); /* at once, also while no frames come */
+	pthread_mutex_unlock(&f->gaze_lock);
+
 	obs_data_t *changes = obs_data_create();
 	obs_data_set_bool(changes, S_HAS_NOTES, false);
 	obs_data_set_double(changes, S_NOTES_OFFSET, 0.0);
 	obs_data_set_double(changes, S_NOTES_SIDE, 0.0);
 	obs_data_set_double(changes, S_NOTES_OPEN, 0.0);
-	obs_data_set_int(changes, S_VIS_CAL, f->vis_cal);
-	queue_ui(f, changes); /* saves it and rebuilds the panel */
-	blog(LOG_INFO, "[cam-flip] notes calibration cleared");
+	obs_data_set_int(changes, S_VIS_CAL, vis_cal);
+	obs_data_set_bool(changes, S_LEARNT, false);
+	obs_data_set_double(changes, S_LEARNT_OFFSET, 0.0);
+	obs_data_set_double(changes, S_LEARNT_SIDE, 0.0);
+	obs_data_set_double(changes, S_LEARNT_OPEN, 0.0);
+	obs_data_set_bool(changes, S_LEARNT_HAS_VIS, false);
+	obs_data_set_double(changes, S_LEARNT_VIS, 0.0);
+	obs_data_set_double(changes, S_LEARNT_SECONDS, 0.0);
+	queue_ui(f, changes, true); /* saves it and rebuilds the panel */
+	blog(LOG_INFO,
+	     "[cam-flip] notes forgotten (the notes step and the learnt notes): they are learnt again as you read");
 	return false;
 }
 
+/*
+ * The status, in plain words and two lines: setting up (what to do next, a step that didn't work
+ * first, as it says what to do), then how it is going right now. *warn: line 1 is a problem, or the
+ * camera can't be used.
+ */
 static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 {
 	pthread_mutex_lock(&f->lock);
 	const bool stalled = calib_stall_check_locked(f, now_ns());
-	const bool eye_contact = f->eye_contact, face = f->st_face, lens = f->lens_done;
-	const bool notes = f->has_notes && !f->notes_stale, notes_stale = f->notes_stale;
-	const bool head = f->head_ref.ok != 0;
-	const bool lids = f->baseline_upper > 0 && f->baseline_lower > 0;
-	const bool vis_notes = (f->vis_cal & 2) != 0;
-	const bool recalib = f->needs_recalib;
-	const int running = f->calib_running, failed = f->calib_failed;
+	const bool eye_contact = f->eye_contact, lens = f->lens_done;
+	const bool face = f->st_face, too_far = f->st_too_far, turned = f->st_turned;
+	const bool manual = f->has_notes && !f->notes_stale, notes_stale = f->notes_stale, learnt = f->learnt.has != 0;
+	const bool look_off = look_seems_off_locked(f), redo = redo_lens_locked(f);
+	const int running = f->calib_running, failed = f->calib_failed, look = f->look_bad;
 	const bool notes_bad = f->calib_notes_bad, no_frames = f->calib_no_frames, flipped = f->frames_flipped;
-	const char *done = f->calib_done_msg;
-	const bool hint = f->calib_hint;
-	const double vms = f->ema_vision_ms, fps = f->ema_fps, wms = f->ema_warp_ms;
 	pthread_mutex_unlock(&f->lock);
-	if (stalled)
+	if (stalled) {
 		log_calib_stalled(flipped);
-
-	char calib[480], track[160], speed[200];
-	*warn = false;
-	if (running == CALIB_LENS)
-		snprintf(calib, sizeof(calib), "Calibrating: keep looking into the camera…");
-	else if (running == CALIB_NOTES)
-		snprintf(calib, sizeof(calib), "Calibrating: keep looking at the middle of your notes…");
-	else if (no_frames && flipped) {
-		*warn = true;
-		snprintf(calib, sizeof(calib),
-			 "Calibration didn't finish: this camera sends upside-down (flipped) frames, which eye "
-			 "contact can't track yet.");
-	} else if (no_frames) {
-		*warn = true;
-		snprintf(calib, sizeof(calib),
-			 "Calibration didn't finish: no camera frames. Make sure the camera is on and try again.");
-	} else if (failed) {
-		*warn = true;
-		snprintf(calib, sizeof(calib),
-			 "Calibration gave up: no steady, front-facing face seen. Light your face and try step %d again.",
-			 failed == CALIB_NOTES ? 2 : 1);
-	} else if (notes_bad) {
-		*warn = true;
-		snprintf(calib, sizeof(calib),
-			 "Notes calibration failed: look at your notes below the camera and try again.");
-	} else if (recalib) {
-		*warn = true;
-		snprintf(calib, sizeof(calib), "Please calibrate again (this version measures your eyes differently).");
-	} else if (notes_stale) {
-		*warn = true;
-		snprintf(calib, sizeof(calib), "%s%sNotes calibration no longer matches: please redo step 2.",
-			 done ? done : "", done ? " " : "");
-	} else {
-		/* A step done by an older version (or step 1 without the nose in view): head tilt and lids
-		 * aren't measured for this face, or the notes step lacks Vision's point, so the correction is
-		 * weaker or less sure than it could be. */
-		const bool redo1 = lens && (!head || !lids), redo2 = notes && !vis_notes;
-		const char *redo = redo1 && notes ? " Redo steps 1 and 2 once so your head tilt and eyelids are measured."
-				   : redo1	    ? " Redo step 1 so your head tilt and eyelids are measured."
-				   : redo2	    ? " Redo step 2 once so it measures how far your eyes move."
-						    : "";
-		*warn = hint && done;
-		snprintf(calib, sizeof(calib), "%s%sCalibration: camera %s, notes %s.%s", done ? done : "",
-			 done ? " " : "", lens ? "done" : "not done", notes ? "done" : "not done", redo);
+		play_cue(f, CUE_FAILED);
 	}
 
-	if (!eye_contact)
-		snprintf(track, sizeof(track), "Eye contact is off.");
-	else if (flipped)
-		snprintf(track, sizeof(track),
-			 "Eye contact can't run: this camera sends upside-down (flipped) frames. Mirroring still works.");
-	else if (!face)
-		snprintf(track, sizeof(track), "No face found. Light your face and look towards the camera.");
+	const char *setup;
+	*warn = true;
+	if (running == CALIB_LENS) {
+		setup = "Look into the camera lens…";
+		*warn = false;
+	} else if (running == CALIB_NOTES) {
+		setup = "Look at the middle of your notes…";
+		*warn = false;
+	} else if (no_frames && flipped) {
+		setup = "That didn't work: this camera's video comes upside down, which eye contact can't use yet.";
+	} else if (no_frames) {
+		setup = "That didn't work: no video from the camera. Make sure it's on and not used by another app, "
+			"then try again.";
+	} else if (failed == CALIB_NOTES) {
+		setup = "Couldn't see your face well: light your face, face the camera and click “Look at your notes” "
+			"again.";
+	} else if (failed) {
+		setup = "Couldn't see your face well: light your face, face the camera and click “Look at the camera” "
+			"again.";
+	} else if (look == CF_LOOK_UNSTEADY) {
+		setup = "Your eyes moved: click “Look at the camera” and hold your gaze on the lens.";
+	} else if (look != CF_LOOK_OK) {
+		setup = "That looked like a look at the screen, not the lens: click “Look at the camera” and look right "
+			"into the lens.";
+	} else if (notes_bad) {
+		setup = "That didn't look like your notes below the camera: click “Look at your notes” and look at the "
+			"middle of your notes.";
+	} else if (!lens) {
+		setup = "Almost ready: click “Look at the camera”, then look into the lens until you hear a sound.";
+		*warn = false;
+	} else if (look_off) {
+		setup = "Your camera look seems off: click “Look at the camera” and look right into the lens.";
+	} else if (notes_stale) {
+		setup = "Your notes step no longer fits your camera look: click “Look at your notes” again, or "
+			"“Forget my notes”.";
+	} else {
+		*warn = false;
+		setup = redo ? "Ready. For the best result, click “Look at the camera” once more."
+			: manual ? "Ready (using your notes step)."
+			: learnt ? "Ready. It has learnt where your notes are."
+				 : "Ready. Read your notes as usual: it learns where they are as you read.";
+	}
+
+	const char *live;
+	if (!eye_contact) {
+		live = "Eye contact is off.";
+	} else if (flipped) {
+		live = "Eye contact can't work with this camera: its video comes upside down. Mirroring still works.";
+		*warn = true;
+	} else if (!face) {
+		live = "Can't see your face: light your face and look towards the camera.";
+	} else if (too_far) {
+		live = "You're too far from the camera to correct your eyes.";
+	} else if (turned) {
+		live = "Turn your face towards the camera.";
+	} else if (!lens) {
+		live = "It can see your face."; /* (tracking runs, but nothing is corrected before the camera look) */
+	} else {
+		live = "Eye contact is working.";
+	}
+	snprintf(out, size, "%s\n%s", setup, live);
+}
+
+/* The advanced details: what is known about the notes, and how fast tracking runs. */
+static void details_text(struct camflip *f, char *out, size_t size)
+{
+	pthread_mutex_lock(&f->lock);
+	const bool manual = f->has_notes && !f->notes_stale, learnt = f->learnt.has != 0;
+	const bool reading = f->eye_contact && f->st_reading;
+	const float seconds = f->learnt.seconds;
+	const double vms = f->ema_vision_ms, fps = f->ema_fps, wms = f->ema_warp_ms;
+	pthread_mutex_unlock(&f->lock);
+
+	char notes[96], speed[200];
+	if (manual)
+		snprintf(notes, sizeof(notes), "Notes: from your notes step.");
+	else if (learnt && seconds >= 120.0f)
+		snprintf(notes, sizeof(notes), "Notes learnt from %.0f min of reading.", seconds / 60.0f);
+	else if (learnt)
+		snprintf(notes, sizeof(notes), "Notes learnt from %.0f s of reading.", seconds);
+	else if (reading)
+		snprintf(notes, sizeof(notes), "Learning your notes…");
 	else
-		snprintf(track, sizeof(track), "Face found.");
+		snprintf(notes, sizeof(notes), "Notes not learnt yet: they are learnt as you read.");
 
 	if (vms > 0)
 		snprintf(speed, sizeof(speed),
@@ -1526,36 +1808,37 @@ static void status_text(struct camflip *f, char *out, size_t size, bool *warn)
 			 vms, fps, wms);
 	else
 		snprintf(speed, sizeof(speed), "Speed: warp and mirror %.2f ms per frame.", wms);
-
-	snprintf(out, size, "%s\n%s\n%s", calib, track, speed);
+	snprintf(out, size, "%s\n%s", notes, speed);
 }
 
-static obs_properties_t *camflip_properties(void *data)
+/* The advanced settings, in panel order: "Show advanced settings" shows or hides these. A new
+ * advanced option goes in add_advanced_properties() and in this list. */
+static const char *const advanced_ids[] = {S_STRENGTH,     S_SCAN_DAMP, S_MAX_GLANCE, "calibrate_notes",
+					   "forget_notes", S_SHOW_EYES, "details"};
+
+static void show_advanced(obs_properties_t *props, bool show)
 {
-	struct camflip *f = data;
-	bool has_notes = false, notes_used = false;
-	if (f) {
-		pthread_mutex_lock(&f->lock);
-		has_notes = f->has_notes;
-		notes_used = f->has_notes && !f->notes_stale;
-		pthread_mutex_unlock(&f->lock);
-	}
+	for (size_t i = 0; i < sizeof(advanced_ids) / sizeof(advanced_ids[0]); i++)
+		obs_property_set_visible(obs_properties_get(props, advanced_ids[i]), show);
+}
 
-	obs_properties_t *props = obs_properties_create();
+static bool camflip_advanced_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	(void)property;
+	show_advanced(props, obs_data_get_bool(settings, S_ADVANCED));
+	return true; /* lay the panel out again */
+}
 
-	obs_property_t *p = obs_properties_add_bool(props, S_MIRROR, "Mirror video (everyone in the call sees it mirrored)");
-	obs_property_set_long_description(
-		p, "Call apps only mirror your own preview. This mirrors the video that is actually sent.");
-
-	obs_properties_add_bool(props, S_EYE_CONTACT, "Eye contact");
-
+/* manual: the notes step is in use (the glance limit then isn't); any_notes: there are notes to forget */
+static void add_advanced_properties(obs_properties_t *props, struct camflip *f, bool manual, bool any_notes)
+{
 	/* Up to CF_STRENGTH_MAX (200%): over 100% the correction overshoots, for when glances still show. */
-	p = obs_properties_add_float_slider(props, S_STRENGTH, "Eye contact strength", 0.0, 100.0 * CF_STRENGTH_MAX, 1.0);
+	obs_property_t *p =
+		obs_properties_add_float_slider(props, S_STRENGTH, "Strength", 0.0, 100.0 * CF_STRENGTH_MAX, 1.0);
 	obs_property_float_set_suffix(p, "%");
 	obs_property_set_long_description(
-		p, "100% cancels the glance at your notes as it is measured. If you still look like you're reading, "
-		   "go higher (up to 200%) to lift your eyes further; lower keeps some of the natural movement. "
-		   "The damping of your eyes' sideways scanning along a line doesn't change with it (above 25%).");
+		p, "100% lifts your eyes by exactly how far they drop, measured from your camera look and your "
+		   "reading. Go higher if you still look like you're reading.");
 
 	p = obs_properties_add_float_slider(props, S_SCAN_DAMP, "Hide reading along a line", 0.0, 100.0, 5.0);
 	obs_property_float_set_suffix(p, "%");
@@ -1567,31 +1850,64 @@ static obs_properties_t *camflip_properties(void *data)
 	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 5.0, 30.0, 1.0);
 	obs_property_float_set_suffix(p, "%");
 	obs_property_set_long_description(
-		p, "How far down you can look and still be corrected. Glances further down (like at your keyboard) "
-		   "fade back to your real eyes so it stays natural. Not used once step 2 (notes) is calibrated: "
-		   "then the correction is matched to your notes and fades out just beyond them.");
-	if (notes_used)
+		p, "How far down you can look and still be corrected. Further down (like at your keyboard), your real "
+		   "eyes show again. The notes it learns are always covered too. Not used while your notes step is in "
+		   "use.");
+	if (manual)
 		obs_property_set_enabled(p, false);
 
-	p = obs_properties_add_button2(props, "calibrate_lens", "1. Click, then look into the camera",
-				       camflip_calib_lens_clicked, data);
-	obs_property_set_long_description(p, "After clicking, look straight into the camera lens until the status says it's "
-					     "done (a second or two). Redo it if you move your screen or chair.");
-
-	p = obs_properties_add_button2(props, "calibrate_notes", "2. Click, then look at your notes",
-				       camflip_calib_notes_clicked, data);
+	p = obs_properties_add_button2(props, "calibrate_notes", "Look at your notes (optional)",
+				       camflip_calib_notes_clicked, f);
 	obs_property_set_long_description(
-		p, "After clicking, look at the middle of the line you usually read, with your head still, until the "
-		   "status says it's done (a second or two). The correction is then matched exactly to your notes.");
+		p, "Not needed: it learns where your notes are as you read. To set them yourself, click, then look at "
+		   "the middle of the line you usually read until you hear a sound. This comes before what it learns.");
 
-	if (has_notes) {
-		p = obs_properties_add_button2(props, "forget_notes", "Forget notes calibration",
-					       camflip_forget_notes_clicked, data);
-		obs_property_set_long_description(p, "Go back to using the \"Correct glances up to\" slider.");
-	}
+	p = obs_properties_add_button2(props, "forget_notes", "Forget my notes", camflip_forget_notes_clicked, f);
+	obs_property_set_long_description(p, "Forgets where your notes are: your notes step and what it learnt from "
+					     "your reading. It learns them again as you read.");
+	obs_property_set_enabled(p, any_notes);
+
+	p = obs_properties_add_bool(props, S_SHOW_EYES, "Show tracked eyes (for tuning)");
+	obs_property_set_long_description(
+		p, "While a glance is being corrected, draws thin outlines where the correction works: white = "
+		   "the area that may change, black = the eye opening your iris is moved inside. Nothing is drawn "
+		   "while you look into the camera. Turn it off before a call (hiding the advanced settings turns "
+		   "it off too).");
 
 	if (f) {
-		char text[880]; /* (calib, track and speed in status_text, and their line breaks) */
+		char text[320];
+		details_text(f, text, sizeof(text));
+		obs_properties_add_text(props, "details", text, OBS_TEXT_INFO);
+	}
+}
+
+static obs_properties_t *camflip_properties(void *data)
+{
+	struct camflip *f = data;
+	bool advanced = false, manual = false, any_notes = false;
+	if (f) {
+		pthread_mutex_lock(&f->lock);
+		advanced = f->advanced;
+		manual = f->has_notes && !f->notes_stale;
+		any_notes = f->has_notes || f->learnt.has;
+		pthread_mutex_unlock(&f->lock);
+	}
+
+	obs_properties_t *props = obs_properties_create();
+
+	obs_property_t *p = obs_properties_add_bool(props, S_MIRROR, "Mirror my video");
+	obs_property_set_long_description(
+		p, "Call apps only mirror your own preview. This mirrors the video that is actually sent.");
+
+	obs_properties_add_bool(props, S_EYE_CONTACT, "Eye contact");
+
+	p = obs_properties_add_button2(props, "calibrate_lens", "Look at the camera", camflip_calib_lens_clicked, data);
+	obs_property_set_long_description(
+		p, "Click, then look into the camera lens until you hear a sound (about 2 seconds). Do it once, and "
+		   "again only if you move the camera or your seat a lot.");
+
+	if (f) {
+		char text[480];
 		bool warn = false;
 		status_text(f, text, sizeof(text), &warn);
 		/* No long description: OBS then shows the description itself as the info text. */
@@ -1600,16 +1916,14 @@ static obs_properties_t *camflip_properties(void *data)
 			obs_property_text_set_info_type(p, OBS_TEXT_INFO_WARNING);
 	}
 
-	p = obs_properties_add_bool(props, S_SHOW_EYES, "Show tracked eyes (for tuning)");
-	obs_property_set_long_description(
-		p, "While a glance is being corrected, draws thin outlines where the correction works: white = "
-		   "the area that may change, black = the eye opening your iris is moved inside. Nothing is drawn "
-		   "while you look into the camera. Turn it off before a call.");
+	p = obs_properties_add_bool(props, S_ADVANCED, "Show advanced settings");
+	obs_property_set_modified_callback(p, camflip_advanced_modified);
+	add_advanced_properties(props, f, manual, any_notes);
+	show_advanced(props, advanced); /* (OBS then also runs camflip_advanced_modified with the settings) */
 
 	obs_properties_add_text(props, "info",
-				"Tip: in Teams/Zoom/Meet pick “OBS Virtual Camera” and turn off “Mirror my video”, "
-				"so your own preview matches what others see. Toggle eye contact with a hotkey: "
-				"Settings › Hotkeys › “" HOTKEY_DESC "” under your camera.",
+				"Tip: in Teams, Zoom or Meet, pick “OBS Virtual Camera” as your camera. To turn eye "
+				"contact on and off with a key: Settings › Hotkeys › “" HOTKEY_DESC "”, under your camera.",
 				OBS_TEXT_INFO);
 	return props;
 }
@@ -1624,6 +1938,7 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 	pthread_mutex_lock(&f->lock);
 	const bool mirror = f->mirror;
 	const bool eye_contact = f->eye_contact;
+	const bool lens_done = f->lens_done;
 	const bool show_eyes = f->show_eyes;
 	const bool calibrating = f->calib_request != 0 || f->calib_running != 0;
 	const cf_gaze_params params = params_locked(f);
@@ -1657,14 +1972,14 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 	if (frame->flip) {
 		/* Upside-down (bottom-up) frames aren't tracked (below): the panel says why; log it once.
 		 * A calibration can't run on them either: cancel it at once, with the panel saying why,
-		 * instead of showing "Calibrating…" until it times out for lack of frames. */
+		 * instead of asking the user to look into the lens until it times out for lack of frames. */
 		if (eye_contact && !f->warned_flip) {
 			f->warned_flip = true;
 			blog(LOG_WARNING, "[cam-flip] eye contact is unavailable: this camera sends upside-down "
 					  "(flipped) frames. Mirroring still works");
 		}
 		if (calibrating && calib_cancel_flipped(f))
-			queue_ui(f, NULL); /* show it in an open panel */
+			queue_ui(f, NULL, true); /* show it in an open panel */
 	}
 
 	/* Eye contact first (on the camera's original orientation), then mirror. */
@@ -1674,7 +1989,10 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 
 		cf_eye eyes[2];
 		int n = 0;
-		if (eye_contact) {
+		/* Nothing is corrected before the camera look: without it there is no "looking into the lens" to
+		 * correct towards. Tracking still runs, so the panel can say the face is found and the notes can
+		 * be learnt meanwhile. */
+		if (eye_contact && lens_done) {
 			pthread_mutex_lock(&f->gaze_lock);
 			n = cf_gaze_predict(&f->gaze, &params, t, eyes);
 			pthread_mutex_unlock(&f->gaze_lock);
