@@ -341,6 +341,12 @@ typedef struct {
 	float svk_m, svk_v, svk_mm, svk_mv;
 	int have_svk;
 	int side_novis; /* Vision's point hardly moves sideways: not used there */
+	/* The head's tilt down as an iris shift, uncapped (head_lids()): past HEAD_READ_MAX, for the far cue; all
+	 * of it, and how far it moved lately (decaying), to tell the eyes catching up with the head from a look. */
+	float head_far, head_full, head_move;
+	int have_head_full;
+	float engage_f; /* how far the sideways damping (and the lid restoration) is engaged, 0..1 */
+	int have_engage;
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);
