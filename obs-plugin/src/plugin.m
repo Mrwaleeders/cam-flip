@@ -118,6 +118,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define LOG_EVERY_NS 10000000000ull  /* timing summary in the log */
 #define REFRESH_NS 1000000000ull     /* settings panel status refresh, at most this often */
 #define CALIB_STALL_NS 12000000000ull /* calibration gives up after this long without camera frames */
+#define HOLD_GAP_NS 250000000ull     /* a frame held back is stale once the next comes this much later (a pause) */
 
 /* Vision runs on frames up to twice this wide at full size (the pupil needs the detail). Wider
  * frames (1440p, 4K) are shrunk by the whole factor that keeps them at least this wide: Vision's
@@ -258,6 +259,10 @@ struct camflip {
 	bool warned_format;
 	bool warned_flip;
 	bool vt_was_on;
+	/* The camera frame held back one frame while reading along a line is hidden (see camflip_filter_video): it
+	 * holds one reference of the source's frame cache until it is shown or given back (release_held()). Also
+	 * read by camflip_filter_remove(), which OBS only calls once this filter is out of the source's list. */
+	struct obs_source_frame *held;
 
 #ifdef CAMFLIP_TEST
 	bool test_pause; /* guarded by `lock`: worker leaves frames alone */
@@ -1647,10 +1652,25 @@ static void camflip_renamed(void *data, calldata_t *cd)
 	obs_data_array_release(keys);
 }
 
+/* Gives a camera frame held back (see camflip_filter_video) to the source's frame cache, as OBS's own video delay
+ * filter does: it holds one reference of it. The tests' filter has no parent, and its frames are their own. */
+static void give_back(obs_source_t *parent, struct obs_source_frame *frame)
+{
+	if (frame && parent)
+		obs_source_release_frame(parent, frame);
+}
+
+static obs_source_t *parent_of(struct camflip *f)
+{
+	return f->context ? obs_filter_get_parent(f->context) : NULL;
+}
+
 static void camflip_filter_remove(void *data, obs_source_t *parent)
 {
-	(void)parent;
-	hotkey_unregister(data);
+	struct camflip *f = data;
+	give_back(parent, f->held); /* (no frame comes any more: OBS has taken the filter out of the list) */
+	f->held = NULL;
+	hotkey_unregister(f);
 }
 
 /* ---------------------------------------------------------------- Settings panel */
@@ -1883,9 +1903,10 @@ static void add_advanced_properties(obs_properties_t *props, struct camflip *f, 
 	p = obs_properties_add_float_slider(props, S_SCAN_DAMP, "Hide reading along a line", 0.0, 100.0, 5.0);
 	obs_property_float_set_suffix(p, "%");
 	obs_property_set_long_description(
-		p, "Takes out this much of your eyes' sideways movement as you read along a line (95% leaves about a "
-		   "third of it visible). Tracking runs a frame behind the video, so at the jump back to the next line "
-		   "your eyes twitch for one frame. Off by default; a look held to one side is never shifted.");
+		p, "Takes out this much of your eyes' sideways movement as you read along a line. While it is on, the "
+		   "video is held back one frame (33 ms), so the counter-move lands in the same frame as your eyes' jump "
+		   "back to the next line instead of a frame later (a twitch). Off by default; a look held to one side is "
+		   "never shifted.");
 
 	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 5.0, 30.0, 1.0);
 	obs_property_float_set_suffix(p, "%");
@@ -1996,6 +2017,8 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 			     "UYVY in its properties",
 			     (int)frame->format);
 		}
+		give_back(parent_of(f), f->held);
+		f->held = NULL;
 		return frame;
 	}
 	/* Brightness channel: the luma plane, or green for RGB cameras. */
@@ -2022,11 +2045,46 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 			queue_ui(f, NULL, true); /* show it in an open panel */
 	}
 
-	/* Eye contact first (on the camera's original orientation), then mirror. */
-	if ((eye_contact || calibrating) && !frame->flip && f->worker_started) {
-		const double t = (double)frame->timestamp / 1e9;
-		submit_frame(f, luma, t);
+	const bool track = (eye_contact || calibrating) && !frame->flip && f->worker_started;
+	if (track)
+		submit_frame(f, luma, (double)frame->timestamp / 1e9);
 
+	/* Hiding the reading along a line (scan_damp) holds the video back one frame: this frame is kept and the one
+	 * before it shown, warped by its own tracking, which the worker has had a frame's time to finish (18 ms on the
+	 * user's Mac against 33 between frames). Shown with the frame after it, as without the hold, the sideways
+	 * counter-move came a frame after the eye's own jump back to the next line: a one-frame twitch at each. */
+	const bool hold = track && eye_contact && lens_done && params.scan_damp > 0.0f;
+	struct obs_source_frame *out = frame;
+	if (hold) {
+		struct obs_source_frame *prev = f->held;
+		f->held = frame;
+		/* (a gap since it was kept, or another camera format: stale, and maybe out of the cache OBS keeps) */
+		if (prev && (frame->timestamp < prev->timestamp || frame->timestamp - prev->timestamp > HOLD_GAP_NS ||
+			     prev->width != frame->width || prev->height != frame->height || prev->format != frame->format)) {
+			give_back(parent_of(f), prev);
+			prev = NULL;
+		}
+		if (!prev)
+			return NULL; /* (the source shows its last frame once more) */
+		out = prev;
+	} else if (f->held) {
+		give_back(parent_of(f), f->held); /* (the hold just ended: that frame is skipped) */
+		f->held = NULL;
+	}
+	cf_channel held_channels[8];
+	cf_channel *ch = channels;
+	int ch_count = count;
+	const cf_channel *ch_luma = luma;
+	if (out != frame) {
+		ch_count = cf_channels(to_cf_format(out->format), out->data, out->linesize, (int)out->width,
+				       (int)out->height, held_channels);
+		ch = held_channels;
+		ch_luma = &held_channels[is_rgb(fmt) && ch_count > 1 ? 1 : 0];
+	}
+
+	/* Eye contact first (on the camera's original orientation), then mirror. */
+	if (track) {
+		const double t = (double)out->timestamp / 1e9;
 		cf_eye eyes[2];
 		int n = 0;
 		/* Nothing is corrected before the camera look: without it there is no "looking into the lens" to
@@ -2037,14 +2095,14 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 			n = cf_gaze_predict(&f->gaze, &params, t, eyes);
 			pthread_mutex_unlock(&f->gaze_lock);
 			if (n > 0)
-				cf_warp_frame(channels, count, eyes, n);
+				cf_warp_frame(ch, ch_count, eyes, n);
 		}
 		if (show_eyes)
-			draw_overlay(luma, eyes, n);
+			draw_overlay(ch_luma, eyes, n);
 	}
 
 	if (mirror)
-		cf_mirror_frame(channels, count);
+		cf_mirror_frame(ch, ch_count);
 
 	/* Timing: the video thread part, plus a summary in the log every 10 s. */
 	const uint64_t end = now_ns();
@@ -2078,7 +2136,7 @@ static struct obs_source_frame *camflip_filter_video(void *data, struct obs_sour
 		else
 			blog(LOG_INFO, "[cam-flip] tracking idle, warp %.2f ms", warp_ms);
 	}
-	return frame;
+	return out;
 }
 
 static struct obs_source_info camflip_filter = {
