@@ -186,6 +186,68 @@ class Session:
               f"reading {np.sum(ok & (self.kind == 'read'))})")
 
 
+# Where to compare two frames of a pair to line them up: around the eye, not in it (brow, lid crease,
+# corners, cheek), since the eye itself is what differs.
+_ys, _xs = np.mgrid[0:H, 0:W].astype(np.float32)
+ALIGN_MASK = ((((_xs - 64) / 50) ** 2 + ((_ys - 30) / 21) ** 2) > 1) & (_xs > 6) & (_xs < W - 6) & (_ys > 4) & (_ys < H - 4)
+ALIGN_R = 4
+ALIGN = False  # set in main: real captures yes (unless --no-align), the synthetic self-test no
+
+
+def maybe_align(s, d, t, grid):
+    if not ALIGN:
+        return d, t
+    with torch.no_grad():
+        d, t, _ = align_pairs(s, d, t, grid)
+    return d, t
+
+
+def align_pairs(src, dst, tgt, grid):
+    """Lines each destination up on its source around the eye, and moves its target with it.
+    Each patch is cut on its own Vision eye corners, which jitter by a pixel or two between frames. A pair
+    that is off by that teaches the model to paint a blurred average instead of moving the eye.
+    Whole-pixel search over +-ALIGN_R, then a quarter-pixel search around the best. On the training device."""
+    b = src.shape[0]
+    r = ALIGN_R
+    m = torch.from_numpy(ALIGN_MASK).to(src.device)
+    mc = m[r:H - r, r:W - r]
+    n = mc.sum()
+
+    def centred(x, msk, cnt):
+        return x - (x * msk).sum((-2, -1), keepdim=True) / cnt
+
+    a = centred(src[:, 0, r:H - r, r:W - r], mc, n)
+    costs = []
+    for oy in range(-r, r + 1):
+        for ox in range(-r, r + 1):
+            bb = centred(dst[:, 0, r + oy:H - r + oy, r + ox:W - r + ox], mc, n)
+            costs.append(((a - bb).abs() * mc).sum((-2, -1)) / n)
+    k = torch.stack(costs, 1).argmin(1)
+    d = torch.stack([(k % (2 * r + 1)) - r, (k // (2 * r + 1)) - r], 1).float()  # (dx, dy) whole px
+    mf = m.float()
+    nf = mf.sum()
+    af = centred(src[:, 0], mf, nf)
+    best, best_c = d.clone(), None
+    for fy in (-0.5, -0.25, 0.0, 0.25, 0.5):
+        for fx in (-0.5, -0.25, 0.0, 0.25, 0.5):
+            dd = d + torch.tensor([fx, fy], device=src.device)
+            q = grid[None] + dd[:, :, None, None]
+            g = torch.stack([q[:, 0] / (W - 1) * 2 - 1, q[:, 1] / (H - 1) * 2 - 1], -1)
+            c = ((af - centred(sample(dst, g)[:, 0], mf, nf)).abs() * mf).sum((-2, -1)) / nf
+            if best_c is None:
+                best_c = c
+                best = dd
+            else:
+                better = c < best_c
+                best_c = torch.where(better, c, best_c)
+                best = torch.where(better[:, None], dd, best)
+    q = grid[None] + best[:, :, None, None]
+    g = torch.stack([q[:, 0] / (W - 1) * 2 - 1, q[:, 1] / (H - 1) * 2 - 1], -1)
+    out = sample(dst, g)
+    tgt = tgt - best / torch.tensor([W, H], dtype=torch.float32, device=src.device)
+    return out, tgt, best
+
+
 class Pairs:
     """Samples (source, destination) pairs: same eye, same session, a few seconds apart, head still."""
 
@@ -365,6 +427,7 @@ def evaluate(model, data, grid, wmap, edge, device, batches=20, seed=123):
     with torch.no_grad():
         for _ in range(batches):
             s, d, t = [torch.from_numpy(x).to(device) for x in data.sample(32)]
+            d, t = maybe_align(s, d, t, grid)
             _, out, lp = losses(model, s, d, t, grid, wmap, edge)
             l_model += lp.item()
             l_copy += (torch.abs(s - d) * wmap).mean().item()
@@ -380,6 +443,7 @@ def save_preview(model, data, grid, folder, device, n=12):
     os.makedirs(folder, exist_ok=True)
     data.rng = np.random.default_rng(7)
     s, d, t = [torch.from_numpy(x).to(device) for x in data.sample(n)]
+    d, t = maybe_align(s, d, t, grid)
     with torch.no_grad():
         flow, res, mask = model(s, t)
         out = render(s, flow, res, mask, grid)
@@ -465,12 +529,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--res-weight", type=float, default=0.05,
                     help="cost of the brightness residual (higher: move pixels rather than paint them)")
+    ap.add_argument("--no-align", action="store_true", help="don't line up each pair's frames around the eye")
     ap.add_argument("--pair-tol", type=float, default=0.04,
                     help="pairs only when the eye corners moved less than this fraction of the eye width")
     ap.add_argument("--selftest-export", metavar="PATH", help="with --selftest: also export the synthetic model here")
     a = ap.parse_args()
-    global RES_WEIGHT
+    global RES_WEIGHT, ALIGN
     RES_WEIGHT = a.res_weight
+    ALIGN = not a.selftest and not a.no_align
     dev = torch.device(a.device)
     torch.manual_seed(a.seed)
 
@@ -513,6 +579,7 @@ def main():
     t0 = time.time()
     for step in range(1, a.steps + 1):
         s, d, t = [torch.from_numpy(x).to(dev) for x in train.sample(a.batch)]
+        d, t = maybe_align(s, d, t, grid)
         s, d, t = augment(s, d, t, rng, dev)
         loss, _, _ = losses(model, s, d, t, grid, wmap, edge)
         opt.zero_grad()
