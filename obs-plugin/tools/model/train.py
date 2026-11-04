@@ -214,6 +214,10 @@ class Pairs:
                     cand = cand[d < tol]
                     if len(cand):
                         self.items.append((s, i, cand))
+        # The job in use: from wherever the eye looks (dots, reading) to the lens look. Pick those sources
+        # more often than the capture's mix would (it is about 40% lens looks, which barely need moving).
+        self.to_lens = [k for k, (s, i, cand) in enumerate(self.items)
+                        if s.kind[i] != "lens" and np.any(s.kind[cand] == "lens")]
         self.rng = np.random.default_rng(seed)
 
     def __len__(self):
@@ -224,13 +228,14 @@ class Pairs:
         dst = np.zeros((batch, 1, H, W), np.float32)
         tgt = np.zeros((batch, 2), np.float32)
         for b in range(batch):
-            s, i, cand = self.items[self.rng.integers(len(self.items))]
             r = self.rng.random()
-            if r < 0.1:
-                j = i  # identity: target where the iris already is -> change nothing
+            if 0.1 <= r < 0.7 and self.to_lens:  # a look somewhere else, to the lens look
+                s, i, cand = self.items[self.to_lens[self.rng.integers(len(self.to_lens))]]
+                j = self.rng.choice(cand[s.kind[cand] == "lens"])
             else:
-                lens = cand[s.kind[cand] == "lens"]
-                j = self.rng.choice(lens) if (r < 0.65 and len(lens)) else self.rng.choice(cand)
+                s, i, cand = self.items[self.rng.integers(len(self.items))]
+                # identity (target where the iris already is: change nothing), or any nearby look
+                j = i if r < 0.1 else self.rng.choice(cand)
             src[b, 0] = s.patches[i] / 255.0
             dst[b, 0] = s.patches[j] / 255.0
             tgt[b] = (s.px[j] / W, s.py[j] / H)
