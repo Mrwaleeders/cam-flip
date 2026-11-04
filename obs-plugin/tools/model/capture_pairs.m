@@ -18,7 +18,7 @@
  *   targets.csv    when each dot was shown and where (cm from the camera: x right, y down)
  *   session.json   distance, screen size, camera, resolution
  * This is your face: it stays on this Mac. Never add it to the repository.
- * Esc stops early (what was recorded is kept).
+ * Esc or a click stops early (what was recorded is kept). It quits by itself if the camera never starts.
  */
 #import <AVFoundation/AVFoundation.h>
 #import <AppKit/AppKit.h>
@@ -285,6 +285,10 @@ static void build_reading_sequence(int quick)
 		self.stopping = YES;
 	});
 	[self.session stopRunning];
+	if (self.writer.status != AVAssetWriterStatusWriting) { /* no frame ever arrived: nothing to finish */
+		dispatch_async(dispatch_get_main_queue(), done);
+		return;
+	}
 	[self.input markAsFinished];
 	[self.writer finishWritingWithCompletionHandler:^{
 		dispatch_async(dispatch_get_main_queue(), done);
@@ -300,6 +304,7 @@ static double step_t0;
 static FILE *targets;
 static NSString *out_dir;
 static double distance_cm = 60;
+static double launch_t;
 
 @interface DotView : NSView
 @end
@@ -314,16 +319,38 @@ static double distance_cm = 60;
 	if (e.keyCode == 53) /* Esc */
 		[NSApp terminate:nil];
 }
+- (BOOL)acceptsFirstMouse:(NSEvent *)e
+{
+	(void)e;
+	return YES;
+}
+- (void)mouseDown:(NSEvent *)e
+{
+	(void)e;
+	/* A click stops it too (Esc needs the keyboard, which macOS may not hand to us). */
+	[NSApp terminate:nil];
+}
 - (void)drawRect:(NSRect)r
 {
 	(void)r;
 	[[NSColor colorWithWhite:0.94 alpha:1] setFill];
 	NSRectFill(self.bounds);
-	if (cur < 0 || cur >= nsteps)
-		return;
-	const step_t *s = &steps[cur];
 	NSDictionary *attr = @{NSFontAttributeName: [NSFont systemFontOfSize:22],
 			       NSForegroundColorAttributeName: [NSColor colorWithWhite:0.25 alpha:1]};
+	if (cur < 0) {
+		/* No camera frame yet: say so, instead of a blank screen. */
+		NSString *t = CACurrentMediaTime() - launch_t < 6
+				      ? @"Starting the camera…"
+				      : @"The camera hasn't started. If macOS asked to allow camera access, allow it and run this again.\n"
+					@"If another app (OBS, a call) is using the camera, close it first. Click or press Esc to quit.";
+		NSSize sz = [t sizeWithAttributes:attr];
+		[t drawAtPoint:NSMakePoint((self.bounds.size.width - sz.width) / 2, self.bounds.size.height * 0.45)
+		    withAttributes:attr];
+		return;
+	}
+	if (cur >= nsteps)
+		return;
+	const step_t *s = &steps[cur];
 	if (s->text) {
 		NSString *t = [NSString stringWithUTF8String:s->text];
 		NSSize sz = [t sizeWithAttributes:attr];
@@ -420,8 +447,14 @@ static void finish(void)
 - (void)tick:(NSTimer *)t
 {
 	(void)t;
-	if (rec.first_pts < 0) /* wait for the camera's first frame */
+	if (rec.first_pts < 0) { /* wait for the camera's first frame */
+		self.view.needsDisplay = YES;
+		if (CACurrentMediaTime() - launch_t > 20) {
+			fprintf(stderr, "the camera never started (no camera access, or another app is using it)\n");
+			[NSApp terminate:nil];
+		}
 		return;
+	}
 	const double now = CACurrentMediaTime();
 	if (cur < 0 || now - step_t0 >= steps[cur].dur) {
 		const double host = [rec now] - rec.first_pts;
@@ -442,6 +475,7 @@ static void finish(void)
 - (void)applicationDidFinishLaunching:(NSNotification *)n
 {
 	(void)n;
+	launch_t = CACurrentMediaTime();
 	NSScreen *scr = [NSScreen mainScreen];
 	screen_frame = scr.frame;
 	const CGDirectDisplayID did = [scr.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
