@@ -174,6 +174,10 @@
 #define VOR_TAU 0.5           /* s: how long the head's move can explain a catch-up of the glance ... */
 #define VOR_GLIDE_PX 0.2f     /* ... px per 1/30 s it is glided in at (glide_catch_up()) ... */
 #define VOR_RAW_TAU 0.03      /* s: ... and smoothing of the raw glance it is checked against */
+#define HEAD_READ_MAX 14.0f  /* deg: a head tilted further down than this counts towards looking past the notes ... */
+#define HEAD_FAR_MAX 40.0f    /* ... up to here (the far cue, see cf_gaze_update()) */
+#define ENGAGE_UP_MARGIN 0.02f /* eye widths: sideways damping engages this much later with the eyes up in the head */
+#define ENGAGE_SLEW 0.15f      /* per 1/30 s: how fast it engages or lets go without a look (at once with one) */
 
 /* ---- One Euro filter (Casiez et al.): adaptive low-pass, little jitter and little lag. */
 
@@ -1469,6 +1473,13 @@ static void head_lids(cf_gaze *g, const cf_gaze_params *p, const eye_measure m[2
 	const float hh = HEAD_YAW_K * EYE_K * sinf(clampf(yaw, -HEAD_YAW_MAX, HEAD_YAW_MAX) * deg) *
 			 (g->axis.x >= 0 ? 1.0f : -1.0f);
 	const float sh = HEAD_SLEW_PX * k30 / w;
+	/* For the far cue: the head's tilt the same way (not capped at HEAD_PITCH_MAX), how far it moved lately,
+	 * and what is past HEAD_READ_MAX. */
+	const float hf = EYE_K * sinf(clampf(pitch, 0.0f, HEAD_FAR_MAX) * deg);
+	g->head_move = g->have_head_full ? g->head_move * (float)exp(-dt / VOR_TAU) + (hf - g->head_full) : 0.0f;
+	g->head_full = hf;
+	g->have_head_full = 1;
+	g->head_far = fmaxf(hf - EYE_K * sinf(HEAD_READ_MAX * deg), 0.0f);
 	g->head_v += clampf(hv - g->head_v, -sh, sh);
 	g->head_h += clampf(hh - g->head_h, -sh, sh);
 
@@ -1653,6 +1664,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		if (!g->cx[0].ready || t - g->cx[0].t > FACE_GONE) {
 			g->rb_down.have_v = g->rb_side.have_v = 0;
 			g->have_lids = 0; /* the lids' smoothing starts afresh from the face coming back */
+			g->have_head_full = 0;
+			g->have_engage = 0;
 		}
 		g->rb_down.have_lid = 0;
 		/* The detector often misses a frame or two: hold the correction exactly as it was through
@@ -2059,6 +2072,13 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 			lid_glance = LID_GLANCE_K * (1.0f - r);
 		far = fmaxf(far, lid_glance);
 	}
+	/* Third cue: the head. A look past the notes is often made mostly with the head (the keyboard: the eyes
+	 * jump down, then turn back up in the head as far as the head follows, into the reading band again; or
+	 * the head goes first). The eyes alone would then read as reading and take over again, with the head
+	 * term at its cap: a jump of the whole correction while looking at the keyboard. So a head tilted further
+	 * down than reading takes (HEAD_READ_MAX) adds its excess to the glance. It can only add to the far cue. */
+	head_lids(g, p, m, hold, t, dt);
+	far += g->head_far;
 
 	/* Everything that should switch the effect off. Each term is 1 when it's fine. The head's (f_yaw,
 	 * f_pitch, f_size) fade it gently; the gaze's (f_side, f_far) let go with a saccade (see lock_f). */
@@ -2111,8 +2131,16 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float lock = f_side * f_far;
 	const int glide = g->rb_down.gliding || g->rb_side.gliding;
 	const int sacc = (snap_down && fabs(down - down_was) > down_hi) || (snap_side && fabs(side_f - side_was) > side_hi);
+	/* The glance jumping one way while the head has just tilted the other way by about as much is the eyes
+	 * catching up with the head (the gate takes their slow turn back in the head in one step, see
+	 * glide_catch_up()), not a look. Back up with the head tilted down, it may let go at once, but takes over
+	 * again only as a fade (else, the head having carried a look past the notes, the whole correction would
+	 * jump back in while looking there). */
+	const float jump = (float)(down - down_was);
+	const int catching_up = jump * g->head_move < 0 && fabsf(g->head_move) > 0.5f * fabsf(jump);
+	const int look = sacc && !(catching_up && jump < 0 && lock > g->lock_f);
 	if (!hold) {
-		if (sacc) {
+		if (look) {
 			g->lock_f = g->lock_mid = lock;
 		} else {
 			const float a = (float)(1.0 - exp(-dt / (lock > g->lock_mid ? FADE_IN_TAU : FADE_OUT_TAU)));
@@ -2134,8 +2162,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	/* The head's tilt and turn, and the lids (see head_lids()), held through blinks like the glance; and
 	 * the eyes' glance up in the head, which offsets a head tilted down (the eyes holding the lens while the
 	 * head tilts). Followed while the gaze is on the notes; while it is away, never growing (like the
-	 * glance), so a fade only ever lets go. */
-	head_lids(g, p, m, hold, t, dt);
+	 * glance), so a fade only ever lets go. (head_lids() ran above, for the far cue.) */
 	const float up_live = fminf((float)down, 0.0f);
 	if (lock >= 0.999f || !g->have_lock) {
 		g->head_v_lock = g->head_v;
@@ -2150,7 +2177,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 		g->up_drop_lock = fminf(g->up_drop_lock, g->up_drop);
 		g->lo_rise_lock = fminf(g->lo_rise_lock, g->lo_rise);
 	}
-	if (!g->have_lock || (lock >= 0.999f && sacc)) {
+	if (!g->have_lock || (lock >= 0.999f && look)) {
 		g->d_lock = d_live;
 		g->side_lock = side_dev;
 		g->have_lock = 1;
@@ -2172,10 +2199,30 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	/* How far the eyes must turn up to meet the lens: their glance plus the head's tilt down (with the glance's
 	 * catch-up after a head move glided in, see glide_catch_up()). */
 	const float eye = g->d_lock + g->up_lock;
-	const float d = fmaxf(eye + g->head_v_lock + glide_catch_up(g, eye, down_raw, hold, t, dt), 0.0f);
+	const float catch_up = glide_catch_up(g, eye, down_raw, hold, t, dt);
+	const float d = fmaxf(eye + g->head_v_lock + catch_up, 0.0f);
+	/* A strength over 1 makes up for a pupil reading that under-reads the eyes' turn (emit() multiplies by
+	 * it). The head's tilt is measured from the head, not the pupil, so it is not under-read: it is made up
+	 * for at most once (else 200% lifts the eyes above the lens by the whole head term). */
+	const float head_once = g->head_v_lock / fmaxf(clampf(p->strength, 0.0f, CF_STRENGTH_MAX), 1.0f);
+	const float d_amt = fmaxf(eye + catch_up + head_once, 0.0f);
 	/* Sideways damping only engages as the gaze drops towards the notes, so looking around at lens
-	 * height (at the other person) stays untouched. The lids are restored only then too. */
-	const float engage = smoothstepf(0.0f, fmaxf(0.35f * limit, 0.01f), d);
+	 * height (at the other person) stays untouched. The lids are restored only then too. It damps all of a
+	 * look to the side, so it must not flick on there: with the eyes turned up in the head (the head tilted
+	 * down, the eyes on the lens), d is the head's tilt less that turn, about 0 at the lens give or take two
+	 * measures that do not cancel exactly (noise, and the head and the glance settling at their own pace
+	 * after a look), so there it starts past a margin; and it moves at once only with a look (not with the
+	 * eyes catching up with the head), else at ENGAGE_SLEW. */
+	const float e0 = fminf(-fminf(g->up_lock, 0.0f), ENGAGE_UP_MARGIN);
+	const float engage_t = smoothstepf(e0, e0 + fmaxf(0.35f * limit, 0.01f), d);
+	if (!g->have_engage || (sacc && !catching_up)) {
+		g->engage_f = engage_t;
+	} else {
+		const float es = ENGAGE_SLEW * (float)(dt * 30.0);
+		g->engage_f += clampf(engage_t - g->engage_f, -es, es);
+	}
+	g->have_engage = 1;
+	const float engage = g->engage_f;
 	/* Upper lid: beyond following the iris lift by LID_SHIFT (emit()), lifted by what is left of its drop
 	 * after the share of the glance's own lift (the share it dropped with); lower lid: by its rise. */
 	const float lid_up_x = fmaxf(g->up_drop_lock - LID_SHIFT * fmaxf(g->d_lock, 0.0f), 0.0f) * engage;
@@ -2190,7 +2237,7 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float max_step = EASE_STEP_PX * (float)(dt * 30.0);
 	for (int i = 0; i < 2; i++) {
 		const float w = (float)g->rx[i].value;
-		float a = d * w * g->factor * g->lock_f;
+		float a = d_amt * w * g->factor * g->lock_f;
 		float h = -READ_DAMP * (g->side_lock + g->head_h_lock) * w * g->factor * g->lock_f * engage;
 		float l = lid_up_x * w * g->factor * g->lock_f, b = lid_lo_x * w * g->factor * g->lock_f;
 		if (g->ease) {

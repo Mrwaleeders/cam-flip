@@ -334,6 +334,12 @@ typedef struct {
 	float vor_raw, vor_gap;          /* the raw glance (lightly smoothed), and how far the glance lagged it */
 	double vor_t;
 	int have_vor;
+	/* The head's tilt down as an iris shift, uncapped (head_lids()): past HEAD_READ_MAX, for the far cue; all
+	 * of it, and how far it moved lately (decaying), to tell the eyes catching up with the head from a look. */
+	float head_far, head_full, head_move;
+	int have_head_full;
+	float engage_f; /* how far the sideways damping (and the lid restoration) is engaged, 0..1 */
+	int have_engage;
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);

@@ -1137,10 +1137,12 @@ static void test_head_lids(void)
 		printf("ok: a blink holds the head and lid terms too\n");
 	}
 
-	/* H7. Strength over 100%: the iris (and the upper lid that follows it) is lifted proportionally more,
-	 * the lids are restored no further than the lens opening, and the warp's cap still holds. */
+	/* H7. Strength over 100%: the eyes' share of the iris lift (and the upper lid that follows it) is lifted
+	 * proportionally more, the head's share (measured from the head, not under-read like the pupil) at most
+	 * once, the lids are restored no further than the lens opening, and the warp's cap still holds (eyes twice
+	 * the notes glance with the head 14 deg down: further down, the head counts as looking past the notes). */
 	{
-		float iris[2], lid_x[2], low[2];
+		float iris[2], lid_x[2], low[2], head_px = 0;
 		for (int k = 0; k < 2; k++) {
 			cf_gaze_params ps = p;
 			ps.strength = k ? 2.0f : 1.0f;
@@ -1154,6 +1156,8 @@ static void test_head_lids(void)
 			iris[k] = o.iris;
 			lid_x[k] = o.lid - HL_LID_SHIFT * o.iris;
 			low[k] = o.low;
+			if (!k)
+				head_px = HL_EYE_K * sinf(fmaxf(g.pose.pitch, 0) * 0.017453293f) * (float)g.rx[0].value;
 		}
 		cf_gaze_params ps = p;
 		ps.strength = 5.0f; /* clamped to 2 */
@@ -1161,17 +1165,18 @@ static void test_head_lids(void)
 		double t = 800.0;
 		int n = 0;
 		for (int i = 0; i < 90; i++, t += dt) {
-			const hl_state s = {.glance = 0.04f, .pitch = 18, .up_drop = 0.02f, .lo_rise = 0.01f};
+			const hl_state s = {.glance = 0.04f, .pitch = 14, .up_drop = 0.02f, .lo_rise = 0.01f};
 			n = update(&g, face_hl(s, 0), &ps, t, out);
 		}
 		float ext_y = 0;
 		for (int k = 0; k < out[0].aperture_count; k++)
 			ext_y = fmaxf(ext_y, fabsf(out[0].aperture[k][1] - out[0].cy));
 		const float cap = fminf(0.38f * out[0].ry, 0.5f * (out[0].ry - ext_y)), big = hl_read(n, &out[0]).iris;
-		printf("    strength 100%% -> 200%%: iris %.2f -> %.2f px, lid restore %.2f -> %.2f, lower lid %.2f -> %.2f; "
-		       "500%% far down: %.2f px (cap %.2f)\n",
-		       iris[0], iris[1], lid_x[0], lid_x[1], low[0], low[1], big, cap);
-		CHECK(fabsf(iris[1] - 2.0f * iris[0]) < 0.05f * iris[0] && fabsf(lid_x[1] - lid_x[0]) < 0.05f &&
+		const float want2 = 2.0f * (iris[0] - head_px) + head_px;
+		printf("    strength 100%% -> 200%%: iris %.2f -> %.2f px (want %.2f: the head's %.2f once), lid restore %.2f -> "
+		       "%.2f, lower lid %.2f -> %.2f; 500%% far down: %.2f px (cap %.2f)\n",
+		       iris[0], iris[1], want2, head_px, lid_x[0], lid_x[1], low[0], low[1], big, cap);
+		CHECK(fabsf(iris[1] - want2) < 0.05f * iris[0] && fabsf(lid_x[1] - lid_x[0]) < 0.05f &&
 			      fabsf(low[1] - low[0]) < 0.05f,
 		      "strength 200%%: iris %.2f vs %.2f, lids %.2f vs %.2f, %.2f vs %.2f", iris[1], iris[0], lid_x[1], lid_x[0],
 		      low[1], low[0]);
@@ -1264,6 +1269,76 @@ static void test_head_lids(void)
 	}
 	hl_head_noise = 0.5f;
 	printf("ok: head and lid terms add no visible jitter\n");
+
+	/* H10. To the keyboard (0.17 eye widths past the notes, ~34 deg down in all) with the head following
+	 * part of the way. Eyes first: they jump down, then turn back up in the head as the head tilts down to 28
+	 * deg, ending 0.04 down in the head, inside the reading band; the gate takes that slow turn in one step,
+	 * like a look back up. Head first: the head tilts to 22 deg with the eyes still in the head, then the eyes
+	 * jump down. Either way the correction lets go and stays let go: under 0.5 px over the last second, and
+	 * it never grows by more than the head term's slew in a frame while looking away. */
+	{
+		const float s6 = sinf(6.0f * 0.017453293f);
+		for (int c = 0; c < 2; c++) {
+			const float head_to = c ? 22.0f : 28.0f;
+			cf_gaze_init(&g);
+			double t = 1300.0;
+			const hl_state rd = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+			hl_out o = {0, 0, 0, 0};
+			for (int i = 0; i < 60; i++, t += dt)
+				o = hl_read(update(&g, face_hl(rd, 0), &p, t, out), &out[0]);
+			const float before = o.iris;
+			float rise = 0, late = 0, prev = o.iris;
+			for (int i = 0; i < 75; i++, t += dt) {
+				/* the head: 6 deg -> head_to over 0.5 s (eyes first: from the 3rd frame; head first: at once) */
+				const int h0 = c ? 0 : 2, e0 = c ? 21 : 0;
+				const float kh = fminf(fmaxf((float)(i - h0) / 15.0f, 0.0f), 1.0f);
+				const float ke = fminf(fmaxf((float)(i - e0) / 2.0f, 0.0f), 1.0f);
+				const float pitch = hl_lerp(6, head_to, kh * kh * (3 - 2 * kh));
+				/* the eyes in the head: from the notes to the keyboard, less what the head tilted further than
+				 * reading (before they jump, head first, they ride with the head) */
+				const float kbd = 0.19f - HL_EYE_K * (sinf(pitch * 0.017453293f) - s6);
+				const hl_state s = {hl_lerp(0.02f, kbd, ke), 0, pitch, 0, hl_lerp(0.01f, 0.04f, ke), hl_lerp(0.01f, 0.0f, ke), 0};
+				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+				rise = fmaxf(rise, o.iris - prev);
+				prev = o.iris;
+				if (i >= 45)
+					late = fmaxf(late, o.iris);
+			}
+			printf("    keyboard, %s (head to %.0f deg): %.2f px before; while away it grew by %.2f px a frame at most, "
+			       "%.2f px at most over the last second\n",
+			       c ? "head first" : "eyes first", head_to, before, rise, late);
+			CHECK(late < 0.5f && rise < HL_HEAD_SLEW_PX + 0.1f, "keyboard %s: %.2f px left, grew %.2f px in a frame",
+			      c ? "head first" : "eyes first", late, rise);
+		}
+		printf("ok: a look past the notes carried by the head lets go and stays let go\n");
+	}
+
+	/* H11. From reading (head 6 deg down) to someone 25 deg to the side at lens height: the eyes turn up in
+	 * the head by the head's tilt, the head stays down for 0.3 s, then comes up level over 0.5 s, the eyes
+	 * turning back down in it. The pupil reads only 0.65 of that turn up (as a real one may), and is noisy.
+	 * At the lens the head term and the eyes' turn up then cancel only to about 0: that must not engage the
+	 * sideways damping (it would pull the whole side look back towards the middle for a few frames). Over 20
+	 * noise seeds the sideways shift stays under 1.5 px. */
+	{
+		float worst = 0;
+		for (int sd = 0; sd < 20; sd++) {
+			cf_gaze_init(&g);
+			rng_seed(500 + 31 * sd);
+			double t = 1400.0;
+			const hl_state rd = {.glance = 0.02f, .pitch = 6, .up_drop = 0.01f, .lo_rise = 0.01f};
+			for (int i = 0; i < 60; i++, t += dt)
+				update(&g, face_hl(rd, 0.3f), &p, t, out);
+			for (int i = 0; i < 45; i++, t += dt) {
+				const float k = fminf(fmaxf((float)(i - 9) / 15.0f, 0.0f), 1.0f), pitch = 6.0f * (1 - k * k * (3 - 2 * k));
+				const hl_state s = {-0.65f * HL_EYE_K * sinf(pitch * 0.017453293f), 0.16f, pitch, 0, 0, 0, 0};
+				const hl_out o = hl_read(update(&g, face_hl(s, 0.3f), &p, t, out), &out[0]);
+				worst = fmaxf(worst, fabsf(o.side));
+			}
+		}
+		printf("    side look at lens height, head coming up level: sideways shift %.2f px at most over 20 seeds\n", worst);
+		CHECK(worst < 1.5f, "side look at the lens: sideways shift %.2f px", worst);
+		printf("ok: a look to the side at lens height is not damped back\n");
+	}
 }
 
 int main(void)
