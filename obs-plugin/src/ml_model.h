@@ -49,6 +49,15 @@ int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *chan
 		  unsigned res_channels, const cf_eye *eyes, int n, const float (*target_img)[2], const float *alpha,
 		  double *ms);
 
+/*
+ * Where this person's iris sits looking into the lens (learnt from the capture's lens looks, stored in
+ * the model), for eyes[e] of n as cf_ml_correct sees them, in image px: the target that holds the iris on
+ * the lens while reading, so neither the sideways sweep along a line nor the jump back to the next line
+ * shows. It moves with the eye corners (smoothed by the gaze model), not with the tracked pupil. Returns 0
+ * if the model doesn't carry it or eyes[e] has no outline.
+ */
+int cf_ml_lens_target(const cf_ml_model *m, const cf_eye *eyes, int n, int e, float out[2]);
+
 #ifdef __cplusplus
 }
 #endif

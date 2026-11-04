@@ -116,7 +116,7 @@ A small learned model, trained only on **your own face**, that may replace the h
 1. **Record** (about 4 minutes, head still, eyes follow a dot): `obs-plugin/tools/model/capture.sh --distance 60`. Use your real distance in cm. Do one session at your call distance and one at your desk distance.
 2. **Cut out the eyes:** `obs-plugin/tools/model/extract.sh ~/Downloads/camflip-diag/captures/<session>` (for each session).
 3. **Train** (about 30 to 60 minutes on Apple Silicon): `obs-plugin/tools/model/train.sh <session> <session>`. This writes `~/Library/Application Support/cam-flip/eye-model.mlpackage`, plus a preview of held-out frames showing your eye, the model's correction, and the real look into the lens.
-4. **Compare:** `obs-plugin/tools/render.sh <clip.mov> <out-dir> --engine model`, against the same command without `--engine model`. The tool prints the model's time per frame. `--ml-compute cpu|gpu|ane` picks where it runs.
+4. **Compare:** `obs-plugin/tools/render.sh <clip.mov> <out-dir> --engine model`, against the same command without `--engine model`. The tool prints the model's time per frame. `--ml-compute cpu|gpu|ane` picks where it runs. By default the model holds your iris where it sits when you look into the lens (learnt from the recording), so the sideways sweep along a line and the jump back to the next line don't show; `--ml-target follow` instead follows the tracked pupil plus the classic shift.
 
 The model covers anything within about 20 cm around your notes: the whole screen width and down to the bottom of the screen. It's trained for 0.5 to 1.5 m, and anything further out fades out like the classic warp. The research and plan are in the [design doc](https://claude.ai/artifact/CTFrxG6jB1H3EasJs5kSW1).
 

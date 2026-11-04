@@ -358,7 +358,21 @@ class Export(nn.Module):
         return self.m(patch, target)
 
 
-def export_coreml(model, path):
+def lens_look(sessions):
+    """Where the iris sits, in patch px, looking into the lens: (x, y) for the eye left in the image (0) and
+    the mirrored one (1). The plugin holds the iris there while reading, so sideways sweeps and line
+    returns don't show."""
+    out = []
+    for e in (0, 1):
+        xs = np.concatenate([s.px[s.ok & (s.kind == "lens") & (s.flip == e)] for s in sessions])
+        ys = np.concatenate([s.py[s.ok & (s.kind == "lens") & (s.flip == e)] for s in sessions])
+        if len(xs) < 20:
+            return None
+        out += [float(np.median(xs)), float(np.median(ys))]
+    return out
+
+
+def export_coreml(model, path, lens=None):
     import coremltools as ct
     m = Export(model).eval().cpu()
     ex = (torch.rand(2, 1, H, W), torch.rand(2, 2))
@@ -369,6 +383,8 @@ def export_coreml(model, path):
                     convert_to="mlprogram", compute_precision=ct.precision.FLOAT16,
                     minimum_deployment_target=ct.target.macOS13)
     ml.short_description = "Cam Flip personal eye model (private: trained on one person's face)"
+    if lens:
+        ml.user_defined_metadata["camflip.lens"] = " ".join(f"{v:.3f}" for v in lens)
     ml.save(path)
     print(f"exported {path}")
 
@@ -401,6 +417,9 @@ def main():
         if not a.sessions:
             ap.error("give one or more capture folders (or --selftest)")
         sessions = [Session(s) for s in a.sessions]
+        lens = lens_look(sessions)
+        print("looking into the lens, the iris sits at " +
+              (f"({lens[0]:.1f}, {lens[1]:.1f}) and ({lens[2]:.1f}, {lens[3]:.1f}) patch px" if lens else "? (too few lens frames)"))
         train, val = Pairs(sessions), Pairs(sessions, val=True, seed=1)
         print(f"training pairs from {len(train)} source frames, validation {len(val)}")
         if len(train) < 200 or len(val) < 20:
@@ -446,12 +465,13 @@ def main():
         print(f"selftest {'passed' if ok else 'FAILED'}: iris error {em:.2f} px vs {ec:.2f} uncorrected, "
               f"difference {lm:.4f} vs {lc:.4f}")
         if ok and a.selftest_export:
-            export_coreml(model.cpu(), a.selftest_export)
+            # The synthetic eye looks into the "lens" around the middle, just above the corner line.
+            export_coreml(model.cpu(), a.selftest_export, [64.0, CORNER_Y - 1.0, 64.0, CORNER_Y - 1.0])
         sys.exit(0 if ok else 1)
     torch.save(model.state_dict(), os.path.join(out_dir, "eye-model.pt"))
     save_preview(model, val, grid, os.path.join(out_dir, "preview"), dev)
     if not a.no_export:
-        export_coreml(model.cpu(), os.path.join(out_dir, "eye-model.mlpackage"))
+        export_coreml(model.cpu(), os.path.join(out_dir, "eye-model.mlpackage"), lens)
 
 
 if __name__ == "__main__":

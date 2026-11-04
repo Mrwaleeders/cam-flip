@@ -13,6 +13,8 @@ struct cf_ml_model {
 	void *model;    /* MLModel, retained */
 	void *in_patch; /* MLMultiArray [2,1,H,W] float32, retained */
 	void *in_target;
+	int has_lens;
+	float lens[2][2]; /* iris looking into the lens, patch px: eye left in the image, mirrored eye */
 	float flow_x[2][PN], flow_y[2][PN], res[2][PN], mask[2][PN];
 };
 
@@ -88,6 +90,10 @@ cf_ml_model *cf_ml_load(const char *path, enum cf_ml_compute compute, char *err,
 		m->model = (__bridge_retained void *)model;
 		m->in_patch = (__bridge_retained void *)ip;
 		m->in_target = (__bridge_retained void *)it;
+		NSString *lens = model.modelDescription.metadata[MLModelCreatorDefinedKey][@"camflip.lens"];
+		if (lens && sscanf(lens.UTF8String, "%f %f %f %f", &m->lens[0][0], &m->lens[0][1], &m->lens[1][0],
+				   &m->lens[1][1]) == 4)
+			m->has_lens = 1;
 		return m;
 	}
 }
@@ -185,6 +191,23 @@ void cf_ml_free(cf_ml_model *m)
 
 #include <mach/mach_time.h>
 
+static int mirrored(const cf_eye *eyes, int n, int e)
+{
+	return n == 2 && eyes[e].cx > eyes[1 - e].cx;
+}
+
+int cf_ml_lens_target(const cf_ml_model *m, const cf_eye *eyes, int n, int e, float out[2])
+{
+	if (!m || !m->has_lens || e < 0 || e >= n || n > 2)
+		return 0;
+	const int flip = mirrored(eyes, n, e);
+	cf_ml_frame fr;
+	if (!cf_ml_eye_frame(&eyes[e], flip, &fr))
+		return 0;
+	cf_ml_to_image(&fr, m->lens[flip][0], m->lens[flip][1], &out[0], &out[1]);
+	return 1;
+}
+
 int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *channels, int count,
 		  unsigned res_channels, const cf_eye *eyes, int n, const float (*target_img)[2], const float *alpha,
 		  double *ms)
@@ -200,7 +223,7 @@ int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *chan
 	float a[2];
 	int k = 0;
 	for (int e = 0; e < n; e++) {
-		const int flip = n == 2 && eyes[e].cx > eyes[1 - e].cx;
+		const int flip = mirrored(eyes, n, e);
 		if (!cf_ml_eye_frame(&eyes[e], flip, &fr[k]))
 			continue;
 		use[k] = eyes[e];

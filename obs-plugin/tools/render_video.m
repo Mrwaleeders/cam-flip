@@ -35,6 +35,9 @@
  *   --model PATH       the model for --engine model (default ~/Library/Application Support/cam-flip/
  *                      eye-model.mlpackage)
  *   --ml-compute U     where the model runs: all (default), cpu, gpu (CPU + GPU), ane (CPU + Neural Engine)
+ *   --ml-target T      where the model puts the iris: lens (default, if the model learnt it): where your
+ *                      iris sits looking into the lens, so the sideways sweep and line returns don't show;
+ *                      follow: the tracked pupil plus the classic warp's shift (keeps the sweep)
  *
  * Nothing leaves this Mac. tools/render.sh builds and runs it.
  */
@@ -340,7 +343,7 @@ int main(int argc, char **argv)
 	const char *model_path = NULL;
 	enum cf_ml_compute ml_compute = CF_ML_ALL;
 	double ml_ms = 0, ml_ms_max = 0;
-	int ml_runs = 0;
+	int ml_runs = 0, ml_follow = 0;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
 	int vis_opt = 0; /* --vis-baseline (1) and --vis-notes (2) given */
@@ -375,6 +378,7 @@ int main(int argc, char **argv)
 				   : !strcmp(v, "ane") ? CF_ML_CPU_ANE : CF_ML_ALL;
 			i++;
 		}
+		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); i++; }
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
 	}
 	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
@@ -387,7 +391,17 @@ int main(int argc, char **argv)
 			fprintf(stderr, "cannot load the eye model %s: %s\n", mp, err);
 			return 1;
 		}
-		printf("engine: personal eye model %s\n", mp);
+		cf_eye probe[1];
+		memset(probe, 0, sizeof(probe));
+		probe[0].aperture_count = 2;
+		probe[0].aperture[1][0] = 10;
+		float pt[2];
+		if (!ml_follow && !cf_ml_lens_target(ml, probe, 1, 0, pt)) {
+			printf("this model doesn't carry the lens look (retrain it): following the pupil instead\n");
+			ml_follow = 1;
+		}
+		printf("engine: personal eye model %s, iris %s\n", mp,
+		       ml_follow ? "follows the pupil plus the classic shift" : "held on the lens look");
 	}
 	if (lag < 0)
 		lag = 0;
@@ -692,11 +706,17 @@ int main(int argc, char **argv)
 					cf_channel ch[8];
 					const int cc = cf_channels(CF_FMT_NV12, planes, ls, w, h, ch);
 					if (ml) {
-						/* The model gets where the iris should end up: where the gaze model last saw it
-						 * (moved with the eye since, as predicted) plus the shift the classic warp
-						 * would apply. It sees this frame's pixels, so it handles jumps since then. */
+						/* The model gets where the iris should end up. Lens (default): where this
+						 * person's iris sits looking into the lens, placed by the eye corners, so the
+						 * pupil's sideways sweep and line returns never reach the target. Follow: where
+						 * the gaze model last saw the pupil (moved with the eye since, as predicted) plus
+						 * the shift the classic warp would apply. The model sees this frame's pixels
+						 * either way, so it handles jumps since the last tracking. */
 						float tgt[2][2], alpha[2];
 						for (int e = 0; e < n; e++) {
+							alpha[e] = fminf(1.0f, st.factor / 0.3f);
+							if (!ml_follow && cf_ml_lens_target(ml, eyes, n, e, tgt[e]))
+								continue;
 							const cf_pt c0 = centroid_of(fed.left_eye, fed.left_count),
 								    c1 = centroid_of(fed.right_eye, fed.right_count);
 							const float d0 = hypotf(c0.x - eyes[e].cx, c0.y - eyes[e].cy),
@@ -705,7 +725,6 @@ int main(int argc, char **argv)
 							const cf_pt c = right ? c1 : c0, pu = right ? fed.right_pupil : fed.left_pupil;
 							tgt[e][0] = pu.x + (eyes[e].cx - c.x) + eyes[e].sx;
 							tgt[e][1] = pu.y + (eyes[e].cy - c.y) + eyes[e].sy;
-							alpha[e] = fminf(1.0f, st.factor / 0.3f);
 						}
 						double ms = 0;
 						if (cf_ml_correct(ml, &ch[0], ch, cc, cf_ml_residual_channels(CF_FMT_NV12), eyes, n,
