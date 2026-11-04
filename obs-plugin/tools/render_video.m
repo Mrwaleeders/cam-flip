@@ -698,7 +698,8 @@ int main(int argc, char **argv)
 		 * the refined and Vision pupil offsets (eye widths, + = up) the gaze model saw on this frame.
 		 * yaw, pitch: the smoothed head pose (pose.c, degrees from the calibrated one) its fade used. */
 		fprintf(csv, "t,n,factor,cx0,cy0,sx0,sy0,cx1,cy1,sx1,sy1,in_ly,in_ry,out_ly,out_ry,"
-			     "l_open,l_ref,l_vis,r_open,r_ref,r_vis,yaw,pitch\n");
+			     "l_open,l_ref,l_vis,r_open,r_ref,r_vis,yaw,pitch,"
+			     "ml_tx0,ml_ty0,ml_tx1,ml_ty1,ml_a0,ml_a1,ml_px0,ml_py0,ml_px1,ml_py1\n");
 
 		size_t cap = 4096, nm = 0;
 		meas_t *m = calloc(cap, sizeof(meas_t));
@@ -805,6 +806,8 @@ int main(int argc, char **argv)
 				/* Warp, exactly like camflip_filter_video. */
 				cf_eye eyes[2];
 				memset(eyes, 0, sizeof(eyes));
+				/* Eye model log for frames.csv, per eye in the image's order: target, effect, pupil seen. */
+				float mlt[2][2] = {{0}}, mla[2] = {0}, mlp[2][2] = {{0}};
 				const int n = cf_gaze_predict(&gaze, &p, t, eyes);
 				cf_gaze_status st;
 				cf_gaze_get_status(&gaze, &st);
@@ -835,6 +838,8 @@ int main(int argc, char **argv)
 							const cf_pt c = right ? c1 : c0, pu = right ? fed.right_pupil : fed.left_pupil;
 							tgt[e][0] = pu.x + (eyes[e].cx - c.x) + eyes[e].sx;
 							tgt[e][1] = pu.y + (eyes[e].cy - c.y) + eyes[e].sy;
+							mlp[e][0] = pu.x + (eyes[e].cx - c.x);
+							mlp[e][1] = pu.y + (eyes[e].cy - c.y);
 							cf_ml_frame fr;
 							const int flip = n == 2 && eyes[e].cx > eyes[1 - e].cx;
 							if (ml_steady && cf_ml_eye_frame(&eyes[e], flip, &fr)) {
@@ -848,6 +853,11 @@ int main(int argc, char **argv)
 											       steady_dwell, steady_snaps);
 								cf_ml_to_image(&fr, hd[0], hd[1], &tgt[e][0], &tgt[e][1]);
 							}
+						}
+						for (int e = 0; e < n && e < 2; e++) {
+							mlt[e][0] = tgt[e][0];
+							mlt[e][1] = tgt[e][1];
+							mla[e] = alpha[e];
 						}
 						double ms = 0;
 						if (cf_ml_correct(ml, &ch[0], ch, cc, ml_res ? cf_ml_residual_channels(CF_FMT_NV12) : 0u, eyes, n,
@@ -917,10 +927,11 @@ int main(int argc, char **argv)
 					    &em[1][0], &em[1][1], &em[1][2]);
 				fprintf(csv,
 					"%.4f,%d,%.3f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-					"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f\n",
+					"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f\n",
 					t, n, st.factor, eyes[0].cx, eyes[0].cy, eyes[0].sx, eyes[0].sy, eyes[1].cx, eyes[1].cy,
 					eyes[1].sx, eyes[1].sy, mm->in_y[0], mm->in_y[1], mm->out_y[0], mm->out_y[1], em[0][0],
-					em[0][1], em[0][2], em[1][0], em[1][1], em[1][2], gaze.pose.yaw, gaze.pose.pitch);
+					em[0][1], em[0][2], em[1][0], em[1][1], em[1][2], gaze.pose.yaw, gaze.pose.pitch,
+					mlt[0][0], mlt[0][1], mlt[1][0], mlt[1][1], mla[0], mla[1], mlp[0][0], mlp[0][1], mlp[1][0], mlp[1][1]);
 
 				/* Writers, sized on the first frame. The close-up crop is fixed from the first face. */
 				if (!wfull) {
