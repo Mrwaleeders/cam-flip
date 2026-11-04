@@ -170,19 +170,24 @@ class Session:
 class Pairs:
     """Samples (source, destination) pairs: same eye, same session, a few seconds apart, head still."""
 
-    def __init__(self, sessions, val_frac=0.15, val=False, seed=0):
+    def __init__(self, sessions, val=False, seed=0):
         self.items = []  # (session, src index, candidate dst indices)
         for s in sessions:
-            tmax = s.t.max()
-            cut = tmax * (1 - val_frac)
+            # Held-out frames: every 6th 8-second block, so they cover the whole session (lens looks, dots
+            # all over the screen, reading, looking away) and not just its end, which is mostly reading
+            # and barely needs correcting. Pairs never cross into another block's frames.
+            block = np.floor(s.t / 8.0).astype(int)
+            held = (block % 6) == 3
             for e in (0, 1):
-                idx = np.where(s.ok & (s.flip == e) & ((s.t >= cut) if val else (s.t < cut)))[0]
+                idx = np.where(s.ok & (s.flip == e) & (held if val else ~held))[0]
                 if len(idx) < 2:
                     continue
                 t = s.t[idx]
                 for j, i in enumerate(idx):
                     lo, hi = np.searchsorted(t, s.t[i] - 2.5), np.searchsorted(t, s.t[i] + 2.5)
                     cand = idx[lo:hi]
+                    if val:
+                        cand = cand[block[cand] == block[i]]
                     # head still: corners within 6% of the eye width
                     tol = 0.06 * s.eye_w[i]
                     d = np.maximum(np.hypot(s.ax[cand] - s.ax[i], s.ay[cand] - s.ay[i]),
