@@ -41,11 +41,11 @@
 #define LID_SHIFT 0.45f       /* upper lid follows the iris by this fraction (real lids track vertical gaze) */
 #define AMOUNT_MAX_RY 0.38f   /* vertical iris shift limit, fraction of ry (well inside the fold limit) */
 #define HSHIFT_MAX_RX 0.30f   /* sideways iris shift limit, fraction of rx */
-#define READ_DAMP 0.95f       /* fraction of the measured sideways reading excursion cancelled. Nearly all: the
-			       * refined point takes in ~86% of a sideways iris move and the warp delivers ~90% of a
-			       * sideways shift at the pupil (synthetic eyes, 60-120 px), so ~25-30% of the eyes'
-			       * scanning stays visible, never frozen and never reversed */
-#define HEAD_DAMP 0.65f       /* ... and of the head turn's share (HEAD_YAW_K of it) */
+#define READ_DAMP 0.95f       /* sideways, the shown gaze may move 1 / this faster than SLEW_PX (the sideways
+			       * damping, cf_gaze_params.scan_damp, takes out up to all of it; with 0.95 the refined
+			       * point's ~86% of a sideways move and the warp's ~90% leave ~30% of the scanning) */
+#define SIDE_CENTRE_TAU 4.0   /* s: the sideways damping is centred on where the eyes have been over this */
+#define HEAD_DAMP 0.65f       /* share of the head turn's term (HEAD_YAW_K of the turn) made up for sideways */
 #define SIDE_FADE_LO 0.30f    /* sideways distance from the notes centre (eye widths) where fading starts */
 #define SIDE_FADE_HI 0.45f
 #define FADE_IN_TAU 0.15      /* s: per stage of the fade in (10-90% in ~0.5 s) ... */
@@ -1268,6 +1268,7 @@ static cf_gaze_params sanitize(const cf_gaze_params *in)
 	if (!(p.baseline_upper > 0.0f && p.baseline_upper < 1.0f && p.baseline_lower > 0.0f && p.baseline_lower < 1.0f))
 		p.baseline_upper = p.baseline_lower = 0.0f;
 	p.max_glance = finite_or(p.max_glance, 0.15f);
+	p.scan_damp = clampf(finite_or(p.scan_damp, 0.0f), 0.0f, 1.0f);
 	p.baseline = finite_or(p.baseline, 0.0f);
 	p.baseline_open = finite_or(p.baseline_open, 0.0f);
 	p.notes_open = finite_or(p.notes_open, 0.0f);
@@ -1849,9 +1850,9 @@ static void emit(const cf_gaze *g, const cf_gaze_params *p, cf_eye out[2])
 		const float cap = fminf(AMOUNT_MAX_RY * e->ry, 0.5f * (e->ry - ext_y));
 		amount = fminf(amount, cap);
 		amount = fmaxf(amount, 0.0f);
-		/* Sideways independent of strength (fully from 25% on): it takes out READ_DAMP of the eyes' measured
-		 * scanning, which the strength (making up for the vertical lift the warp falls short of) has nothing to
-		 * do with, and more would show them sweeping the wrong way. */
+		/* Sideways independent of strength (fully from 25% on): it has its own setting (scan_damp) and the head
+		 * turn's share, which the strength (making up for the vertical lift the warp falls short of) has nothing
+		 * to do with, and more would show the eyes sweeping the wrong way. */
 		float hs = g->hshift_unit[i] * fminf(4.0f * strength, 1.0f);
 		hs = clampf(hs, -HSHIFT_MAX_RX * e->rx, HSHIFT_MAX_RX * e->rx);
 
@@ -2503,6 +2504,17 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	}
 	g->have_engage = 1;
 	const float engage = g->engage_f;
+	/* Where the sideways damping is centred: where the eyes have been over the last SIDE_CENTRE_TAU, from
+	 * where they were when it engaged. Not the calibrated notes_side: the refined point's sideways reading
+	 * has its own offset that can differ from the calibration's by 0.05 eye widths (a re-render of the
+	 * user's clip at 150%: the iris shown 2.3 px off where it was, up to 10 px of shift held at one spot of
+	 * the notes, and a 4.5 px one-frame jump of the shift when looking down to the notes). */
+	if (engage < 0.01f || !g->have_centre) {
+		g->side_centre = g->side_lock;
+		g->have_centre = 1;
+	} else if (!hold) {
+		g->side_centre += (float)(1.0 - exp(-dt / SIDE_CENTRE_TAU)) * (g->side_lock - g->side_centre);
+	}
 	/* Upper lid: beyond following the iris lift by LID_SHIFT (emit()), lifted by what is left of its drop
 	 * after the share of the glance's own lift (the share it dropped with); lower lid: by its rise. */
 	const float lid_up_x = fmaxf(g->up_drop_lock - LID_SHIFT * fmaxf(g->d_lock, 0.0f), 0.0f) * engage;
@@ -2518,7 +2530,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	for (int i = 0; i < 2; i++) {
 		const float w = (float)g->rx[i].value;
 		float a = d_amt * w * g->factor * g->lock_f;
-		float h = -(READ_DAMP * g->side_lock + HEAD_DAMP * g->head_h_lock) * w * g->factor * g->lock_f * engage;
+		float h = -(p->scan_damp * (g->side_lock - g->side_centre) + HEAD_DAMP * g->head_h_lock) * w * g->factor *
+			  g->lock_f * engage;
 		float l = lid_up_x * w * g->factor * g->lock_f, b = lid_lo_x * w * g->factor * g->lock_f;
 		/* The lid terms never change by more than dt / LID_EASE_TIME of themselves in a frame (half at most):
 		 * when the iris jumps (a saccade to or from the notes, a fade switching with it),

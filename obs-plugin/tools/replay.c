@@ -2,7 +2,7 @@
  * Replays a landmarks CSV from tools/diag_video.m through the gaze model, the way the plugin runs
  * it live, and measures shaking. Pure C: runs anywhere.
  *
- *   replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength 0..2] [--out per-frame.csv]
+ *   replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength 0..2] [--scan-damp 0..1] [--out per-frame.csv]
  *          [--baseline B --baseline-open O --notes-offset N --notes-side S --notes-open P]
  *          [--head-side S --head-vert V --head-eyes E --head-tilt K]
  *
@@ -141,12 +141,12 @@ static int in_range(double t, const double r[2])
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength s] [--out f]\n");
+		fprintf(stderr, "usage: replay <landmarks.csv> [--lag N] [--lens a-b] [--notes a-b] [--strength s] [--scan-damp d] [--out f]\n");
 		return 2;
 	}
 	int lag = 0;
 	double lens[2] = {0, 0}, notes[2] = {0, 0};
-	float strength = 1.0f;
+	float strength = 1.0f, scan_damp = 0.0f;
 	const char *outp = NULL;
 	float cal[5] = {0, 0, 0, 0, 0}; /* baseline, baseline_open, notes_offset, notes_side, notes_open */
 	float lids[2] = {0, 0}, vis[2] = {0, 0}; /* baseline_upper/lower; vis_baseline/notes */
@@ -162,6 +162,8 @@ int main(int argc, char **argv)
 			sscanf(argv[++i], "%lf-%lf", &notes[0], &notes[1]);
 		else if (!strcmp(argv[i], "--strength") && i + 1 < argc)
 			strength = (float)atof(argv[++i]);
+		else if (!strcmp(argv[i], "--scan-damp") && i + 1 < argc)
+			scan_damp = (float)atof(argv[++i]);
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc)
 			outp = argv[++i];
 		else if (!strcmp(argv[i], "--baseline") && i + 1 < argc)
@@ -199,7 +201,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Calibrate exactly like the buttons do, on the given time ranges. */
-	cf_gaze_params p = {.strength = strength, .max_glance = 0.15f, .head_ref = head};
+	cf_gaze_params p = {.strength = strength, .max_glance = 0.15f, .head_ref = head, .scan_damp = scan_damp};
 	/* Calibration as saved in the filter's settings (OBS scene JSON), if given. */
 	if (have_cal & 1) {
 		p.baseline = cal[0];

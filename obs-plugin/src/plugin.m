@@ -55,6 +55,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_EYE_CONTACT "eye_contact"
 #define S_STRENGTH "strength"
 #define S_MAX_GLANCE "max_glance"
+#define S_SCAN_DAMP "scan_damp"
 #define S_SHOW_EYES "show_eyes"
 #define S_BASELINE "baseline"
 #define S_BASELINE_OPEN "baseline_open"
@@ -127,6 +128,7 @@ struct camflip {
 	bool eye_contact;
 	bool show_eyes;
 	float strength;
+	float scan_damp;
 	float max_glance;
 	float baseline;
 	float baseline_open;
@@ -283,6 +285,7 @@ static cf_gaze_params params_locked(const struct camflip *f)
 	cf_gaze_params p;
 	memset(&p, 0, sizeof(p));
 	p.strength = f->strength;
+	p.scan_damp = f->scan_damp;
 	p.max_glance = f->max_glance;
 	p.baseline = f->baseline;
 	p.baseline_open = f->baseline_open;
@@ -1115,6 +1118,7 @@ static void camflip_update(void *data, obs_data_t *settings)
 	f->eye_contact = obs_data_get_bool(settings, S_EYE_CONTACT);
 	f->show_eyes = obs_data_get_bool(settings, S_SHOW_EYES);
 	f->strength = (float)obs_data_get_double(settings, S_STRENGTH) / 100.0f;
+	f->scan_damp = (float)obs_data_get_double(settings, S_SCAN_DAMP) / 100.0f;
 	f->max_glance = (float)obs_data_get_double(settings, S_MAX_GLANCE) / 100.0f; /* eye widths */
 	f->baseline = (float)obs_data_get_double(settings, S_BASELINE);
 	f->baseline_open = (float)obs_data_get_double(settings, S_BASELINE_OPEN);
@@ -1258,6 +1262,8 @@ static void camflip_defaults(obs_data_t *settings)
 	/* Full strength: with the notes calibrated, anything less leaves part of every glance visible.
 	 * The slider stays so it can be turned down. */
 	obs_data_set_default_double(settings, S_STRENGTH, 100.0);
+	/* Off: tracking runs a frame behind, so taking out the scanning twitches the eyes at every line return. */
+	obs_data_set_default_double(settings, S_SCAN_DAMP, 0.0);
 	obs_data_set_default_double(settings, S_MAX_GLANCE, 15.0);
 	obs_data_set_default_double(settings, S_BASELINE, DEFAULT_BASELINE);
 	obs_data_set_default_double(settings, S_BASELINE_OPEN, 0.0);
@@ -1550,6 +1556,13 @@ static obs_properties_t *camflip_properties(void *data)
 		p, "100% cancels the glance at your notes as it is measured. If you still look like you're reading, "
 		   "go higher (up to 200%) to lift your eyes further; lower keeps some of the natural movement. "
 		   "The damping of your eyes' sideways scanning along a line doesn't change with it (above 25%).");
+
+	p = obs_properties_add_float_slider(props, S_SCAN_DAMP, "Hide reading along a line", 0.0, 100.0, 5.0);
+	obs_property_float_set_suffix(p, "%");
+	obs_property_set_long_description(
+		p, "Takes out this much of your eyes' sideways movement as you read along a line (95% leaves about a "
+		   "third of it visible). Tracking runs a frame behind the video, so at the jump back to the next line "
+		   "your eyes twitch for one frame. Off by default; a look held to one side is never shifted.");
 
 	p = obs_properties_add_float_slider(props, S_MAX_GLANCE, "Correct glances up to", 5.0, 30.0, 1.0);
 	obs_property_float_set_suffix(p, "%");

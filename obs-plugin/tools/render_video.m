@@ -26,6 +26,7 @@
  *   --lens a-b --notes a-b   or calibrate on these time ranges (seconds) of the clip instead (--lens
  *                      also learns the head looking into the camera)
  *   --strength S       0..2 (default 1; over 1 overshoots, like the 200% slider)
+ *   --scan-damp D      0..1 (default 0): the "Hide reading along a line" slider
  *   --measure          also track the corrected output and report how much the iris seen by the
  *                      viewer shakes (RMS of value minus its centred 5-frame mean, pixels)
  *   --zoom Z           compare.mov enlargement (default 3)
@@ -324,7 +325,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: render_video <in> <out-dir> [--lag N] [--dedupe X] [--baseline B] "
 				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--head-side S] "
 				"[--head-vert V] [--head-eyes E] [--head-tilt K] [--baseline-upper U] [--baseline-lower L] "
-				"[--vis-baseline A] [--vis-notes B] [--lens a-b] [--notes a-b] [--strength S] "
+				"[--vis-baseline A] [--vis-notes B] [--lens a-b] [--notes a-b] [--strength S] [--scan-damp D] "
 				"[--measure] [--zoom Z]\n");
 		return 2;
 	}
@@ -353,6 +354,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--lens")) { parse_range(v, lens); i++; }
 		else if (!strcmp(a, "--notes")) { parse_range(v, notes_r); i++; }
 		else if (!strcmp(a, "--strength")) { p.strength = (float)atof(v); i++; }
+		else if (!strcmp(a, "--scan-damp")) { p.scan_damp = (float)atof(v); i++; }
 		else if (!strcmp(a, "--zoom")) { zoom = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--measure")) measure = 1;
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }

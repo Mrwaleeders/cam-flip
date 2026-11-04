@@ -72,6 +72,15 @@ typedef struct {
 	 * looking into the lens, eye widths (lens calibration, mean of both eyes). 0 = unknown (calibrated by
 	 * an older version): the lids then only follow the iris as before, nothing is restored. */
 	float baseline_upper, baseline_lower;
+
+	/* How much of the eyes' sideways scanning along a line is taken out, 0..1 of what is measured (0: none,
+	 * the default). Tracking runs a frame behind the video, so the counter-move for the jump back to the next
+	 * line comes a frame after the eye's own jump: a one-frame twitch at every line return. Taking it in
+	 * gently instead (a glide) left 0.77-0.98 of the scan (the eye sliding back across the line after each
+	 * return), so there is no smooth middle way: the scanning is taken out (with that twitch) or left alone.
+	 * Damping is centred on where the eyes have been lately (seconds), never on a calibrated spot, so it
+	 * never adds a sideways offset the eyes don't have. */
+	float scan_damp;
 } cf_gaze_params;
 
 /* "Eye contact strength" goes up to this (200%): over 1 the correction overshoots, so it can make up for
@@ -355,6 +364,8 @@ typedef struct {
 	float svk_m, svk_v, svk_mm, svk_mv;
 	int have_svk;
 	int side_novis; /* Vision's point hardly moves sideways: not used there */
+	float side_centre; /* where the sideways damping is centred (where the eyes have been lately) */
+	int have_centre;
 	/* The head's tilt down as an iris shift, uncapped (head_lids()): past HEAD_READ_MAX, for the far cue; all
 	 * of it, and how far it moved lately (decaying), to tell the eyes catching up with the head from a look. */
 	float head_far, head_full, head_move;

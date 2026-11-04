@@ -1186,39 +1186,52 @@ static void test_head_lids(void)
 	}
 
 	/* H8. The head turned while reading, the eyes turning back in the head to the notes: half of the turn is
-	 * made up for sideways, by HEAD_DAMP (0.65; the eyes' own scanning by READ_DAMP, 0.95). Eyes alone
-	 * scanning a line are damped by READ_DAMP. */
+	 * made up for sideways, by HEAD_DAMP (0.65). The eyes' own sideways offset is not: the scan damping is
+	 * off by default, and when on (scan_damp 0.95) it takes out a move along a line at once but lets go of
+	 * an offset held for seconds (centred on where the eyes have been: never a sideways offset the eyes
+	 * don't have). */
 	{
 		const float yaw = 8.0f;
-		float h[2];
-		for (int k = 0; k < 2; k++) {
-			cf_gaze_init(&g);
-			double t = 900.0;
-			hl_out o = {0, 0, 0, 0};
-			float meas = 0;
-			for (int i = 0; i < 90; i++, t += dt) {
-				const float yk = k ? yaw * fminf(1.0f, (float)i / 20.0f) : 0.0f;
-				const hl_state s = {.glance = 0.02f, .side = k ? -HL_EYE_K * sinf(1.2f * yk * 0.017453293f) : 0.08f,
-						    .yaw = yk, .up_drop = 0.01f, .lo_rise = 0.01f};
-				o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
-				meas = g.pose.yaw;
-			}
-			h[k] = o.side;
-			if (k) {
-				const float eyes = -HL_EYE_K * sinf(1.2f * yaw * 0.017453293f);
-				const float want = -(0.95f * eyes + 0.65f * 0.5f * HL_EYE_K * sinf(meas * 0.017453293f)) * HW;
-				printf("    head turned %.0f deg (reads %.1f), eyes back on the notes: sideways shift %.2f px (%.2f "
-				       "expected, %.2f without the head)\n",
-				       yaw, meas, h[1], want, -0.95f * eyes * HW);
-				CHECK(fabsf(h[1] - want) < 0.15f + 0.05f * fabsf(want), "head turn: sideways %.2f px, want %.2f", h[1],
-				      want);
-			} else {
-				printf("    eyes 0.08 sideways on a line: sideways shift %.2f px (%.2f expected)\n", h[0],
-				       -0.95f * 0.08f * HW);
-				CHECK(fabsf(h[0] + 0.95f * 0.08f * HW) < 0.15f, "eyes scanning: sideways %.2f px", h[0]);
-			}
+		cf_gaze_init(&g);
+		double t = 900.0;
+		hl_out o = {0, 0, 0, 0};
+		float meas = 0;
+		for (int i = 0; i < 90; i++, t += dt) {
+			const float yk = yaw * fminf(1.0f, (float)i / 20.0f);
+			const hl_state s = {.glance = 0.02f, .side = -HL_EYE_K * sinf(1.2f * yk * 0.017453293f), .yaw = yk,
+					    .up_drop = 0.01f, .lo_rise = 0.01f};
+			o = hl_read(update(&g, face_hl(s, 0), &p, t, out), &out[0]);
+			meas = g.pose.yaw;
 		}
-		printf("ok: half the head's turn is made up for sideways, the eyes' scanning damped as before\n");
+		const float want = -0.65f * 0.5f * HL_EYE_K * sinf(meas * 0.017453293f) * HW;
+		printf("    head turned %.0f deg (reads %.1f), eyes back on the notes: sideways shift %.2f px (%.2f expected)\n",
+		       yaw, meas, o.side, want);
+		CHECK(fabsf(o.side - want) < 0.15f + 0.05f * fabsf(want), "head turn: sideways %.2f px, want %.2f", o.side,
+		      want);
+
+		for (int on = 0; on < 2; on++) {
+			cf_gaze_params pd = p;
+			pd.scan_damp = on ? 0.95f : 0.0f;
+			cf_gaze_init(&g);
+			t = 950.0;
+			float first = 0, last = 0;
+			for (int i = 0; i < 300; i++, t += dt) {
+				const hl_state s = {.glance = 0.02f, .side = i < 45 ? 0.0f : 0.08f, .up_drop = 0.01f, .lo_rise = 0.01f};
+				o = hl_read(update(&g, face_hl(s, 0), &pd, t, out), &out[0]);
+				if (i == 48)
+					first = o.side;
+				last = o.side;
+			}
+			printf("    eyes moving 0.08 sideways and staying, scan damping %s: sideways shift %.2f px after 0.1 s "
+			       "(%.2f for 95%%), %.2f px 8 s on\n",
+			       on ? "on" : "off", first, -0.95f * 0.08f * HW, last);
+			if (on)
+				CHECK(fabsf(first + 0.95f * 0.08f * HW) < 0.3f + 0.1f * 0.08f * HW && fabsf(last) < 0.2f * fabsf(first),
+				      "scan damping: %.2f px at first, %.2f px 8 s on", first, last);
+			else
+				CHECK(fabsf(first) < 0.05f && fabsf(last) < 0.05f, "scan damping off: %.2f / %.2f px", first, last);
+		}
+		printf("ok: half the head's turn is made up for sideways; the eyes' own offset never held\n");
 	}
 
 	/* H9. Real-camera noise while reading with the head down (eye landmarks 0.4 px; head landmarks 0.2 px,
@@ -1405,7 +1418,7 @@ static void test_side_scan(void)
 		cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = 23.0f / SC_W,
 				    .has_notes = 1, .notes_offset = -0.10f, .notes_side = 0.0f,
 				    .notes_open = (23.0f - 0.05f * SC_W) / SC_W, .has_vis_calib = 1, .vis_baseline = 0,
-				    .vis_notes = -0.06f};
+				    .vis_notes = -0.06f, .scan_damp = 0.95f};
 		cf_gaze g;
 		cf_gaze_init(&g);
 		cf_eye out[2];
@@ -1452,6 +1465,35 @@ static void test_side_scan(void)
 	}
 	printf("ok: S1 reading scan damped to a quarter or a third, whatever Vision's sideways point follows, the line "
 	       "returns taken within the saccade\n");
+
+	/* S2. The sideways reading's calibrated notes spot off by 0.073 eye widths (5.4 px; as on a user's clip,
+	 * the refined reading's own offset): looking from the lens down to the notes and staying there, the eyes
+	 * still in the middle, the scan damping (on) adds no sideways shift: none appears at the look, and none
+	 * builds up. */
+	{
+		cf_gaze_params p = {.strength = 1.5f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = 23.0f / SC_W,
+				    .has_notes = 1, .notes_offset = -0.10f, .notes_side = -0.0726f,
+				    .notes_open = (23.0f - 0.05f * SC_W) / SC_W, .has_vis_calib = 1, .vis_baseline = 0,
+				    .vis_notes = -0.06f, .scan_damp = 0.95f};
+		cf_gaze g;
+		cf_gaze_init(&g);
+		cf_eye out[2];
+		rng_seed(91);
+		float worst = 0, step = 0, prev = 0;
+		for (int i = 0; i < 300; i++) {
+			const cf_face f = sc_face(i < 90 ? 0.0f : 0.10f, 0.0f, 0.6f);
+			const int k = cf_gaze_update(&g, &f, &p, 200.0 + i / 30.0, out);
+			const float sx = k ? 0.5f * (out[0].sx + out[1].sx) : 0.0f;
+			worst = fmaxf(worst, fabsf(sx));
+			if (i)
+				step = fmaxf(step, fabsf(sx - prev));
+			prev = sx;
+		}
+		printf("    notes spot 5.4 px off, eyes in the middle: sideways shift %.2f px at most, %.2f px a frame\n", worst,
+		       step);
+		CHECK(worst < 0.5f && step < 0.3f, "miscalibrated notes spot: sideways shift %.2f px, step %.2f px", worst, step);
+		printf("ok: S2 the scan damping adds no sideways offset of its own\n");
+	}
 }
 
 /* 42. Vision's own frame-step tail, and jumps it can't back (patterns seen on the user's camera, generic
@@ -2014,7 +2056,7 @@ int main(void)
 	 * nothing jumps. */
 	{
 		cf_gaze_params pr = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f, .baseline_open = 0.4f,
-				     .has_notes = 1, .notes_offset = -0.08f, .notes_side = 0.0f};
+				     .has_notes = 1, .notes_offset = -0.08f, .notes_side = 0.0f, .scan_damp = 0.95f};
 		cf_gaze_init(&g);
 		float raw_lo = 1e9f, raw_hi = -1e9f, app_lo = 1e9f, app_hi = -1e9f, max_dy = 0;
 		float raw_step = 0, app_step = 0, prev_raw = 0, prev_app = 0;

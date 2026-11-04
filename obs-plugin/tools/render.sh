@@ -39,7 +39,8 @@ for p in glob.glob(os.path.expanduser("~/Library/Application Support/obs-studio/
             if f.get("id") == "camflip_filter":
                 st = f.get("settings", {})
                 out = ["--baseline", st.get("baseline", 0), "--baseline-open", st.get("baseline_open", 0),
-                       "--strength", st.get("strength", 100) / 100.0]
+                       "--strength", st.get("strength", 100) / 100.0,
+                       "--scan-damp", st.get("scan_damp", 0) / 100.0]
                 if st.get("has_notes"):
                     out += ["--notes-offset", st.get("notes_offset", 0), "--notes-side", st.get("notes_side", 0),
                             "--notes-open", st.get("notes_open", 0)]
