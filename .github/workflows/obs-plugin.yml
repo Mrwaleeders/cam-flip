@@ -74,9 +74,13 @@ jobs:
           clang -O2 -Wall -fobjc-arc tools/model/capture_pairs.m -framework AppKit -framework AVFoundation \
             -framework CoreMedia -framework QuartzCore -o build/capture_pairs
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # torch and coremltools ship wheels for it
+
       - name: Eye model, trained on synthetic eyes, through Core ML and the pixel code
         run: |
-          python3 -m venv build/venv
+          python3.12 -m venv build/venv
           build/venv/bin/pip install -q -r tools/model/requirements.txt
           build/venv/bin/python tools/model/train.py --selftest --device cpu --selftest-export build/selftest.mlpackage
           clang -O2 -Wall -fobjc-arc -Isrc tests/test_ml_model.m src/ml_model.m src/ml_eye.c src/warp.c \
