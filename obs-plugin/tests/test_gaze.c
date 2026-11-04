@@ -1454,6 +1454,222 @@ static void test_side_scan(void)
 	       "returns taken within the saccade\n");
 }
 
+/* 42. Vision's own frame-step tail, and jumps it can't back (patterns seen on the user's camera, generic
+ * sizes; v_gain both low and high, the eyes' refined points 1.2 px noisy with 5% spikes, Vision's 0.25 px
+ * with excursions of about 1 px held for 1-4 frames on 10% of frames, 30 and 15 fps):
+ *  (a) steady reading for 20 s: Vision's excursions alone (with the refined noise) never back a jump: no
+ *      output step past the slew limit;
+ *  (b) one eye's refined point 0.06 high in the frame Vision's point steps 0.014 the same way: no step past
+ *      the slew limit;
+ *  (c) a small real move down (0.02), the refined points overstating it by 0.025 for 1/15 s: the
+ *      correction lands no more than 1 px past where it settles, and overshoots it by no more than 1.2 px in
+ *      the 0.3 s after, also when a Vision excursion overstates it in the same frames;
+ *  (d) back from a keyboard look with the refined points (and Vision's half as much) overshooting for two
+ *      frames: back within 1 px of where it settles within 0.5 s (0.3 s unless a Vision excursion falls in
+ *      the landing);
+ *  (e) 6 px saccades lens <-> notes with Vision's point and both eyes jumping together: 80% of the move
+ *      shows by the frame after the eyes' jump;
+ *  and in all: the lid terms never fall from a visible size to near 0 in a single frame. */
+typedef struct {
+	float amp, p, off;
+	int left;
+} vex_state;
+
+static cf_face vex_face(vex_state *vx, float glance, float dl, float dr, float dv, float lo_rise)
+{
+	float d[2][2], vd[2][2];
+	if (vx->left > 0) {
+		if (--vx->left == 0)
+			vx->off = 0;
+	} else if (rng_u() < vx->p) {
+		vx->off = gauss(vx->amp);
+		vx->left = 1 + (int)(rng_u() * 4);
+	}
+	for (int e = 0; e < 2; e++) {
+		d[e][0] = gauss(1.2f);
+		d[e][1] = gauss(1.2f) + (e == 0 ? dl : dr) * RW;
+		if (rng_u() < 0.05)
+			d[e][1] += (float)(SPIKE_PX + rng_u()) * (rng_u() < 0.5 ? -1.0f : 1.0f);
+		vd[e][0] = gauss(0.25f);
+		vd[e][1] = gauss(0.25f) + dv * RW + vx->off;
+	}
+	const real_gaze gz = {glance, 0, 0};
+	cf_face f = face_real(gz, d, 1, vd);
+	for (int e = 0; e < 2; e++) {
+		cf_pt *pts = e == 0 ? f.left_eye : f.right_eye;
+		for (int i = 0; i < 16; i++) {
+			const float s = (pts[i].y - 500) / (0.5f * RH);
+			if (s > 1e-3f)
+				pts[i].y -= lo_rise * RW * s;
+		}
+	}
+	return f;
+}
+
+static void test_vision_tail(void)
+{
+	const float notes = 0.025f, gains[2] = {1.84f, 3.19f};
+	const double fpss[2] = {30.0, 15.0};
+	float w_a = 0, w_b = 0, w_c = 0, w_co = 0, w_d = 0, w_e = 1, w_lid = 0;
+	int n_vis = 0, n_vis_all = 0, n_cb = 0;
+	float w_cb = 0;
+	for (int pat = 0; pat < 5; pat++)
+		for (int fr = 0; fr < 2; fr++)
+			for (int gi = 0; gi < 2; gi++)
+				for (unsigned seed = 1; seed <= 4; seed++) {
+					const double fps = fpss[fr], dts = 1.0 / fps;
+					r_vis = 1.0f / gains[gi];
+					cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f,
+							    .baseline_open = RH / RW, .has_notes = 1, .notes_offset = -notes,
+							    .notes_side = 0.0f, .notes_open = (RH - R_LID * notes * RW) / RW};
+					p.has_vis_calib = 1;
+					p.vis_baseline = 0.0f;
+					p.vis_notes = -notes * R_VIS;
+					p.baseline_upper = p.baseline_lower = 0.5f * RH / RW;
+					cf_gaze g;
+					cf_eye out[2];
+					cf_gaze_init(&g);
+					rng_seed(4200 + 97 * seed + 13 * pat + 5 * gi + fr);
+					vex_state vx = {1.0f, 0.1f, 0, 0};
+					double t = 100.0;
+					const int n0 = (int)(4.0 * fps), kb = (int)(0.6 * fps), per = (int)fps;
+					const int nf = n0 + (int)((pat == 0 ? 20.0 : pat == 4 ? 4.0 : 2.0) * fps);
+					const float slew = 0.3f * (float)(30.0 / fps) + 0.05f;
+					float prev = 0, prevl = 0, prevb = 0, big = 0, before = 0, land = 0, peak = 0, settle = 0;
+					float v_before = 0, v_over = 0;
+					float c_hist[400], v_hist[400];
+					int n_settle = 0;
+					float vprev = 0;
+					for (int i = 0; i < nf; i++, t += dts) {
+						const int k = i - n0;
+						float gl = notes, dl = 0, dr = 0, dv = 0;
+						if (pat == 1 && k == 0) {
+							dl = -0.06f;
+							dv = -0.014f;
+						} else if (pat == 1 && k == 1) {
+							dv = -0.007f;
+						} else if (pat == 2 && k >= 0) {
+							gl = notes + 0.02f;
+							if (k * dts < 0.066)
+								dl = dr = 0.025f;
+						} else if (pat == 3) {
+							if (k >= 0 && k < kb)
+								gl = 0.20f;
+							if (k == kb || k == kb + 1) {
+								dl = dr = k == kb ? 0.07f : 0.04f;
+								dv = (k == kb ? 0.5f : 0.2f) * (0.20f - notes) * R_VIS;
+							}
+						} else if (pat == 4 && k >= 0) {
+							gl = (k / per) % 2 == 0 ? 0.07f : 0.0f;
+						}
+						cf_face f = vex_face(&vx, gl, dl, dr, dv, gl > 0.01f ? 0.012f : 0.0f);
+						const float vr = 0.5f * ((f.left_pupil_vision.y - 500) + (f.right_pupil_vision.y - 500)) / RW;
+						const int n = cf_gaze_update(&g, &f, &p, t, out);
+						/* (the lid terms beyond following the iris: lid_unit, low_unit) */
+						const float c = n ? -out[0].sy : 0.0f, lid = n ? g.lid_unit[0] : 0.0f,
+							    low = n ? g.low_unit[0] : 0.0f;
+						if (k >= 0 && k < 400) {
+							c_hist[k] = c;
+							v_hist[k] = vr;
+						}
+						if (i > 2 * (int)fps) {
+							if (pat == 0) {
+								n_vis_all++;
+								n_vis += fabsf(vr - vprev) * RW >= 1.0f;
+							}
+							if (pat <= 1 && (pat == 0 || (k >= -2 && k < (int)fps)))
+								big = fmaxf(big, fabsf(c - prev));
+							/* (a lid term falling from a visible size to near 0 in one frame) */
+							const float fl = fabsf(prevl) > 0.3f && fabsf(lid) < 0.25f * fabsf(prevl) ? fabsf(prevl) : 0.0f;
+							const float fb = fabsf(prevb) > 0.3f && fabsf(low) < 0.25f * fabsf(prevb) ? fabsf(prevb) : 0.0f;
+							w_lid = fmaxf(w_lid, fmaxf(fl, fb));
+							CHECK(fl == 0 && fb == 0, "Vision tail pattern %d (%.0f fps, gain %.2f, seed %u): a lid term "
+							      "fell from %.2f/%.2f to %.2f/%.2f px in one frame", pat, fps, gains[gi], seed,
+							      prevl, prevb, lid, low);
+						}
+						if (k == -1) {
+							before = c;
+							v_before = vr;
+						}
+						if (pat == 2 && k >= 0 && k <= 1)
+							v_over = fmaxf(v_over, gains[gi] * (vr - v_before) - 0.02f);
+						if (pat == 2 && k >= 0 && k <= 1)
+							land = fmaxf(land, c - before);
+						if (pat == 2 && k >= 0 && k * dts <= 0.3 + 1e-6)
+							peak = fmaxf(peak, c - before);
+						if (pat == 2 && k >= nf - n0 - (int)(0.6 * fps)) {
+							settle += c - before;
+							n_settle++;
+						}
+						vprev = vr;
+						prev = c;
+						prevl = lid;
+						prevb = low;
+					}
+					const char *gs = gains[gi] < 2.0f ? "low" : "high";
+					if (pat <= 1) {
+						CHECK(big < slew, "Vision tail pattern %c (%.0f fps, %s gain, seed %u): a step of %.2f px",
+						      "ab"[pat], fps, gs, seed, big);
+						if (pat == 0)
+							w_a = fmaxf(w_a, big * (float)(fps / 30.0));
+						else
+							w_b = fmaxf(w_b, big * (float)(fps / 30.0));
+					} else if (pat == 2) {
+						settle /= (float)n_settle;
+						/* (counted apart: Vision's point overstating it too, by half the move or more, an
+						 * excursion in the same frames) */
+						const int both = v_over > 0.01f;
+						CHECK(land <= settle + 1.0f && peak <= settle + 1.2f,
+						      "small move overstated (%.0f fps, %s gain, seed %u%s): lands %.2f px, peaks %.2f, settles %.2f",
+						      fps, gs, seed, both ? ", Vision's point overstating it too" : "", land, peak, settle);
+						if (both) {
+							w_cb = fmaxf(w_cb, peak - settle);
+							n_cb++;
+						} else {
+							w_c = fmaxf(w_c, land - settle);
+							w_co = fmaxf(w_co, peak - settle);
+						}
+					} else if (pat == 3) {
+						const int nk = nf - n0;
+						float fin = 0;
+						const int nl = (int)(0.5 * fps);
+						for (int j = nk - nl; j < nk; j++)
+							fin += c_hist[j] / (float)nl;
+						double back = -1;
+						for (int j = nk - 1; j > kb; j--)
+							if (fabsf(c_hist[j] - fin) > 1.0f) {
+								back = (j + 1 - kb) * dts;
+								break;
+							}
+						if (back < 0)
+							back = 0;
+						CHECK(back <= 0.5 + 1e-6, "keyboard return overshooting (%.0f fps, %s gain, seed %u): "
+						      "within 1 px of where it settles only %.3f s after", fps, gs, seed, back);
+						w_d = fmaxf(w_d, (float)back);
+					} else {
+						/* each switch after the first period: the share of the move shown by frame 1 */
+						for (int s = per; s + 1 < nf - n0 && s + per <= nf - n0; s += per) {
+							const float from = c_hist[s - 1], to = c_hist[s + per - 1];
+							/* (only where Vision's point jumps with the eyes, by half what its gain says at least) */
+							const float vexp = (s / per) % 2 == 0 ? 0.07f * R_VIS : -0.07f * R_VIS;
+							if (fabsf(to - from) < 3.0f || (v_hist[s] - v_hist[s - 1]) * vexp < 0.5f * vexp * vexp)
+								continue;
+							const float share = (c_hist[s + 1] - from) / (to - from);
+							CHECK(share >= 0.8f, "6 px saccade (%.0f fps, %s gain, seed %u, at %d): %.0f%% of %.2f px "
+							      "by the frame after the jump", fps, gs, seed, s, 100.0f * share, to - from);
+							w_e = fminf(w_e, share);
+						}
+					}
+				}
+	r_vis = 0.6f;
+	printf("ok: Vision's step tail (%.1f%% of frames step 1 px or more): steady reading steps at most %.2f px per "
+	       "1/30 s; a one-eye outlier on a Vision step %.2f; a small move overstated lands at most %.2f px and peaks "
+	       "%.2f px past where it settles (%d of 16 with Vision's point overstating it too: peaks %.2f); a "
+	       "keyboard return is settled %.3f s after; 6 px saccades show %.0f%% by "
+	       "frame 1; no lid term drops to 0 in one frame (largest such fall %.2f px)\n",
+	       100.0 * n_vis / (n_vis_all ? n_vis_all : 1), w_a, w_b, w_c, w_co, n_cb, w_cb, w_d, 100.0f * w_e, w_lid);
+}
+
 int main(void)
 {
 	const cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f};
@@ -3638,6 +3854,7 @@ int main(void)
 	test_pose();
 	test_head_lids();
 	test_side_scan();
+	test_vision_tail();
 
 	if (failures) {
 		printf("%d FAILED\n", failures);

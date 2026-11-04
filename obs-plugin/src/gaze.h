@@ -212,6 +212,10 @@ typedef struct {
 	double land_t;
 	int land_mode;    /* (how its landing is shown: like the jump, gate()'s return) */
 	int rel_s, rel_n; /* frames running both readings have been off the accepted value, and which way */
+	/* The last pending jump of Vision's point taken out of the offset (see gate()): by how much (refit_dv,
+	 * of Vision's reading), from where (refit_v0, refit_anchor) and when; Vision's point going back undoes it. */
+	float refit_dv, refit_v0, refit_anchor;
+	double refit_t;
 } cf_robust;
 
 typedef struct {
