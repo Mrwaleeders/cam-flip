@@ -329,7 +329,7 @@ int main(int argc, char **argv)
 				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--head-side S] "
 				"[--head-vert V] [--head-eyes E] [--head-tilt K] [--baseline-upper U] [--baseline-lower L] "
 				"[--vis-baseline A] [--vis-notes B] [--lens a-b] [--notes a-b] [--strength S] [--scan-damp D] "
-				"[--measure] [--zoom Z] [--learn]\n");
+				"[--measure] [--zoom Z] [--learn] [--notes-learnt]\n");
 		return 2;
 	}
 	int lag = 1, measure = 0, zoom = 3, learn = 0;
@@ -361,6 +361,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--zoom")) { zoom = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--measure")) measure = 1;
 		else if (!strcmp(a, "--learn")) learn = 1;
+		else if (!strcmp(a, "--notes-learnt")) p.notes_learnt = 1; /* the --notes-* given were learnt from reading */
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
 	}
 	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
