@@ -100,10 +100,26 @@ def base_grid(device):
 
 
 def sample(img, g):
-    """grid_sample with border padding, written so Apple's GPU (MPS) runs it: MPS has no "border" mode,
-    but with align_corners=True, clamping the grid to the image and padding with zeros is the same,
-    values and gradients alike."""
-    return F.grid_sample(img, g.clamp(-1, 1), mode="bilinear", padding_mode="zeros", align_corners=True)
+    """F.grid_sample(img, g, bilinear, padding_mode="border", align_corners=True), written out with plain
+    gathers: Apple's GPU (MPS) has no "border" mode, and on his real eyes its grid_sample training froze
+    (the weights stopped changing). Same values and gradients as grid_sample (checked on the CPU)."""
+    b, c, h, w = img.shape
+    x = ((g[..., 0] + 1) * 0.5 * (w - 1)).clamp(0, w - 1)
+    y = ((g[..., 1] + 1) * 0.5 * (h - 1)).clamp(0, h - 1)
+    x0 = x.detach().floor().clamp(0, w - 2)
+    y0 = y.detach().floor().clamp(0, h - 2)
+    fx, fy = (x - x0)[:, None], (y - y0)[:, None]
+    x0, y0 = x0.long(), y0.long()
+    flat = img.reshape(b, c, h * w)
+    oh, ow = g.shape[1], g.shape[2]
+
+    def at(yy, xx):
+        idx = (yy * w + xx).reshape(b, 1, oh * ow).expand(b, c, oh * ow)
+        return flat.gather(2, idx).reshape(b, c, oh, ow)
+
+    top = at(y0, x0) * (1 - fx) + at(y0, x0 + 1) * fx
+    bot = at(y0 + 1, x0) * (1 - fx) + at(y0 + 1, x0 + 1) * fx
+    return top * (1 - fy) + bot * fy
 
 
 def render(src, flow, res, mask, grid):
