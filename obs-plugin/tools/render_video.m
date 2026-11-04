@@ -101,14 +101,15 @@ static cf_pt centroid_of(const cf_pt *p, int n)
 }
 
 /* --ml-target steady, per eye (patch px). The held point drifts slowly (STEADY_TAU) to where the eye is,
- * so reading along a line or down the notes stays on its middle. A look outside the band is followed:
- * at once past twice the band, otherwise once it has stayed out for --steady-dwell frames, so a noisy pupil
+ * so reading along a line or down the notes stays on its middle. A look to the side outside the band is
+ * followed at once past twice the band, otherwise once it has stayed out for --steady-dwell frames, so a noisy pupil
  * fix doesn't throw the hold. The pupil is a 3-frame median for both. Blinks and the moment after them
  * leave the hold alone: the pupil fix is unreliable there. */
 #define STEADY_TAU 3.0
 #define STEADY_AFTER_BLINK 0.15
+#define STEADY_FAST 0.15
 typedef struct {
-	int has, out, nh;
+	int has, out, nh, vfollow;
 	float hold[2], hist[3][2], med[2];
 	double t, quiet_until;
 } steady_eye;
@@ -151,23 +152,38 @@ static const float *steady_update(steady_eye *s, float px, float py, double t, i
 		return s->hold;
 	}
 	const float dx = fabsf(m[0] - s->hold[0]), dy = m[1] - s->hold[1];
-	const int outside = dx > band[0] || dy > band[1] || -dy > band[2];
-	const int far = dx > 2 * band[0] || dy > 2 * band[1] || -dy > 2 * band[2];
-	s->out = outside ? s->out + 1 : 0;
-	if (far || s->out >= dwell) {
-		const int side = dx > band[0];
-		snaps[side ? 0 : dy > 0 ? 1 : 2]++;
-		/* Only a sideways look moves the hold sideways. A look up or down that is followed keeps the
-		 * held side position: otherwise every vertical follow (often pupil noise) would reset the hold
-		 * to wherever the reading sweep happens to be, and the sweep would leak straight through. */
-		if (side)
-			s->hold[0] = m[0];
+	const int side_out = dx > band[0], side_far = dx > 2 * band[0];
+	const int vert_out = dy > band[1] || -dy > band[2], vert_far = dy > 2 * band[1] || -dy > 2 * band[2];
+	s->out = side_out ? s->out + 1 : 0;
+	const float slow = (float)fmin(1.0, dt / STEADY_TAU), fast = (float)fmin(1.0, dt / STEADY_FAST);
+	if (side_far || s->out >= dwell) {
+		/* A look to the side: go there (both ways). */
+		snaps[0]++;
+		s->hold[0] = m[0];
 		s->hold[1] = m[1];
 		s->out = 0;
-	} else if (!outside) {
-		const float k = (float)fmin(1.0, dt / STEADY_TAU);
-		s->hold[0] += (m[0] - s->hold[0]) * k;
-		s->hold[1] += (m[1] - s->hold[1]) * k;
+		s->vfollow = 0;
+		return s->hold;
+	}
+	/* Sideways the hold only drifts slowly: that is what hides the reading sweep. Vertically, a move
+	 * past the band is followed smoothly (STEADY_FAST) rather than with a jump, and only a big one
+	 * jumps, so pupil noise can't make the corrected eye twitch up and down. A followed look up or down
+	 * never moves the held side position: otherwise each would reset it to wherever the sweep was. */
+	s->hold[0] += (m[0] - s->hold[0]) * slow;
+	if (vert_far) {
+		snaps[dy > 0 ? 1 : 2]++;
+		s->hold[1] = m[1];
+		s->vfollow = 0;
+	} else {
+		/* Once a smooth follow starts it carries on until the hold has caught up (within half a px),
+		 * not just back inside the band, or a look up would stall at the band's edge. */
+		if (vert_out && !s->vfollow) {
+			snaps[dy > 0 ? 1 : 2]++;
+			s->vfollow = 1;
+		}
+		if (s->vfollow && fabsf(dy) < 0.5f)
+			s->vfollow = 0;
+		s->hold[1] += (m[1] - s->hold[1]) * (s->vfollow ? fast : slow);
 	}
 	return s->hold;
 }
