@@ -155,8 +155,13 @@ static const float *steady_update(steady_eye *s, float px, float py, double t, i
 	const int far = dx > 2 * band[0] || dy > 2 * band[1] || -dy > 2 * band[2];
 	s->out = outside ? s->out + 1 : 0;
 	if (far || s->out >= dwell) {
-		snaps[dx > band[0] ? 0 : dy > 0 ? 1 : 2]++;
-		s->hold[0] = m[0];
+		const int side = dx > band[0];
+		snaps[side ? 0 : dy > 0 ? 1 : 2]++;
+		/* Only a sideways look moves the hold sideways. A look up or down that is followed keeps the
+		 * held side position: otherwise every vertical follow (often pupil noise) would reset the hold
+		 * to wherever the reading sweep happens to be, and the sweep would leak straight through. */
+		if (side)
+			s->hold[0] = m[0];
 		s->hold[1] = m[1];
 		s->out = 0;
 	} else if (!outside) {
