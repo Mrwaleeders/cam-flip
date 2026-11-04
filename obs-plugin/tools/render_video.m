@@ -45,6 +45,8 @@
  *                      width 80), before it counts as a look elsewhere: X either side, D down, U up
  *                      (default 8,4,2.5). Reading only ever moves down a page, so the band is small
  *                      upwards and a look up at the camera is followed within a few frames
+ *   --steady-gain G    steady: ask the model for G times the move back to the held point (default 1);
+ *                      the model delivers only part of what it's asked, so 1.5-2.5 makes up for that
  *   --steady-dwell N   steady: frames a look must stay outside the band before it is followed (default 2;
  *                      1 follows a frame sooner but trips more easily on a noisy pupil)
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
@@ -107,7 +109,7 @@ static cf_pt centroid_of(const cf_pt *p, int n)
 #define STEADY_AFTER_BLINK 0.15
 typedef struct {
 	int has, out, nh;
-	float hold[2], hist[3][2];
+	float hold[2], hist[3][2], med[2];
 	double t, quiet_until;
 } steady_eye;
 
@@ -126,8 +128,11 @@ static const float *steady_update(steady_eye *s, float px, float py, double t, i
 		s->nh = 0;
 		s->out = 0;
 	}
-	if (s->has && t < s->quiet_until)
+	if (s->has && t < s->quiet_until) {
+		s->med[0] = s->hold[0];
+		s->med[1] = s->hold[1];
 		return s->hold;
+	}
 	memmove(s->hist[1], s->hist[0], sizeof(s->hist[0]) * 2);
 	s->hist[0][0] = px;
 	s->hist[0][1] = py;
@@ -137,6 +142,8 @@ static const float *steady_update(steady_eye *s, float px, float py, double t, i
 	if (s->nh == 3)
 		for (int k = 0; k < 2; k++)
 			m[k] = med3(s->hist[0][k], s->hist[1][k], s->hist[2][k]);
+	s->med[0] = m[0];
+	s->med[1] = m[1];
 	if (!s->has) {
 		s->hold[0] = m[0];
 		s->hold[1] = m[1];
@@ -422,6 +429,7 @@ int main(int argc, char **argv)
 	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
 	float steady_band[3] = {8.0f, 4.0f, 2.5f};
 	int steady_dwell = 2;
+	float steady_gain = 1.0f;
 	steady_eye steady[2];
 	memset(steady, 0, sizeof(steady));
 	int steady_snaps[3] = {0, 0, 0}; /* looks followed: sideways, down, up */
@@ -461,6 +469,7 @@ int main(int argc, char **argv)
 			i++;
 		}
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
+		else if (!strcmp(a, "--steady-gain")) { steady_gain = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-dwell")) { steady_dwell = atoi(v) < 1 ? 1 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f,%f", &steady_band[0], &steady_band[1], &steady_band[2]); i++; }
 		else if (!strcmp(a, "--ml-res")) { ml_res = atoi(v); i++; }
@@ -851,7 +860,14 @@ int main(int argc, char **argv)
 								cf_ml_to_patch(&fr, pu.x + (eyes[e].cx - c.x), pu.y + (eyes[e].cy - c.y), &px, &py);
 								const float *hd = steady_update(&steady[flip], px, py, t, st.blinking, steady_band,
 											       steady_dwell, steady_snaps);
-								cf_ml_to_image(&fr, hd[0], hd[1], &tgt[e][0], &tgt[e][1]);
+								/* The model moves the iris only part of the way it's asked (about 40-65%
+								 * on Waleed's clip), so --steady-gain asks for more: the held point plus
+								 * (gain - 1) times again its distance from where the eye is. */
+								const steady_eye *se = &steady[flip];
+								const float g = steady_gain;
+								const float ask[2] = {se->med[0] + g * (hd[0] - se->med[0]),
+										      se->med[1] + g * (hd[1] - se->med[1])};
+								cf_ml_to_image(&fr, ask[0], ask[1], &tgt[e][0], &tgt[e][1]);
 							}
 						}
 						for (int e = 0; e < n && e < 2; e++) {
