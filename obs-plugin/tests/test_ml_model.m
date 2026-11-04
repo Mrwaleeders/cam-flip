@@ -4,8 +4,8 @@
  *   clang -fobjc-arc -Isrc tests/test_ml_model.m src/ml_model.m src/ml_eye.c src/warp.c -framework CoreML \
  *     -framework Foundation -o test_ml_model && ./test_ml_model <path>
  *  - the model loads and keeps the input / output contract ml_model.h expects, on every compute unit,
- *  - a synthetic eye with the iris low, asked to put it 6 patch px higher, gets it there (roughly) on
- *    a 1080p frame, and nothing outside the eye changes,
+ *  - a synthetic eye with the iris low (reading), asked to put it 6 patch px higher, ends up most of the
+ *    way to the same eye drawn looking there, on a 1080p frame, and nothing outside the eye changes,
  *  - and how long it takes per frame (printed; the live budget is a few ms).
  */
 #import <Foundation/Foundation.h>
@@ -19,14 +19,15 @@
 
 static void draw_eye(uint8_t *img, int w, float cx, float cy, float ew, float iris_dx, float iris_dy)
 {
-	/* matches train.py's synthetic_eye roughly, in image px: eye ew wide */
+	/* train.py's synthetic_eye, in image px (eye ew wide): the lids follow the gaze like there */
 	const float s = ew / 80.0f;
+	const float down = iris_dy / 10.0f;
 	for (int y = (int)(cy - 40 * s); y < (int)(cy + 40 * s); y++)
 		for (int x = (int)(cx - 64 * s); x < (int)(cx + 64 * s); x++) {
 			const float u = (x - cx) / (40 * s), py = (y - cy) / s;
 			const float k = fmaxf(0, 1 - u * u);
 			float v = 158;
-			if (py > -13 * k && py < 9 * k) {
+			if (py > -(13 - 4 * down) * k && py < (9 - 3 * fmaxf(down, 0)) * powf(k, 1.2f)) {
 				v = 224;
 				const float r = hypotf((x - cx - iris_dx * s) / s, (y - cy - iris_dy * s) / s);
 				if (r < 11)
@@ -71,6 +72,10 @@ int main(int argc, char **argv)
 		uint8_t *img = malloc((size_t)w * h), *orig = malloc((size_t)w * h);
 		memset(img, 158, (size_t)w * h);
 		const float ew = 70, ecx = 900, ecy = 520;
+		uint8_t *want = malloc((size_t)w * h);
+		memset(want, 158, (size_t)w * h);
+		draw_eye(want, w, ecx, ecy, ew, 0, 1); /* the same eye looking where it's asked to */
+		memset(img, 158, (size_t)w * h);
 		draw_eye(img, w, ecx, ecy, ew, 0, 7); /* iris low: reading */
 		memcpy(orig, img, (size_t)w * h);
 		cf_channel ch[8];
@@ -106,8 +111,10 @@ int main(int argc, char **argv)
 			printf("FAIL: run (%s)\n", names[cu]);
 			fails++;
 		} else {
+			/* The lids hide part of the iris, so measure against the eye drawn looking there. */
 			const float before = dark_y(orig, w, ecx, ecy, ew), after = dark_y(img, w, ecx, ecy, ew);
-			const float moved = (before - after) / s; /* patch px up */
+			const float goal = dark_y(want, w, ecx, ecy, ew);
+			const float moved = (before - after) / (before - goal); /* fraction of the way */
 			int outside = 0;
 			for (int y = 0; y < h; y++)
 				for (int x = 0; x < w; x++) {
@@ -115,9 +122,9 @@ int main(int argc, char **argv)
 					if (dx * dx + dy * dy >= 1 && img[(size_t)y * w + x] != orig[(size_t)y * w + x])
 						outside++;
 				}
-			printf("%s: iris moved up %.1f patch px (asked 6), model %.2f ms avg, %.2f ms max\n", names[cu], moved,
-			       total / (reps - 3), worst);
-			if (moved < 2.5f || moved > 10) {
+			printf("%s: iris moved %.0f%% of the way to the eye looking there, model %.2f ms avg, %.2f ms max\n",
+			       names[cu], moved * 100, total / (reps - 3), worst);
+			if (moved < 0.6f || moved > 1.4f) {
 				printf("FAIL: the iris didn't move as asked (%s)\n", names[cu]);
 				fails++;
 			}
@@ -128,6 +135,7 @@ int main(int argc, char **argv)
 		}
 		free(img);
 		free(orig);
+		free(want);
 		cf_ml_free(m);
 	}
 	if (fails) {
