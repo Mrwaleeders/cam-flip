@@ -203,6 +203,66 @@
 #define ENGAGE_UP_MARGIN 0.02f /* eye widths: sideways damping engages this much later with the eyes up in the head */
 #define ENGAGE_SLEW 0.15f      /* per 1/30 s: how fast it engages or lets go without a look (at once with one) */
 
+/* ---- Tuning: notes learnt from reading (see "Notes learnt from reading"). The reading numbers are the user's
+ * clips (~0.5 m from a MacBook camera, eyes 75-88 px wide). */
+#define LEARN_DT 0.026          /* s: a frame this soon after the last one kept is skipped, so the learner sees ~30
+				 * frames a second (38 at most) at any camera rate, and a 2-frame step spans a whole
+				 * line return */
+#define LEARN_BREAK 2.0         /* s: no usable frame for this long breaks the run: no jump or line is seen across it */
+#define LEARN_YAW_MAX 10.0f     /* deg: frames with the head turned further than this (from the lens calibration) ... */
+#define LEARN_PITCH_MAX 15.0f   /* ... or tilted further than this are not used (reading tilts it a little at most) */
+#define LEARN_OPEN_R 0.6f       /* relative openness: lids lower than this are not reading (a keyboard look, a
+				 * squint) */
+#define LEARN_GLANCE_MAX 0.20f  /* eye widths below the lens (with a lens calibration): further down is the keyboard */
+#define LEARN_SIGMA_INIT 0.006f /* eye widths: the sideways noise assumed until it is measured ... */
+#define LEARN_BLOCK 1.0         /* s: ... as the robust SD over blocks this long, the 25th percentile of the last
+				 * CF_LEARN_BLOCKS of them (quiet ones: not those holding a return) */
+#define LEARN_J_MIN 0.03f       /* eye widths: a jump is a 2-frame sideways change past this (returns: 0.03-0.06) ... */
+#define LEARN_J_K 5.0f          /* ... and past this x the noise (4x let the noise alone make jumps on eyes ~45 px
+				 * wide held still), ... */
+#define LEARN_J_CONFIRM 0.7f    /* ... confirmed by the 5-frame medians before and after it, this x that apart */
+#define LEARN_MERGE 0.5         /* s: jumps the same way this close are one return (and its corrective saccade) */
+#define LEARN_LINE_MIN 1.5      /* s: a line, from one return to the next, lasts at least this ... */
+#define LEARN_LINE_MAX 12.0     /* ... and at most this (the user's: 1.6-7.2 s; two lines with the return between them
+				 * missed are still one line's spread, and its drift and return) */
+#define LEARN_DRIFT_K 0.6f      /* along it the eyes move the other way by at least this x the return that ends
+				 * it ... */
+#define LEARN_DRIFT_MAX 2.0f    /* ... and at most this x (they come back about as far as they went), gradually: no
+				 * jump the other way between the returns (a forward jump past J would be most of a
+				 * line) */
+#define LEARN_RANGE_MAX 0.08f   /* eye widths: the middle 90% of its sideways readings spread over this at most
+				 * (reading: 0.04-0.05; looking around: 0.12) */
+#define LEARN_VERT_SD 0.025f    /* eye widths: the robust SD of its vertical readings at most (reading: 0.016-0.019;
+				 * looking around: 0.036), also of two lines in a row together */
+#define LEARN_OFF_TOL 0.06f     /* eye widths: a line's frames with the pupil further than this (or 4 SD) off its
+				 * median, */
+#define LEARN_LID_TOL 0.03f     /* ... or the openness further than this (or 3 SD) off its median, are left out ... */
+#define LEARN_KEEP 0.7f         /* ... and at least this share of them must be left */
+#define LEARN_COVER 0.6f        /* share of a line's time its usable frames must cover */
+#define LEARN_SHARE 0.75f       /* share of the jumps in the last LEARN_WINDOW that must go the returns' way */
+#define LEARN_WINDOW 20.0       /* s: (the recent jumps) */
+#define LEARN_CHAIN_GAP 12.0    /* s: a reading spell ends when no line came for this long */
+#define LEARN_READ_HOLD 1.0     /* s: the status says reading only while usable frames came this recently */
+#define LEARN_MEMORY 60.0f      /* s: the estimate rests on the latest this much reading at most: the lines' weighted
+				 * median, and the weighted mean of those within these of it (~3x the scatter of one
+				 * line's medians on the synthetic reading in tests/test_gaze.c): */
+#define LEARN_TRIM_OFF 0.015f   /* eye widths: the offset */
+#define LEARN_TRIM_SIDE 0.03f   /* eye widths: sideways */
+#define LEARN_TRIM_OPEN 0.02f   /* the openness */
+#define LEARN_TRIM_VIS 0.01f    /* eye widths: Vision's point */
+#define LEARN_SEED 25.0f        /* s: the reading the learnt notes passed in the params count for when the params
+				 * don't say (notes_seconds 0) ... */
+#define LEARN_SEED_MIN 10.0f    /* ... and at least (at most LEARN_MEMORY) when they do */
+#define LEARN_FIRST 8.0f        /* s: the first estimate is handed out once it rests on this much reading, ... */
+#define LEARN_FIRST_LINES 3     /* ... in this many lines at least (two in a row now and then come from looking
+				 * around) */
+#define LEARN_REPUB 18.0        /* s: ... and a new one at most this often, only once it moved from the last: */
+#define LEARN_MOVE_MIN 0.005f   /* eye widths: the offset by this, */
+#define LEARN_MOVE_FRAC 0.10f   /* ... or by this share of the glance below the lens if that is more; */
+#define LEARN_SIDE_MOVE 0.03f   /* eye widths: or the sideways by this, */
+#define LEARN_OPEN_MOVE 0.03f   /* ... or the openness by this, */
+#define LEARN_VIS_MOVE 0.008f   /* ... or Vision's point by this */
+
 /* ---- One Euro filter (Casiez et al.): adaptive low-pass, little jitter and little lag. */
 
 static double oe_alpha(double cutoff, double dt)
@@ -1236,6 +1296,7 @@ void cf_gaze_init(cf_gaze *g)
 	g->lid_noise = LID_NOISE_INIT;
 	g->svk = 1.0f;
 	g->st_size_f = g->st_turn_f = 1.0f;
+	g->learn.sigma = LEARN_SIGMA_INIT;
 	cf_robust *rb[2] = {&g->rb_down, &g->rb_side};
 	for (int i = 0; i < 2; i++) {
 		rb[i]->lr_noise = LR_NOISE_INIT;
@@ -1274,6 +1335,7 @@ static cf_gaze_params sanitize(const cf_gaze_params *in)
 	p.baseline = finite_or(p.baseline, 0.0f);
 	p.baseline_open = finite_or(p.baseline_open, 0.0f);
 	p.notes_open = finite_or(p.notes_open, 0.0f);
+	p.notes_seconds = fmaxf(finite_or(p.notes_seconds, 0.0f), 0.0f);
 	if (!isfinite(p.notes_offset) || !isfinite(p.notes_side) || !cf_gaze_notes_valid(p.baseline, p.notes_offset)) {
 		p.has_notes = 0;
 		p.notes_offset = p.notes_side = p.notes_open = 0.0f;
@@ -1505,12 +1567,512 @@ int cf_gaze_check_lens_look(const cf_calib_result *res, const cf_learnt_notes *r
 	    !(res->drift <= LOOK_UNSTEADY_K * fmaxf(CALIB_DRIFT_MAX, 2.0f * res->spread)) ||
 	    !(res->open_spread <= LOOK_UNSTEADY_K * CALIB_OPEN_SPREAD_MAX))
 		return CF_LOOK_UNSTEADY;
-	if (reading && reading->has && !cf_gaze_notes_valid(res->offset, reading->offset))
+	if (reading && reading->has && reading->seconds >= CF_LOOK_READING_MIN &&
+	    !cf_gaze_notes_valid(res->offset, reading->offset))
 		return CF_LOOK_LOW;
 	return CF_LOOK_OK;
 }
 
-/* ---- Notes learnt from reading (see cf_learnt_notes) */
+/* ---- Notes learnt from reading (see cf_learnt_notes)
+ *
+ * Reading shows as a sawtooth sideways: the eyes move along a line in small steps, then jump back to the start of
+ * the next one in a frame or two (a line return: 0.03-0.06 eye widths every 2-7 s on the user's clips), with the
+ * gaze held at about one height. Looking around has jumps of the same size, but going both ways, spread wider
+ * sideways and up and down, sometimes under a second apart, and with no steady drift between them.
+ *
+ * Frames that may be reading (the face found, no blink, the head straight, the lids open; with a lens calibration,
+ * the gaze below the lens and above the keyboard) go into a ring of the last few seconds (cf_notes_learner.f). A
+ * jump is a 2-frame sideways change past J (5x the sideways noise, 0.03 at least) that 5-frame medians either side
+ * confirm. Between two jumps the same way lies a line, and it counts as read when no jump went the other way inside
+ * it, it lasted 1.5-12 s, the eyes moved along it the other way from the return that ends it by 0.6-2x that return,
+ * and it spread sideways no more than one line does and up and down no more than reading does (also taken together
+ * with the line before).
+ * Both ways are followed, so text running either way is learnt. Two such lines in a row (three returns), with three
+ * quarters of the recent jumps going the returns' way, start a reading spell (cf_gaze_status.reading): its lines
+ * are used, and each valid line after them, until none came for LEARN_CHAIN_GAP.
+ *
+ * Each line used gives the medians of its frames (those with the pupil or the lids far off the line's own median
+ * left out: a keyboard look). The estimate rests on the latest LEARN_MEMORY seconds of lines: per measure, their
+ * weighted median, and the weighted mean of the lines close to it. So an odd line moves nothing, and when the notes
+ * move it switches over once more than half of that reading is at the new place (half a minute of reading or so).
+ * It is handed out (a new serial) once it rests on LEARN_FIRST seconds of reading in LEARN_FIRST_LINES lines (two
+ * lines in a row now and then come from looking around; three hardly ever), then only when it moved by more than
+ * its noise, and at most every LEARN_REPUB. The caller passes it back in the params; a model started afresh begins
+ * from those, counted as the reading they rest on (notes_seconds), and hands nothing out until it moved away from
+ * them.
+ */
+
+static cf_learn_frame *learn_f(cf_notes_learner *L, unsigned k)
+{
+	return &L->f[k % CF_LEARN_FRAMES];
+}
+
+/* Median of the n values (n <= CF_LEARN_FRAMES), leaving them as they are; tmp holds n. */
+static float learn_median(const float *v, int n, float *tmp)
+{
+	memcpy(tmp, v, (size_t)n * sizeof(float));
+	return median(tmp, n);
+}
+
+/* Robust standard deviation (1.4826 x the median distance from med) of the n values. */
+static float learn_rsd(const float *v, int n, float med, float *tmp)
+{
+	for (int i = 0; i < n; i++)
+		tmp[i] = fabsf(v[i] - med);
+	return 1.4826f * median(tmp, n);
+}
+
+typedef struct {
+	float v, w;
+} learn_vw;
+
+static int learn_cmp_vw(const void *a, const void *b)
+{
+	const float x = ((const learn_vw *)a)->v, y = ((const learn_vw *)b)->v;
+	return (x > y) - (x < y);
+}
+
+/* Weighted median: where half of the weight is reached, going up the values (between two values when it is reached
+ * just at one of them). */
+static float learn_wmedian(learn_vw *a, int n)
+{
+	qsort(a, (size_t)n, sizeof(a[0]), learn_cmp_vw);
+	float tot = 0, acc = 0;
+	for (int i = 0; i < n; i++)
+		tot += a[i].w;
+	for (int i = 0; i < n; i++) {
+		acc += a[i].w;
+		if (acc >= 0.5f * tot - 1e-4f * tot)
+			return i + 1 < n && acc <= 0.5f * tot + 1e-4f * tot ? 0.5f * (a[i].v + a[i + 1].v) : a[i].v;
+	}
+	return a[n - 1].v;
+}
+
+/* The weighted mean of the values within tol of their weighted median: as steady as a mean, while an odd line (or
+ * the old place, once more than half of the reading is at a new one) is left out. */
+static float learn_central(learn_vw *a, int n, float tol)
+{
+	const float m = learn_wmedian(a, n);
+	float sw = 0, sv = 0;
+	for (int i = 0; i < n; i++)
+		if (fabsf(a[i].v - m) <= tol) {
+			sw += a[i].w;
+			sv += a[i].w * a[i].v;
+		}
+	return sw > 0 ? sv / sw : m;
+}
+
+/* The estimate from the lines it rests on. */
+static void learn_estimate(cf_notes_learner *L)
+{
+	cf_learnt_notes *e = &L->est;
+	learn_vw a[CF_LEARN_LINES];
+	float w = 0, wv = 0;
+	for (int i = 0; i < L->lines; i++) {
+		w += L->line[i].w;
+		wv += L->line[i].w_vis;
+	}
+	e->has = L->lines > 0 && w > 0;
+	e->seconds = w;
+	if (!e->has)
+		return;
+	for (int q = 0; q < 3; q++) {
+		for (int i = 0; i < L->lines; i++) {
+			const cf_learn_line *ln = &L->line[i];
+			a[i].v = q == 0 ? ln->off : q == 1 ? ln->side : ln->open;
+			a[i].w = ln->w;
+		}
+		const float tol = q == 0 ? LEARN_TRIM_OFF : q == 1 ? LEARN_TRIM_SIDE : LEARN_TRIM_OPEN;
+		const float m = learn_central(a, L->lines, tol);
+		if (q == 0)
+			e->offset = m;
+		else if (q == 1)
+			e->side = m;
+		else
+			e->open = m;
+	}
+	/* Vision's point: from the lines it was given on, when that is most of the reading */
+	int nv = 0;
+	for (int i = 0; i < L->lines; i++)
+		if (L->line[i].w_vis > 0) {
+			a[nv].v = L->line[i].vis;
+			a[nv].w = L->line[i].w_vis;
+			nv++;
+		}
+	e->has_vis = nv > 0 && wv >= 0.5f * w;
+	e->vis_offset = nv > 0 ? learn_central(a, nv, LEARN_TRIM_VIS) : 0.0f;
+}
+
+/* Keeps the latest LEARN_MEMORY seconds of lines: the oldest lose weight, and go. */
+static void learn_trim(cf_notes_learner *L)
+{
+	float w = 0;
+	for (int i = 0; i < L->lines; i++)
+		w += L->line[i].w;
+	int k = 0;
+	while (k < L->lines && w > LEARN_MEMORY) {
+		cf_learn_line *ln = &L->line[k];
+		const float cut = fminf(w - LEARN_MEMORY, ln->w);
+		ln->w_vis *= ln->w > 0 ? (ln->w - cut) / ln->w : 0.0f;
+		ln->w -= cut;
+		w -= cut;
+		if (ln->w > 1e-3f)
+			break;
+		k++;
+	}
+	if (k > 0) {
+		memmove(&L->line[0], &L->line[k], (size_t)(L->lines - k) * sizeof(L->line[0]));
+		L->lines -= k;
+	}
+}
+
+/* Makes room for one more line: the two oldest become one (their weighted means; they are the next to go). */
+static void learn_make_room(cf_notes_learner *L)
+{
+	if (L->lines < CF_LEARN_LINES)
+		return;
+	cf_learn_line *a = &L->line[0];
+	const cf_learn_line *b = &L->line[1];
+	const float w = a->w + b->w, wv = a->w_vis + b->w_vis;
+	if (w > 0) {
+		a->off = (a->off * a->w + b->off * b->w) / w;
+		a->side = (a->side * a->w + b->side * b->w) / w;
+		a->open = (a->open * a->w + b->open * b->w) / w;
+	}
+	if (wv > 0)
+		a->vis = (a->vis * a->w_vis + b->vis * b->w_vis) / wv;
+	a->w = w;
+	a->w_vis = wv;
+	a->t = b->t;
+	memmove(&L->line[1], &L->line[2], (size_t)(L->lines - 2) * sizeof(L->line[0]));
+	L->lines--;
+}
+
+/* A line read: the estimate rests on it from now on. */
+static void learn_use(cf_notes_learner *L, const cf_learn_line *ln)
+{
+	learn_make_room(L);
+	L->line[L->lines++] = *ln;
+	learn_trim(L);
+	learn_estimate(L);
+}
+
+/* Share of the jumps in the last LEARN_WINDOW (up to t) going `sign`'s way. */
+static float learn_share(const cf_notes_learner *L, int sign, double t)
+{
+	int all = 0, same = 0;
+	const int n = L->jumps < CF_LEARN_JUMPS ? L->jumps : CF_LEARN_JUMPS;
+	for (int i = 0; i < n; i++)
+		if (t - L->jump_t[i] <= LEARN_WINDOW) {
+			all++;
+			same += L->jump_sign[i] == sign;
+		}
+	return all ? (float)same / (float)all : 0.0f;
+}
+
+/* The line from jump a to jump b, both going b->sign's way: its medians in *out. Returns 1 when it looks like a line
+ * read: the right length, the eyes moving the other way along it, and spread no more than reading spreads. */
+static int learn_line(cf_notes_learner *L, const cf_learn_jump *a, const cf_learn_jump *b, cf_learn_line *out)
+{
+	/* From the first frame after jump a to the last one surely before jump b (the one before that may be half way
+	 * through it). */
+	const unsigned k0 = a->last, k1 = b->first - 2;
+	const double dur = b->t_first - a->t_last;
+	if (!(dur >= LEARN_LINE_MIN && dur <= LEARN_LINE_MAX) || k1 < k0 + 9 || k0 <= L->run ||
+	    L->n - k0 >= CF_LEARN_FRAMES)
+		return 0; /* (too short or too long, or its first frames are gone from the ring) */
+	/* Along it the eyes went the other way from the return that ends it, about as far as that return brings them
+	 * back */
+	const float ret = b->after - b->before, drift = b->before - a->after;
+	if (!(drift * (float)b->sign < 0 && fabsf(drift) >= LEARN_DRIFT_K * fabsf(ret) &&
+	      fabsf(drift) <= LEARN_DRIFT_MAX * fabsf(ret)))
+		return 0;
+	const int n = (int)(k1 - k0 + 1);
+	float off[CF_LEARN_FRAMES], open[CF_LEARN_FRAMES], side[CF_LEARN_FRAMES], vis[CF_LEARN_FRAMES],
+		tmp[CF_LEARN_FRAMES];
+	for (int i = 0; i < n; i++) {
+		off[i] = learn_f(L, k0 + (unsigned)i)->off;
+		open[i] = learn_f(L, k0 + (unsigned)i)->open;
+	}
+	/* Frames far off the line's own level (a look at the keyboard, the lids dropping with it) are left out. */
+	const float m_off = learn_median(off, n, tmp), m_open = learn_median(open, n, tmp);
+	const float tol_off = fmaxf(LEARN_OFF_TOL, 4.0f * learn_rsd(off, n, m_off, tmp)),
+		    tol_open = fmaxf(LEARN_LID_TOL, 3.0f * learn_rsd(open, n, m_open, tmp));
+	int m = 0, mv = 0;
+	double cover = 0;
+	for (int i = 0; i < n; i++) {
+		const cf_learn_frame *f = learn_f(L, k0 + (unsigned)i);
+		if (fabsf(f->off - m_off) > tol_off || fabsf(f->open - m_open) > tol_open)
+			continue;
+		off[m] = f->off;
+		open[m] = f->open;
+		side[m] = f->side;
+		m++;
+		if (isfinite(f->vis))
+			vis[mv++] = f->vis;
+		/* (the time since the frame before, so gaps count only up to a frame's worth) */
+		cover += fmin(f->t - learn_f(L, k0 + (unsigned)i - 1)->t, 0.1);
+	}
+	if ((float)m < LEARN_KEEP * (float)n || cover < LEARN_COVER * dur)
+		return 0;
+	/* At one height, and no wider sideways than a line: looking around spreads more both ways */
+	const float mo = learn_median(off, m, tmp), sd = learn_rsd(off, m, mo, tmp);
+	memcpy(tmp, side, (size_t)m * sizeof(float));
+	qsort(tmp, (size_t)m, sizeof(float), cmpf);
+	const float range = tmp[(int)(0.95f * (float)(m - 1))] - tmp[(int)(0.05f * (float)(m - 1))];
+	if (!(sd <= LEARN_VERT_SD && range <= LEARN_RANGE_MAX))
+		return 0;
+	out->w = (float)cover;
+	out->off = mo;
+	out->side = (m & 1) ? tmp[m / 2] : 0.5f * (tmp[m / 2 - 1] + tmp[m / 2]);
+	out->open = learn_median(open, m, tmp);
+	out->w_vis = 2 * mv >= m ? out->w : 0.0f;
+	out->vis = mv ? learn_median(vis, mv, tmp) : 0.0f;
+	out->sd = sd;
+	out->t = b->t_first;
+	return 1;
+}
+
+/* The pending jump is complete (nothing more to merge into it): it ends a line its way. */
+static void learn_jump_done(cf_notes_learner *L)
+{
+	const cf_learn_jump b = L->pend;
+	const double t = b.t_first;
+	L->have_pend = 0;
+	const int k = L->jumps % CF_LEARN_JUMPS;
+	L->jump_t[k] = t;
+	L->jump_sign[k] = b.sign;
+	/* (counts on, staying the same modulo CF_LEARN_JUMPS) */
+	L->jumps = L->jumps >= 2 * CF_LEARN_JUMPS ? L->jumps - CF_LEARN_JUMPS + 1 : L->jumps + 1;
+	const int s = b.sign > 0;
+	L->way[!s].crossed = 1; /* (a jump inside the other way's line) */
+	cf_learn_line ln;
+	if (L->way[s].have) {
+		if (L->way[s].crossed || !learn_line(L, &L->way[s].at, &b, &ln)) {
+			L->way[s].chain = 0;
+			L->way[s].have_line = L->way[s].have_prev = 0;
+			if (L->spell == b.sign)
+				L->spell = 0;
+		} else {
+			/* In a row with the line before: both at about one height (their vertical spread together, the
+			 * difference of their levels included, like one line's). Else this one starts a new row. */
+			const cf_learn_line *pv = &L->way[s].prev;
+			const float dl = 0.5f * (ln.off - pv->off);
+			const int row = L->way[s].chain > 0 && L->way[s].have_prev &&
+					0.5f * (ln.sd * ln.sd + pv->sd * pv->sd) + dl * dl <= LEARN_VERT_SD * LEARN_VERT_SD;
+			if (row) {
+				L->way[s].chain++;
+			} else {
+				L->way[s].chain = 1;
+				L->way[s].chain_t0 = L->way[s].at.t_first;
+				L->way[s].have_line = 0;
+				if (L->spell == b.sign)
+					L->spell = 0;
+			}
+			L->way[s].line_t = t;
+			L->way[s].prev = ln;
+			L->way[s].have_prev = 1;
+			if (L->way[s].chain >= 2 && learn_share(L, b.sign, t) >= LEARN_SHARE) {
+				if (L->spell != b.sign) {
+					L->spell = b.sign;
+					L->spell_id++;
+					L->spell_t0 = L->way[s].chain_t0;
+					L->spell_returns = L->way[s].chain;
+				}
+				if (L->way[s].have_line)
+					learn_use(L, &L->way[s].line);
+				L->way[s].have_line = 0;
+				learn_use(L, &ln);
+				L->spell_t1 = b.t_first;
+				L->spell_returns++;
+			} else {
+				/* (not a spell yet, or the recent jumps are mixed: kept, used if one follows) */
+				L->way[s].line = ln;
+				L->way[s].have_line = 1;
+				if (L->spell == b.sign)
+					L->spell = 0;
+			}
+		}
+	}
+	L->way[s].have = 1;
+	L->way[s].crossed = 0;
+	L->way[s].at = b;
+}
+
+/* Looks for a jump at frame n - 5 (the newest with 5 frames after it). */
+static void learn_jumps(cf_notes_learner *L)
+{
+	if (L->n < L->run + 11)
+		return;
+	const unsigned c = L->n - 5;
+	const double tc = learn_f(L, c)->t;
+	if (L->have_pend && tc - L->pend.t_last > LEARN_MERGE)
+		learn_jump_done(L);
+	if (L->have_last_jump && c < L->last_jump + 3)
+		return; /* (still the last one: a jump over a frame or two shows in three 2-frame steps) */
+	const float J = fmaxf(LEARN_J_MIN, LEARN_J_K * L->sigma);
+	const float d2 = learn_f(L, c)->side - learn_f(L, c - 2)->side;
+	if (!(fabsf(d2) > J))
+		return;
+	float v[5];
+	for (int i = 0; i < 5; i++)
+		v[i] = learn_f(L, c - 6 + (unsigned)i)->side;
+	const float before = median(v, 5);
+	for (int i = 0; i < 5; i++)
+		v[i] = learn_f(L, c + (unsigned)i)->side;
+	const float after = median(v, 5);
+	if (!((after - before) * d2 > 0 && fabsf(after - before) >= LEARN_J_CONFIRM * J))
+		return;
+	L->last_jump = c;
+	L->have_last_jump = 1;
+	const int sign = d2 > 0 ? 1 : -1;
+	if (L->have_pend && L->pend.sign == sign) { /* (within LEARN_MERGE: a corrective saccade) */
+		L->pend.last = c;
+		L->pend.t_last = tc;
+		L->pend.after = after;
+		return;
+	}
+	if (L->have_pend)
+		learn_jump_done(L);
+	const cf_learn_jump j = {sign, c, c, tc, tc, before, after};
+	L->pend = j;
+	L->have_pend = 1;
+}
+
+/* The sideways noise, once a block of LEARN_BLOCK is complete. */
+static void learn_noise(cf_notes_learner *L)
+{
+	if (L->block_from < L->run)
+		L->block_from = L->run;
+	const unsigned k1 = L->n - 1;
+	if (learn_f(L, k1)->t - learn_f(L, L->block_from)->t < LEARN_BLOCK)
+		return;
+	const int m = (int)(k1 - L->block_from + 1);
+	if (m >= 10 && m <= 64) {
+		float v[64];
+		for (int i = 0; i < m; i++)
+			v[i] = learn_f(L, L->block_from + (unsigned)i)->side;
+		const float med = median_of(v, m);
+		L->block_sd[L->block_k] = robust_sd(v, m, med);
+		L->block_k = (L->block_k + 1) % CF_LEARN_BLOCKS;
+		L->blocks += L->blocks < CF_LEARN_BLOCKS;
+		if (L->blocks >= 5) {
+			float s[CF_LEARN_BLOCKS];
+			memcpy(s, L->block_sd, sizeof(float) * (size_t)L->blocks);
+			qsort(s, (size_t)L->blocks, sizeof(float), cmpf);
+			L->sigma = s[(L->blocks - 1) / 4];
+		}
+	}
+	L->block_from = L->n;
+}
+
+/* Hands the estimate out (a new serial) when it is worth saving, and keeps g->learnt current. */
+static void learn_publish(cf_gaze *g, const cf_gaze_params *p, double t)
+{
+	cf_notes_learner *L = &g->learn;
+	const cf_learnt_notes *e = &L->est, *q = &L->pub;
+	if (!e->has)
+		return;
+	int go;
+	if (!L->has_pub) {
+		go = e->seconds >= LEARN_FIRST && L->lines >= LEARN_FIRST_LINES;
+	} else {
+		const float glance = p->baseline_open > 0 ? p->baseline - q->offset : 0.0f;
+		go = t - L->pub_t >= LEARN_REPUB &&
+		     (fabsf(e->offset - q->offset) > fmaxf(LEARN_MOVE_MIN, LEARN_MOVE_FRAC * glance) ||
+		      fabsf(e->side - q->side) > LEARN_SIDE_MOVE || fabsf(e->open - q->open) > LEARN_OPEN_MOVE ||
+		      e->has_vis != q->has_vis || (e->has_vis && fabsf(e->vis_offset - q->vis_offset) > LEARN_VIS_MOVE));
+	}
+	if (!go && !L->has_pub)
+		return;
+	const unsigned serial = g->learnt.serial + (go ? 1u : 0u);
+	g->learnt = *e;
+	g->learnt.has = 1;
+	g->learnt.serial = serial;
+	if (go) {
+		L->pub = g->learnt;
+		L->has_pub = 1;
+		L->pub_t = t;
+	}
+}
+
+/* Starts from the learnt notes in the params (saved from an earlier run) when nothing is learnt yet. */
+static void learn_seed(cf_gaze *g, const cf_gaze_params *p, double t)
+{
+	cf_notes_learner *L = &g->learn;
+	if (!(p->notes_learnt && p->has_notes)) {
+		L->no_seed = 0;
+		return;
+	}
+	if (L->has_pub || L->no_seed || !isfinite(p->notes_offset) || !isfinite(p->notes_side) ||
+	    !(p->notes_open > 0 && p->notes_open < 1))
+		return;
+	const float sec = p->notes_seconds;
+	const float w = isfinite(sec) && sec > 0 ? clampf(sec, LEARN_SEED_MIN, LEARN_MEMORY) : LEARN_SEED;
+	cf_learn_line s = {.w = w, .off = p->notes_offset, .side = p->notes_side, .open = p->notes_open, .t = t};
+	if (p->has_vis_calib && isfinite(p->vis_notes)) {
+		s.vis = p->vis_notes;
+		s.w_vis = s.w;
+	}
+	/* (the oldest: any lines learnt meanwhile are newer) */
+	if (L->lines == CF_LEARN_LINES)
+		L->lines--;
+	memmove(&L->line[1], &L->line[0], (size_t)L->lines * sizeof(L->line[0]));
+	L->line[0] = s;
+	L->lines++;
+	learn_trim(L);
+	learn_estimate(L);
+	/* Handed out already, as far as the caller is concerned: nothing new until the estimate moves from them. */
+	const cf_learnt_notes q = {.has = 1, .offset = s.off, .side = s.side, .open = s.open, .has_vis = s.w_vis > 0,
+				   .vis_offset = s.vis, .seconds = s.w, .serial = g->learnt.serial};
+	L->pub = q;
+	L->has_pub = 1;
+	L->pub_t = t;
+	learn_publish(g, p, t);
+	/* (and taken: a restart or switching eye contact on again must not save the same notes again) */
+	g->learnt_taken = g->learnt.serial;
+}
+
+/* One frame: usable says whether it may be reading (see cf_gaze_update()); off, side, open and vis are its readings
+ * (vis NAN without Vision's point). */
+static void learn_frame(cf_gaze *g, const cf_gaze_params *p, int usable, float off, float side, float open, float vis,
+			double t)
+{
+	cf_notes_learner *L = &g->learn;
+	for (int s = 0; s < 2; s++)
+		if (L->way[s].chain && !(t - L->way[s].line_t <= LEARN_CHAIN_GAP)) {
+			L->way[s].chain = 0;
+			L->way[s].have_line = L->way[s].have_prev = 0;
+		}
+	if (L->spell && !L->way[L->spell > 0].chain)
+		L->spell = 0;
+	if (usable)
+		L->gate_t = t;
+	g->st_reading = L->spell != 0 && t - L->gate_t <= LEARN_READ_HOLD;
+	if (!usable)
+		return;
+	/* A long gap (or time going back): no jump or line across it. */
+	if (L->n && !(t - L->last_t <= LEARN_BREAK && t >= L->last_t)) {
+		if (L->have_pend)
+			learn_jump_done(L);
+		L->way[0].have = L->way[1].have = 0;
+		L->have_last_jump = 0;
+		L->run = L->block_from = L->n;
+	} else if (L->n > L->run && t - L->last_t < LEARN_DT) {
+		return;
+	}
+	cf_learn_frame *f = learn_f(L, L->n);
+	f->t = t;
+	f->off = off;
+	f->side = side;
+	f->open = open;
+	f->vis = vis;
+	L->n++;
+	L->last_t = t;
+	learn_noise(L);
+	learn_jumps(L);
+	learn_publish(g, p, t);
+}
 
 int cf_gaze_take_learnt_notes(cf_gaze *g, cf_learnt_notes *out)
 {
@@ -1523,9 +2085,23 @@ int cf_gaze_take_learnt_notes(cf_gaze *g, cf_learnt_notes *out)
 
 void cf_gaze_forget_learnt_notes(cf_gaze *g)
 {
+	cf_notes_learner *L = &g->learn;
 	memset(&g->learnt, 0, sizeof(g->learnt));
 	g->learnt_taken = 0;
 	g->st_reading = 0;
+	/* What was learnt goes, and the reading spell with it: the notes are learnt afresh from the reading that follows
+	 * (three returns at least). The frames and jumps stay: they are about the eyes, not the notes. Learnt notes still
+	 * in the params are not taken up again (the caller stops passing them). */
+	L->lines = 0;
+	memset(&L->est, 0, sizeof(L->est));
+	memset(&L->pub, 0, sizeof(L->pub));
+	L->has_pub = 0;
+	L->no_seed = 1;
+	L->spell = 0;
+	for (int s = 0; s < 2; s++) {
+		L->way[s].chain = 0;
+		L->way[s].have_line = L->way[s].have_prev = 0;
+	}
 }
 
 /* ---- Blinks */
@@ -1938,6 +2514,9 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 {
 	const cf_gaze_params ps = sanitize(p_in);
 	const cf_gaze_params *p = &ps;
+	/* (from the params as given: learnt notes that sanitize() leaves out, not clearly below a new lens
+	 * calibration, are still started from and refined) */
+	learn_seed(g, p_in, t);
 	use_vis_calib(g, p);
 	if (g->have_base && p->baseline != g->base_prev)
 		rebase_down(g, p->baseline - g->base_prev);
@@ -2229,6 +2808,19 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 			g->calib_head[g->calib_head_n++] = face->head;
 		if (g->calib_count >= CF_CALIB_SAMPLES)
 			finish_calibration(g);
+	}
+
+	/* The notes learnt from reading (see "Notes learnt from reading"): the same readings, from frames that may be
+	 * reading. With a lens calibration the gaze must be below the lens and above the keyboard: the accepted glance
+	 * (last frame's), so the notes just under the lens aren't learnt from only the frames whose noise reads them
+	 * lower. */
+	{
+		const float acc = g->down.ready ? (float)g->down.value : down_raw;
+		const int below = !(p->baseline_open > 0) ||
+				  (acc >= CF_NOTES_MIN_GLANCE && fmaxf(acc, down_raw) <= LEARN_GLANCE_MAX);
+		const int usable = !g->calibrating && !hold && abs_yaw < LEARN_YAW_MAX && abs_pitch < LEARN_PITCH_MAX &&
+				   r > LEARN_OPEN_R && below;
+		learn_frame(g, p, usable, p->baseline - down_raw, side, openness, vis ? -v_down : NAN, t);
 	}
 
 	/* Eye geometry. Position follows the head closely (high beta) and comes from the corners,

@@ -1712,6 +1712,803 @@ static void test_vision_tail(void)
 	       100.0 * n_vis / (n_vis_all ? n_vis_all : 1), w_a, w_b, w_c, w_co, n_cb, w_cb, w_d, 100.0f * w_e, w_lid);
 }
 
+/* ---- Notes learnt from reading (checks L1-L12)
+ *
+ * Synthetic reading, shaped on the summary statistics of the user's clips (~0.5 m from a MacBook camera, eyes 75-88
+ * px wide; units eye widths): at rest the refined points' sideways reading changes ~0.005 a frame (robust SD over
+ * 1 s ~0.006), up and down a little more. Reading: line returns of 0.04-0.062 in 1 or 2 frames every 2.5-6.5 s, the
+ * eyes moving back along the line gradually in between, at one height (the reading's vertical SD ~0.017 with the
+ * noise). Looking around: fixations of 0.3-2.5 s anywhere in 0.12 sideways, SD 0.036 up and down. Besides (generic
+ * reading, not measured): fixations every ~0.25 s, now and then a small step back, and a quarter of the returns
+ * landing short with a corrective saccade after. The upper lid follows the gaze down (half of it); Vision's points
+ * move 0.6 of the eyes' movement. The noise is in pixels, so smaller eyes are noisier in eye widths. */
+#define RD_SLOW_TAU 0.4 /* s: the slow part of the landmark noise wanders this slowly */
+enum { RD_READ, RD_LOOK, RD_HOLD };
+
+typedef struct {
+	/* the camera and the face */
+	float w;               /* eye width, px */
+	float vis_k;           /* Vision's points move this share of the eyes' movement */
+	float white, slow;     /* refined points' noise per eye, sideways (px): white, and a slow wander */
+	float white_y, slow_y; /* ... and up and down */
+	float vwhite, vslow;   /* the same for Vision's points */
+	float lid_px;          /* the outline points' noise (px) */
+	/* what the eyes do */
+	int mode;
+	float level;           /* the glance below the lens while reading or holding (eye widths) */
+	float start;           /* where lines start, sideways (eye widths) */
+	float len_lo, len_hi;  /* line length range (eye widths) */
+	double dur_lo, dur_hi; /* line duration range (s) */
+	int dir;               /* +1: lines run towards +side (returns go -), -1: the other way */
+	float scatter;         /* fixations' vertical scatter while reading (SD, eye widths) */
+	int blinks;            /* a blink every 2-5 s */
+	int keyboard;          /* a look at the keyboard (0.30 below the lens, 0.7-1.5 s) every 6-10 s */
+	/* state */
+	double t;
+	float side, glance;       /* where the eyes are this frame */
+	float to_side, to_glance; /* where a 2-frame saccade lands next frame */
+	int sac;
+	double line_t0, line_t1, next_fix, correct_t;
+	float line_from, line_len, correct_to;
+	int correct;
+	double next_blink;
+	int blink_k;
+	double next_kb, kb_until;
+	float kb_side, kb_glance;
+	float nz[2][4]; /* slow noise: eye x (refined x, y, Vision's x, y) */
+	int returns;
+} rd_sim;
+
+static float rd_u(float a, float b)
+{
+	return a + (b - a) * (float)rng_u();
+}
+
+static void rd_init(rd_sim *s, float w, int mode, float level, double t)
+{
+	memset(s, 0, sizeof(*s));
+	s->w = w;
+	s->vis_k = 0.6f;
+	/* per eye, px (both eyes together at 80 px: sideways ~0.004 white + 0.006 slow, up and down 0.006 + 0.0045) */
+	s->white = 0.45f;
+	s->slow = 0.65f;
+	s->white_y = 0.7f;
+	s->slow_y = 0.5f;
+	s->vwhite = 0.3f;
+	s->vslow = 0.3f;
+	s->lid_px = 0.25f;
+	s->mode = mode;
+	s->level = level;
+	s->start = -0.025f;
+	s->len_lo = 0.040f;
+	s->len_hi = 0.062f;
+	s->dur_lo = 2.5;
+	s->dur_hi = 6.5;
+	s->dir = 1;
+	s->scatter = 0.014f;
+	s->t = t;
+	s->glance = level;
+	s->side = s->start;
+	s->line_t0 = t;
+	s->line_t1 = t + rd_u(0.5f, 4.0f); /* (reading starts mid-line) */
+	s->line_from = s->start;
+	s->line_len = 0.05f;
+	s->next_blink = t + rd_u(2.0f, 5.0f);
+	s->next_kb = t + rd_u(6.0f, 10.0f);
+}
+
+/* Right-to-left text: lines start on the other side and run the other way. */
+static void rd_rtl(rd_sim *s)
+{
+	s->dir = -1;
+	s->start = s->side = s->line_from = 0.025f;
+}
+
+/* Moves the eyes to (side, glance): this frame, or over this and the next (a 2-frame saccade). */
+static void rd_saccade(rd_sim *s, float side, float glance)
+{
+	if (rng_u() < 0.5) {
+		s->to_side = side;
+		s->to_glance = glance;
+		s->side = 0.5f * (s->side + side);
+		s->glance = 0.5f * (s->glance + glance);
+		s->sac = 1;
+	} else {
+		s->side = side;
+		s->glance = glance;
+	}
+}
+
+static void rd_step(rd_sim *s, double dt)
+{
+	s->t += dt;
+	if (s->sac) {
+		s->side = s->to_side;
+		s->glance = s->to_glance;
+		s->sac = 0;
+		return;
+	}
+	if (s->mode == RD_READ && s->keyboard) {
+		if (s->kb_until > 0 && s->t >= s->kb_until) { /* back to where the line was */
+			s->kb_until = 0;
+			rd_saccade(s, s->kb_side, s->kb_glance);
+			s->next_kb = s->t + rd_u(6.0f, 10.0f);
+			return;
+		}
+		if (s->kb_until > 0)
+			return;
+		if (s->t >= s->next_kb) {
+			const double look = rd_u(0.7f, 1.5f);
+			s->kb_until = s->t + look;
+			s->kb_side = s->side;
+			s->kb_glance = s->glance;
+			s->line_t1 += look;
+			s->line_t0 += look;
+			s->next_fix += look;
+			rd_saccade(s, s->side + gauss(0.02f), 0.30f);
+			return;
+		}
+	}
+	if (s->mode == RD_READ) {
+		if (s->correct && s->t >= s->correct_t) {
+			s->correct = 0;
+			rd_saccade(s, s->correct_to, s->glance);
+			return;
+		}
+		if (s->t >= s->line_t1) { /* a line return */
+			s->line_from = s->start + gauss(0.003f);
+			s->line_len = rd_u(s->len_lo, s->len_hi);
+			s->line_t0 = s->t;
+			s->line_t1 = s->t + rd_u((float)s->dur_lo, (float)s->dur_hi);
+			s->next_fix = s->t + rd_u(0.18f, 0.32f);
+			float land = s->line_from;
+			if (rng_u() < 0.25) { /* short of the line's start, then a corrective saccade */
+				land += (float)s->dir * rd_u(0.006f, 0.012f);
+				s->correct = 1;
+				s->correct_t = s->t + rd_u(0.12f, 0.2f);
+				s->correct_to = s->line_from;
+			}
+			s->returns++;
+			rd_saccade(s, land, s->level + gauss(s->scatter));
+			return;
+		}
+		if (s->t >= s->next_fix) {
+			float prog = (float)((s->t - s->line_t0) / (s->line_t1 - s->line_t0)) + gauss(0.02f);
+			prog = prog < 0 ? 0 : (prog > 1 ? 1 : prog);
+			float to = s->line_from + (float)s->dir * s->line_len * prog;
+			if (rng_u() < 0.08)
+				to = s->side - (float)s->dir * rd_u(0.003f, 0.008f); /* a step back */
+			s->next_fix = s->t + rd_u(0.18f, 0.32f);
+			s->side = to; /* (word steps: small, one frame) */
+			s->glance = s->level + gauss(s->scatter);
+		}
+	} else if (s->mode == RD_LOOK) {
+		if (s->t >= s->next_fix) {
+			s->next_fix = s->t + rd_u(0.3f, 2.5f);
+			float gl = s->level + gauss(0.036f);
+			gl = gl < -0.02f ? -0.02f : (gl > 0.19f ? 0.19f : gl);
+			rd_saccade(s, s->start + rd_u(-0.06f, 0.06f), gl);
+		}
+	} else if (s->t >= s->next_fix) { /* holding one spot: microsaccades */
+		s->next_fix = s->t + rd_u(0.4f, 1.0f);
+		s->side = s->start + gauss(0.003f);
+		s->glance = s->level + gauss(0.004f);
+	}
+}
+
+/* This frame's face, with the camera's noise. */
+static cf_face rd_face(rd_sim *s, double dt)
+{
+	static const float shut_k[7] = {0.4f, 0.9f, 1.0f, 1.0f, 0.7f, 0.35f, 0.1f};
+	float shut = 0;
+	if (s->blinks) {
+		if (s->blink_k == 0 && s->t >= s->next_blink)
+			s->blink_k = 1;
+		if (s->blink_k > 0) {
+			shut = shut_k[s->blink_k - 1];
+			if (++s->blink_k > 7) {
+				s->blink_k = 0;
+				s->next_blink = s->t + rd_u(2.0f, 5.0f);
+			}
+		}
+	}
+	cf_face f;
+	memset(&f, 0, sizeof(f));
+	f.found = 1;
+	f.image_width = 1920;
+	f.image_height = 1080;
+	f.face_width = 5.0f * s->w;
+	f.has_pose = 1;
+	f.yaw_deg = gauss(0.5f);
+	const float w = s->w, h = 0.30f * w, gpx = s->glance * w, spx = s->side * w;
+	const float drop = 0.5f * fmaxf(gpx, 0.0f);
+	const float rho = (float)exp(-dt / RD_SLOW_TAU), kr = sqrtf(1.0f - rho * rho);
+	const float cx[2] = {960 - 1.5f * w, 960 + 1.5f * w};
+	for (int e = 0; e < 2; e++) {
+		for (int j = 0; j < 4; j++)
+			s->nz[e][j] = rho * s->nz[e][j] + kr * gauss(j == 0 ? s->slow : j == 1 ? s->slow_y : s->vslow);
+		cf_pt *pts = e == 0 ? f.left_eye : f.right_eye;
+		for (int i = 0; i < 16; i++) {
+			const float a = (float)i / 16.0f * 6.2831853f, sn = sinf(a);
+			const float y = 0.5f * h * sn + (sn < -1e-3f ? drop * -sn : 0.0f);
+			pts[i].x = cx[e] + 0.5f * w * cosf(a) + gauss(s->lid_px);
+			pts[i].y = 500 + y * (1.0f - shut) + gauss(s->lid_px);
+		}
+		cf_pt pupil = {cx[e] + spx + gauss(s->white) + s->nz[e][0], 500 + gpx + gauss(s->white_y) + s->nz[e][1]};
+		cf_pt vp = {cx[e] + s->vis_k * spx + gauss(s->vwhite) + s->nz[e][2],
+			    500 + s->vis_k * gpx + gauss(s->vwhite) + s->nz[e][3]};
+		if (shut > 0.5f) { /* the points are unreliable with the lids nearly shut */
+			pupil.x += gauss(2.0f);
+			pupil.y += gauss(2.0f);
+			vp.y += 1.5f * shut;
+		}
+		if (e == 0) {
+			f.left_count = 16;
+			f.left_pupil = pupil;
+			f.left_pupil_vision = vp;
+		} else {
+			f.right_count = 16;
+			f.right_pupil = pupil;
+			f.right_pupil_vision = vp;
+		}
+	}
+	f.has_vision_pupils = 1;
+	return f;
+}
+
+/* What a run saw: the learnt notes taken (how many, the first and the last, when, the shortest time between two),
+ * and the frames the status said reading (from when). */
+typedef struct {
+	int pubs;
+	cf_learnt_notes first, last;
+	double t_first, t_last, gap;
+	int reading;
+	double t_reading;
+} rd_log;
+
+/* Passes learnt notes back in the params, as the plugin does (the lens step here had Vision's point). */
+static void rd_feed(cf_gaze_params *p, const cf_learnt_notes *ln)
+{
+	p->has_notes = 1;
+	p->notes_offset = ln->offset;
+	p->notes_side = ln->side;
+	p->notes_open = ln->open;
+	p->notes_learnt = 1;
+	p->notes_seconds = ln->seconds;
+	p->vis_notes = ln->vis_offset;
+	p->has_vis_calib = ln->has_vis;
+}
+
+/* Runs the model on the synthetic eyes for secs, taking what it learns (fed back into the params with feed). */
+static void rd_run(cf_gaze *g, cf_gaze_params *p, rd_sim *s, double secs, int feed, rd_log *lg)
+{
+	const double dt = 1.0 / 30.0, end = s->t + secs - 1e-6;
+	while (s->t < end) {
+		rd_step(s, dt);
+		const cf_face f = rd_face(s, dt);
+		cf_eye out[2];
+		cf_gaze_update(g, &f, p, s->t, out);
+		cf_learnt_notes ln;
+		if (cf_gaze_take_learnt_notes(g, &ln)) {
+			if (lg->pubs == 0) {
+				lg->first = ln;
+				lg->t_first = s->t;
+				lg->gap = 1e9;
+			} else {
+				lg->gap = fmin(lg->gap, s->t - lg->t_last);
+			}
+			lg->last = ln;
+			lg->t_last = s->t;
+			lg->pubs++;
+			if (feed)
+				rd_feed(p, &ln);
+		}
+		cf_gaze_status st;
+		cf_gaze_get_status(g, &st);
+		if (st.reading && !lg->reading++)
+			lg->t_reading = s->t;
+	}
+}
+
+/* A calibration on the synthetic eyes held at `level` below the lens. */
+static cf_calib_result rd_calibrate(cf_gaze *g, const cf_gaze_params *p, enum cf_calib_target target, float w,
+				    float level, double *t)
+{
+	rd_sim s;
+	rd_init(&s, w, RD_HOLD, level, *t);
+	cf_calib_result res = {0};
+	cf_gaze_start_calibration(g, target);
+	int got = 0;
+	for (int i = 0; i < 150 && got <= 0; i++) {
+		rd_step(&s, 1.0 / 30.0);
+		const cf_face f = rd_face(&s, 1.0 / 30.0);
+		cf_eye out[2];
+		cf_gaze_update(g, &f, p, s.t, out);
+		got = cf_gaze_take_calibration(g, &res);
+	}
+	*t = s.t;
+	return res;
+}
+
+/* The params after a lens calibration on the synthetic eyes (w px wide), as the plugin saves them; with
+ * notes_cal, also what a notes calibration at `level` measures there (the reference for what is learnt). */
+static cf_gaze_params rd_params(float w, float level, cf_calib_result *notes_cal)
+{
+	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
+	cf_gaze g;
+	cf_gaze_init(&g);
+	double t = 20.0;
+	const cf_calib_result lens = rd_calibrate(&g, &p, CF_CALIB_LENS, w, 0.0f, &t);
+	p.baseline = lens.offset;
+	p.baseline_open = lens.openness;
+	p.head_ref = lens.head;
+	p.baseline_upper = lens.upper;
+	p.baseline_lower = lens.lower;
+	p.vis_baseline = lens.vis_offset;
+	if (notes_cal)
+		*notes_cal = rd_calibrate(&g, &p, CF_CALIB_NOTES, w, level, &t);
+	return p;
+}
+
+/* One reading session from a fresh model: mode, eye width, level; rtl, blinks, keyboard looks. */
+typedef struct {
+	int pubs, reading, spell;
+	double t_first, t_reading, gap;
+	cf_learnt_notes first, last;
+} rd_result;
+
+static rd_result rd_session(const cf_gaze_params *p0, int mode, float w, float level, unsigned seed, double secs,
+			    int rtl, int blinks, int keyboard)
+{
+	cf_gaze_params p = *p0;
+	cf_gaze g;
+	cf_gaze_init(&g);
+	rng_seed(seed);
+	rd_sim s;
+	rd_init(&s, w, mode, level, 100.0);
+	if (rtl)
+		rd_rtl(&s);
+	s.blinks = blinks;
+	s.keyboard = keyboard;
+	rd_log lg = {0};
+	rd_run(&g, &p, &s, secs, 1, &lg);
+	const rd_result r = {lg.pubs, lg.reading, g.learn.spell, lg.pubs ? lg.t_first - 100.0 : -1.0,
+			     lg.reading ? lg.t_reading - 100.0 : -1.0, lg.pubs > 1 ? lg.gap : 0.0, lg.first, lg.last};
+	return r;
+}
+
+static int rd_cmpd(const void *a, const void *b)
+{
+	const double x = *(const double *)a, y = *(const double *)b;
+	return (x > y) - (x < y);
+}
+
+/* How far learnt notes are from where the synthetic eyes read at `level` below the lens: the offset (0), the
+ * openness (1: the upper lid follows the gaze down by half), Vision's point (2: it moves 0.6 of the eyes'
+ * movement). */
+static float rd_err(const cf_learnt_notes *ln, float level, int what)
+{
+	return what == 0 ? fabsf(ln->offset + level)
+			 : what == 1 ? fabsf(ln->open - (0.30f - 0.5f * level)) : fabsf(ln->vis_offset + 0.6f * level);
+}
+
+static void test_learn_notes(void)
+{
+	const float W = 80.0f, LEVEL = 0.10f;
+	cf_calib_result cal;
+	const cf_gaze_params p0 = rd_params(W, LEVEL, &cal);
+	printf("    synthetic eyes %.0f px: lens calibration at %.4f (open %.3f), a notes calibration at %.2f below reads "
+	       "%.4f (open %.3f, side %.4f, Vision %.4f)\n",
+	       W, p0.baseline, p0.baseline_open, LEVEL, cal.offset, cal.openness, cal.side, cal.vis_offset);
+
+	/* L1. Reading at a level below the lens: learnt within ~20 s (half of 12 sessions within 20 s, all within
+	 * 45), where the eyes are (offset and Vision's point within 0.008, the openness within 0.01, sideways within
+	 * 0.01 of the middle of the lines), and handed out once only while nothing changes (90 s). The status says
+	 * reading before the notes are handed out. */
+	{
+		double t1[12];
+		float e_off = 0, e_open = 0, e_vis = 0, e_side = 0;
+		int one = 1, status = 1;
+		for (unsigned k = 0; k < 12; k++) {
+			const rd_result r = rd_session(&p0, RD_READ, W, LEVEL, 1 + k, 90.0, 0, 0, 0);
+			t1[k] = r.pubs ? r.t_first : 1e9;
+			one &= r.pubs == 1;
+			status &= r.reading > 0 && r.t_reading <= r.t_first;
+			if (!r.pubs)
+				continue;
+			e_off = fmaxf(e_off, rd_err(&r.first, LEVEL, 0));
+			e_open = fmaxf(e_open, rd_err(&r.first, LEVEL, 1));
+			e_vis = fmaxf(e_vis, r.first.has_vis ? rd_err(&r.first, LEVEL, 2) : 1.0f);
+			e_side = fmaxf(e_side, fabsf(r.first.side - 0.0f)); /* (lines from -0.025, 0.04-0.062 long) */
+		}
+		qsort(t1, 12, sizeof(double), rd_cmpd);
+		printf("    reading at %.2f: handed out after %.1f-%.1f s (median %.1f); off by at most %.4f, open %.4f, "
+		       "Vision %.4f, side %.4f from the lines' middle\n",
+		       LEVEL, t1[0], t1[11], 0.5 * (t1[5] + t1[6]), e_off, e_open, e_vis, e_side);
+		CHECK(t1[11] <= 45.0 && t1[5] <= 20.0, "reading learnt after %.1f s (half within %.1f)", t1[11], t1[5]);
+		CHECK(e_off <= 0.008f && e_open <= 0.01f && e_vis <= 0.008f && e_side <= 0.01f,
+		      "learnt notes off by %.4f (open %.4f, Vision %.4f, side %.4f)", e_off, e_open, e_vis, e_side);
+		CHECK(one, "learnt notes handed out more than once while nothing changed");
+		CHECK(status, "the status did not say reading before the notes were learnt");
+		printf("ok: L1 reading below the lens is learnt (half within %.0f s, all within %.0f), where the eyes read, "
+		       "and handed out once\n",
+		       t1[5], t1[11]);
+	}
+
+	/* L2. Looking around below the lens for an hour (6 sessions; fixations anywhere in 0.12 sideways, 0.036 up
+	 * and down, the jumps both ways), and holding still for 10 minutes at the lens and 10 below it: nothing is
+	 * learnt, nothing handed out; holding still never even reads as reading. */
+	{
+		int pubs = 0, has = 0, look_reading = 0, hold_reading = 0;
+		for (int c = 0; c < 8; c++) {
+			const int mode = c < 6 ? RD_LOOK : RD_HOLD;
+			const float level = c == 6 ? 0.0f : LEVEL;
+			cf_gaze_params p = p0;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(200 + (unsigned)c);
+			rd_sim s;
+			rd_init(&s, W, mode, level, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 600.0, 1, &lg);
+			pubs += lg.pubs;
+			has += g.learnt.has;
+			if (mode == RD_LOOK)
+				look_reading += lg.reading;
+			else
+				hold_reading += lg.reading;
+		}
+		printf("    looking around for 60 min, holding still 10 min at the lens and 10 below: %d handed out, "
+		       "reading for %d / %d frames\n",
+		       pubs, look_reading, hold_reading);
+		CHECK(pubs == 0 && has == 0, "learnt from looking around or holding still: %d handed out", pubs);
+		CHECK(hold_reading == 0, "holding still read as reading for %d frames", hold_reading);
+		printf("ok: L2 looking around and holding still teach nothing\n");
+	}
+
+	/* L3. Keyboard looks (0.30 below the lens, the lids dropped, 0.7-1.5 s every 6-10 s) in the reading: they
+	 * don't pull the estimate (as L1). */
+	{
+		float e_off = 0, e_open = 0;
+		int all = 1;
+		double worst = 0;
+		for (unsigned k = 0; k < 4; k++) {
+			const rd_result r = rd_session(&p0, RD_READ, W, LEVEL, 11 + k, 90.0, 0, 0, 1);
+			all &= r.pubs >= 1;
+			if (!r.pubs)
+				continue;
+			worst = fmax(worst, r.t_first);
+			e_off = fmaxf(fmaxf(e_off, rd_err(&r.first, LEVEL, 0)), rd_err(&r.last, LEVEL, 0));
+			e_open = fmaxf(fmaxf(e_open, rd_err(&r.first, LEVEL, 1)), rd_err(&r.last, LEVEL, 1));
+		}
+		printf("    reading with keyboard looks: learnt within %.1f s, off by at most %.4f (open %.4f)\n", worst, e_off,
+		       e_open);
+		CHECK(all && e_off <= 0.008f && e_open <= 0.01f,
+		      "reading with keyboard looks: learnt %d, off by %.4f (open %.4f)", all, e_off, e_open);
+		printf("ok: L3 keyboard looks don't pull the learnt notes\n");
+	}
+
+	/* L4. Right-to-left text (the lines start on the other side, the returns go the other way): learnt as well,
+	 * the spell's returns going +side. */
+	{
+		float e_off = 0;
+		int all = 1, way = 1;
+		double worst = 0;
+		for (unsigned k = 0; k < 4; k++) {
+			const rd_result r = rd_session(&p0, RD_READ, W, LEVEL, 21 + k, 90.0, 1, 0, 0);
+			all &= r.pubs >= 1;
+			way &= r.spell == 1;
+			if (!r.pubs)
+				continue;
+			worst = fmax(worst, r.t_first);
+			e_off = fmaxf(e_off, rd_err(&r.first, LEVEL, 0));
+		}
+		printf("    right-to-left: learnt within %.1f s, off by at most %.4f\n", worst, e_off);
+		CHECK(all && way && worst <= 45.0 && e_off <= 0.008f,
+		      "right-to-left reading: learnt %d (returns +side: %d) within %.1f s, off by %.4f", all, way, worst,
+		      e_off);
+		printf("ok: L4 right-to-left reading is learnt too\n");
+	}
+
+	/* L5. The notes move 0.04 lower after 75 s of reading (fed back as the plugin does): within about a minute
+	 * the learnt notes are there (offset within 0.008), handed out again, at most every LEARN_REPUB (18 s), and
+	 * no more than three times in all. */
+	{
+		double follow = 0, gap = 1e9;
+		float e_new = 0;
+		int pubs_max = 0, all = 1;
+		for (unsigned k = 0; k < 4; k++) {
+			cf_gaze_params p = p0;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(31 + k);
+			rd_sim s;
+			rd_init(&s, W, RD_READ, LEVEL, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 75.0, 1, &lg);
+			const int before = lg.pubs;
+			s.level = LEVEL + 0.04f;
+			const double t_move = s.t;
+			double t_there = -1;
+			for (int sec = 0; sec < 90; sec++) {
+				rd_run(&g, &p, &s, 1.0, 1, &lg);
+				if (t_there < 0 && lg.pubs > before && rd_err(&lg.last, LEVEL + 0.04f, 0) <= 0.008f)
+					t_there = s.t - t_move;
+			}
+			all &= before == 1 && t_there > 0;
+			follow = fmax(follow, t_there > 0 ? t_there : 1e9);
+			gap = fmin(gap, lg.pubs > 1 ? lg.gap : 1e9);
+			pubs_max = lg.pubs > pubs_max ? lg.pubs : pubs_max;
+			e_new = fmaxf(e_new, rd_err(&lg.last, LEVEL + 0.04f, 0));
+		}
+		printf("    notes moved 0.04 lower: learnt there %.1f s after (at worst), handed out %d times at most, at "
+		       "least %.1f s apart; last off by %.4f\n",
+		       follow, pubs_max, gap, e_new);
+		CHECK(all && follow <= 60.0 && pubs_max <= 3 && gap >= 18.0 - 1e-6 && e_new <= 0.008f,
+		      "notes moved: followed %d after %.1f s, %d handed out, %.1f s apart, off by %.4f", all, follow,
+		      pubs_max, gap, e_new);
+		printf("ok: L5 learnt notes follow a move within a minute, handed out again at most every 18 s\n");
+	}
+
+	/* L6. Learnt notes in the params (saved from an earlier run): a fresh model starts from them at once,
+	 * counted as the reading they rest on (notes_seconds, 10-60 s; 25 when unknown), and hands nothing out:
+	 * not the seed itself (taken already), nor anything while the reading stays where they are (90 s). Read
+	 * somewhere else (0.04 lower), it moves there and hands that out, sooner when they rest on less reading.
+	 * Forgotten, they are gone (the status no longer reading) and not taken up again from the params; the
+	 * reading after it is learnt afresh. */
+	{
+		cf_gaze_params ps = p0;
+		const cf_learnt_notes saved = {.has = 1, .offset = -LEVEL, .side = 0.0f, .open = 0.30f - 0.5f * LEVEL,
+					       .has_vis = 1, .vis_offset = -0.6f * LEVEL, .seconds = 40.0f, .serial = 7};
+		rd_feed(&ps, &saved);
+		/* weights */
+		const float in_s[4] = {40.0f, 0.0f, 3.0f, 500.0f}, want_s[4] = {40.0f, 25.0f, 10.0f, 60.0f};
+		int weights = 1, at_once = 1, none_new = 1;
+		for (int c = 0; c < 4; c++) {
+			cf_gaze_params p = ps;
+			p.notes_seconds = in_s[c];
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(41);
+			rd_sim s;
+			rd_init(&s, W, RD_HOLD, LEVEL, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 1.0 / 30.0, 1, &lg);
+			weights &= fabsf(g.learnt.seconds - want_s[c]) < 1e-3f;
+			at_once &= g.learnt.has && fabsf(g.learnt.offset - saved.offset) < 1e-6f &&
+				   fabsf(g.learnt.side - saved.side) < 1e-6f && fabsf(g.learnt.open - saved.open) < 1e-6f &&
+				   g.learnt.has_vis && fabsf(g.learnt.vis_offset - saved.vis_offset) < 1e-6f;
+			none_new &= lg.pubs == 0 && g.learnt_taken == g.learnt.serial;
+		}
+		CHECK(weights && at_once && none_new, "seeded from the params: weights %d, at once %d, nothing new %d",
+		      weights, at_once, none_new);
+		/* reading where they are: nothing new; the weight grows to the memory's minute */
+		int quiet = 0;
+		float sec_after = 0;
+		for (unsigned k = 0; k < 4; k++) {
+			cf_gaze_params p = ps;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(51 + k);
+			rd_sim s;
+			rd_init(&s, W, RD_READ, LEVEL, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 90.0, 1, &lg);
+			quiet += lg.pubs;
+			sec_after = fmaxf(sec_after, g.learnt.seconds);
+		}
+		printf("    seeded (40 s of reading): read where they are for 90 s: %d handed out, resting on %.0f s\n", quiet,
+		       sec_after);
+		CHECK(quiet == 0 && sec_after >= 59.0f, "seeded, reading where they are: %d handed out (resting on %.0f s)",
+		      quiet, sec_after);
+		/* reading 0.04 lower: handed out once moved, sooner with a lighter seed */
+		double when[2] = {0, 0};
+		float e_moved = 0;
+		const float sec_in[2] = {10.0f, 60.0f};
+		for (int c = 0; c < 2; c++) {
+			for (unsigned k = 0; k < 4; k++) {
+				cf_gaze_params p = ps;
+				p.notes_seconds = sec_in[c];
+				cf_gaze g;
+				cf_gaze_init(&g);
+				rng_seed(61 + k);
+				rd_sim s;
+				rd_init(&s, W, RD_READ, LEVEL + 0.04f, 100.0);
+				rd_log lg = {0};
+				rd_run(&g, &p, &s, 90.0, 1, &lg);
+				when[c] += (lg.pubs ? lg.t_first - 100.0 : 1e3) / 4;
+				if (lg.pubs)
+					e_moved = fmaxf(e_moved, rd_err(&lg.first, LEVEL + 0.04f, 0));
+			}
+		}
+		printf("    seeded, reading 0.04 lower: handed out after %.1f s on average (a seed of 10 s) / %.1f s "
+		       "(60 s), off by %.4f\n",
+		       when[0], when[1], e_moved);
+		CHECK(when[0] >= 18.0 && when[0] < when[1] && when[1] <= 75.0 && e_moved <= 0.008f,
+		      "seeded, reading elsewhere: handed out after %.1f / %.1f s, off by %.4f", when[0], when[1], e_moved);
+		/* forget */
+		{
+			cf_gaze_params p = ps;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(71);
+			rd_sim s;
+			rd_init(&s, W, RD_READ, LEVEL, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 40.0, 0, &lg);
+			const int was_reading = g.st_reading, had = g.learnt.has;
+			cf_gaze_forget_learnt_notes(&g);
+			cf_learnt_notes ln;
+			cf_gaze_status st;
+			cf_gaze_get_status(&g, &st);
+			const int gone = had && !g.learnt.has && !cf_gaze_take_learnt_notes(&g, &ln) && !st.reading;
+			/* the params still carry them (the plugin stops passing them then): not taken up again */
+			rd_run(&g, &p, &s, 2.0, 0, &lg);
+			const int not_again = !g.learnt.has;
+			rd_log l2 = {0};
+			rd_run(&g, &p, &s, 60.0, 0, &l2);
+			printf("    forgotten after 40 s of reading (the status reading: %d): gone %d, not taken up again %d; "
+			       "learnt afresh %.1f s after (%d handed out, off by %.4f)\n",
+			       was_reading, gone, not_again, l2.pubs ? l2.t_first - 140.0 : -1.0, l2.pubs,
+			       l2.pubs ? rd_err(&l2.first, LEVEL, 0) : 0.0f);
+			CHECK(gone && not_again && l2.pubs >= 1 && l2.first.serial != 0 && rd_err(&l2.first, LEVEL, 0) <= 0.008f,
+			      "forgetting learnt notes: gone %d, not again %d, learnt afresh %d", gone, not_again, l2.pubs);
+		}
+		printf("ok: L6 learnt notes in the params are started from at once (not handed out again), refined, moved "
+		       "when the reading is elsewhere, and forgotten on request\n");
+	}
+
+	/* L7. With learnt notes 0.04 below the lens, a glance of 0.13 (past their own limit, within max_glance 0.15)
+	 * stays corrected; with the same notes from a calibration (notes_learnt 0) it lets go, as before. A look at
+	 * the keyboard (0.30) lets go with learnt notes too. */
+	{
+		float fac[3];
+		for (int c = 0; c < 3; c++) {
+			cf_gaze_params p = p0;
+			p.has_notes = 1;
+			p.notes_offset = -0.04f;
+			p.notes_side = 0.0f;
+			p.notes_open = 0.30f - 0.5f * 0.04f;
+			p.notes_learnt = c != 1;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(81);
+			rd_sim s;
+			rd_init(&s, W, RD_HOLD, c == 2 ? 0.30f : 0.13f, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 3.0, 0, &lg);
+			cf_gaze_status st;
+			cf_gaze_get_status(&g, &st);
+			fac[c] = st.factor;
+		}
+		printf("    glance 0.13, notes 0.04 below: correction %.2f learnt, %.2f calibrated; keyboard (learnt) %.2f\n",
+		       fac[0], fac[1], fac[2]);
+		CHECK(fac[0] > 0.8f && fac[1] < 0.2f && fac[2] < 0.2f,
+		      "glance limit with learnt notes: %.2f learnt, %.2f calibrated, keyboard %.2f", fac[0], fac[1], fac[2]);
+		printf("ok: L7 learnt notes only widen the glance limit (to max_glance); calibrated notes keep theirs\n");
+	}
+
+	/* L8. Vision's gain from learnt notes: a change of under 10% (VIS_CAL_LEARNT_TOL) is not re-applied (its
+	 * levels go on), a bigger one is (they start afresh); from calibrated notes any change is, as before. */
+	{
+		float ratio[3] = {0, 0, 0};
+		int restarted[3] = {0, 0, 0};
+		for (int c = 0; c < 2; c++) {
+			cf_gaze_params p = p0;
+			p.has_notes = 1;
+			p.notes_offset = -LEVEL;
+			p.notes_open = 0.30f - 0.5f * LEVEL;
+			p.notes_learnt = c == 0;
+			p.has_vis_calib = 1;
+			p.vis_notes = p.vis_baseline - 0.06f;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(91);
+			rd_sim s;
+			rd_init(&s, W, RD_HOLD, LEVEL, 100.0);
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 2.0, 0, &lg);
+			const float g0 = g.vis_gain_cal;
+			const float dv[2] = {0.057f, 0.05f}; /* the gain up 5%, then 20% */
+			for (int k = 0; k < 2 - c; k++) {
+				p.vis_notes = p.vis_baseline - dv[k];
+				rd_run(&g, &p, &s, 1.0 / 30.0, 0, &lg);
+				ratio[c ? 2 : k] = g.vis_gain_cal / g0;
+				restarted[c ? 2 : k] = g.rb_down.v_off_n <= 2;
+			}
+		}
+		printf("    Vision's gain from learnt notes: x%.3f after a 5%% change (levels restarted %d), x%.3f after 20%% "
+		       "(%d); from calibrated notes x%.3f after 5%% (%d)\n",
+		       ratio[0], restarted[0], ratio[1], restarted[1], ratio[2], restarted[2]);
+		CHECK(fabsf(ratio[0] - 1.0f) < 1e-6f && !restarted[0] && fabsf(ratio[1] - 1.2f) < 0.01f && restarted[1] &&
+			      fabsf(ratio[2] - 0.06f / 0.057f) < 0.01f && restarted[2],
+		      "Vision's gain with learnt notes: x%.3f (5%%), x%.3f (20%%), calibrated x%.3f", ratio[0], ratio[1],
+		      ratio[2]);
+		printf("ok: L8 a small change of the learnt notes' Vision gain leaves its levels be; a big one restarts "
+		       "them\n");
+	}
+
+	/* L9. Blinking every 2-5 s while reading: still learnt (as L1), the blinks (held frames) not pulling the
+	 * openness down. */
+	{
+		float e_off = 0, e_open = 0;
+		int all = 1;
+		double worst = 0;
+		for (unsigned k = 0; k < 4; k++) {
+			const rd_result r = rd_session(&p0, RD_READ, W, LEVEL, 101 + k, 90.0, 0, 1, 0);
+			all &= r.pubs >= 1;
+			if (!r.pubs)
+				continue;
+			worst = fmax(worst, r.t_first);
+			e_off = fmaxf(e_off, rd_err(&r.first, LEVEL, 0));
+			e_open = fmaxf(e_open, rd_err(&r.first, LEVEL, 1));
+		}
+		printf("    reading with blinks: learnt within %.1f s, off by at most %.4f (open %.4f)\n", worst, e_off,
+		       e_open);
+		CHECK(all && worst <= 45.0 && e_off <= 0.008f && e_open <= 0.01f,
+		      "reading with blinks: learnt %d within %.1f s, off by %.4f (open %.4f)", all, worst, e_off, e_open);
+		printf("ok: L9 reading with blinks is learnt\n");
+	}
+
+	/* L10. Eyes 45 px wide (the same pixel noise: 1.8x as much in eye widths): reading is learnt more slowly but
+	 * as well (most of 8 sessions within 90 s, off by 0.012 at most), and looking around or holding still below
+	 * the lens for 10 minutes teaches nothing. */
+	{
+		const float w = 45.0f;
+		const cf_gaze_params p = rd_params(w, LEVEL, NULL);
+		int learnt = 0;
+		float e_off = 0;
+		double t1 = 0;
+		for (unsigned k = 0; k < 8; k++) {
+			const rd_result r = rd_session(&p, RD_READ, w, LEVEL, 111 + k, 90.0, 0, 0, 0);
+			if (!r.pubs)
+				continue;
+			learnt++;
+			t1 = fmax(t1, r.t_first);
+			e_off = fmaxf(e_off, rd_err(&r.first, LEVEL, 0));
+		}
+		int wrong = 0;
+		for (int c = 0; c < 4; c++)
+			wrong += rd_session(&p, c < 2 ? RD_LOOK : RD_HOLD, w, LEVEL, 121 + (unsigned)c, 600.0, 0, 0, 0).pubs;
+		printf("    eyes %.0f px: %d of 8 learnt within 90 s (the last after %.1f s), off by at most %.4f; looking "
+		       "around and holding still for 40 min: %d handed out\n",
+		       w, learnt, t1, e_off, wrong);
+		CHECK(learnt >= 5 && e_off <= 0.012f && wrong == 0,
+		      "eyes 45 px: %d of 8 learnt, off by %.4f; %d handed out from looking around or holding still", learnt,
+		      e_off, wrong);
+		printf("ok: L10 smaller eyes: reading learnt more slowly, nothing learnt from looking around\n");
+	}
+
+	/* L11. Without a lens calibration the reading is learnt as absolute offsets (no below-the-lens check). */
+	{
+		cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
+		const rd_result r = rd_session(&p, RD_READ, W, LEVEL, 131, 90.0, 0, 0, 0);
+		printf("    no lens calibration: learnt after %.1f s, offset %.4f\n", r.t_first, r.first.offset);
+		CHECK(r.pubs >= 1 && rd_err(&r.first, LEVEL, 0) <= 0.008f, "no lens calibration: learnt %d, offset %.4f",
+		      r.pubs, r.first.offset);
+		printf("ok: L11 without a lens calibration the reading is still learnt\n");
+	}
+
+	/* L12. The lens look against the learnt notes: "too low" (CF_LOOK_LOW) only when it is not CF_NOTES_MIN_GLANCE
+	 * above them and they rest on CF_LOOK_READING_MIN seconds of reading at least. */
+	{
+		cf_calib_result look = {.target = CF_CALIB_LENS, .offset = -0.095f};
+		cf_learnt_notes rd = {.has = 1, .offset = -0.10f, .seconds = 30.0f};
+		const int low = cf_gaze_check_lens_look(&look, &rd);
+		rd.seconds = 5.0f;
+		const int few = cf_gaze_check_lens_look(&look, &rd);
+		rd.seconds = 30.0f;
+		look.offset = -0.085f;
+		const int above = cf_gaze_check_lens_look(&look, &rd);
+		look.offset = -0.095f;
+		const int none = cf_gaze_check_lens_look(&look, NULL);
+		CHECK(low == CF_LOOK_LOW && few == CF_LOOK_OK && above == CF_LOOK_OK && none == CF_LOOK_OK,
+		      "lens look against the reading: %d (low), %d (5 s of reading), %d (0.015 above), %d (none)", low, few,
+		      above, none);
+		printf("ok: L12 a lens look is too low only against learnt notes resting on enough reading\n");
+	}
+}
+
 int main(void)
 {
 	const cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f, .baseline = 0.0f};
@@ -3897,6 +4694,7 @@ int main(void)
 	test_head_lids();
 	test_side_scan();
 	test_vision_tail();
+	test_learn_notes();
 
 	if (failures) {
 		printf("%d FAILED\n", failures);

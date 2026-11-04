@@ -87,6 +87,10 @@ typedef struct {
 	 * limit is never below max_glance, and Vision's gain from them is only re-applied when it moved by more than
 	 * a small tolerance (they are refined as the user reads). A model with nothing learnt yet starts from them. */
 	int notes_learnt;
+	/* How much reading the learnt notes rest on (cf_learnt_notes.seconds), s; 0 = unknown. A model starting from
+	 * them counts them as that much reading (10 s at least, a minute at most): the more there was, the more new
+	 * reading it takes to move them. */
+	float notes_seconds;
 } cf_gaze_params;
 
 /* "Eye contact strength" goes up to this (200%): over 1 the correction overshoots, so it can make up for
@@ -162,7 +166,7 @@ typedef struct {
  * of the next one (a sawtooth sideways), with the gaze held below the lens. From those frames it learns the same
  * measures a notes calibration takes, and keeps following them when they move (the laptop tilted, the notes
  * moved, a new seat). The caller saves what it learns and passes it back in the params (has_notes, notes_offset,
- * notes_side, notes_open, vis_notes, with notes_learnt 1), so it survives restarts. */
+ * notes_side, notes_open, vis_notes, notes_seconds, with notes_learnt 1), so it survives restarts. */
 typedef struct {
 	int has;          /* 1 once enough reading has been seen */
 	float offset;     /* gaze offset while reading (same units as baseline, like cf_calib_result.offset) */
@@ -177,10 +181,13 @@ typedef struct {
 /* Checks a finished lens calibration ("look at the camera") before it is used. reading: the learnt notes, or
  * NULL / has 0 when none are known yet. Returns CF_LOOK_OK, or why the look should be redone:
  *  CF_LOOK_UNSTEADY: the eyes or lids moved far more than a held look does (not just a bit unsteady);
- *  CF_LOOK_LOW: it is not clearly above where the eyes read, so it was a look at the screen, not into the lens. */
+ *  CF_LOOK_LOW: it is not clearly above where the eyes read (by CF_NOTES_MIN_GLANCE), so it was a look at the
+ *    screen, not into the lens. Only said when the learnt notes rest on CF_LOOK_READING_MIN seconds of reading
+ *    at least: a few seconds of it may be off. */
 #define CF_LOOK_OK 0
 #define CF_LOOK_UNSTEADY 1
 #define CF_LOOK_LOW 2
+#define CF_LOOK_READING_MIN 10.0f
 int cf_gaze_check_lens_look(const cf_calib_result *res, const cf_learnt_notes *reading);
 
 typedef struct {
@@ -263,6 +270,85 @@ typedef struct {
 	float refit_dv, refit_v0, refit_anchor;
 	double refit_t;
 } cf_robust;
+
+/* ---- The notes learner's own state (gaze.c, "Notes learnt from reading"). The last few seconds of frames that may
+ * be reading, the sideways jumps found in them, the reading lines between those jumps, and the lines the estimate
+ * rests on. */
+#define CF_LEARN_FRAMES 512 /* frames kept: over 13 s at the learner's frame rate (at most ~38 a second) */
+#define CF_LEARN_JUMPS 32   /* sideways jumps remembered, for the share going the returns' way */
+#define CF_LEARN_LINES 24   /* reading lines the estimate rests on (about a minute's worth) */
+#define CF_LEARN_BLOCKS 20  /* 1 s blocks the sideways noise is measured over */
+
+typedef struct {
+	double t;
+	float off, side, open; /* as cf_calib_result's offset, side and openness, for this one frame */
+	float vis;             /* Vision's point's offset, NAN when it was not given */
+} cf_learn_frame;
+
+/* One reading line: its frames' medians and how much reading it holds (w, seconds; w_vis of them with Vision's
+ * point). Also used for the learnt notes passed in the params (a seed). */
+typedef struct {
+	float w, off, side, open, vis, w_vis;
+	float sd; /* robust standard deviation of the vertical over the line (eye widths) */
+	double t; /* when it ended */
+} cf_learn_line;
+
+/* A sideways jump: where the eyes were before it and after (5-frame medians), at which frames and when. */
+typedef struct {
+	int sign;
+	unsigned first, last; /* the first frame after it (last: of the last jump merged into it) */
+	double t_first, t_last;
+	float before, after;
+} cf_learn_jump;
+
+typedef struct {
+	cf_learn_frame f[CF_LEARN_FRAMES]; /* frame k is f[k % CF_LEARN_FRAMES] */
+	unsigned n;                       /* frames stored so far */
+	unsigned run;                     /* the first frame since the last break (a long gap) */
+	double last_t;                    /* when the last frame was stored */
+	double gate_t;                    /* when a frame last passed the checks (stored or not) */
+	/* The sideways noise: robust standard deviations over 1 s blocks, and their 25th percentile */
+	float block_sd[CF_LEARN_BLOCKS];
+	int blocks, block_k;
+	unsigned block_from;
+	float sigma;
+	/* Jumps: the one waiting to be merged with a quick follow-up the same way (a corrective saccade), the last
+	 * frame a jump was found at, and the recent ones' times and signs */
+	cf_learn_jump pend;
+	int have_pend;
+	unsigned last_jump;
+	int have_last_jump;
+	double jump_t[CF_LEARN_JUMPS];
+	int jump_sign[CF_LEARN_JUMPS];
+	int jumps;
+	/* Per way a return can go (0: towards -side, 1: towards +side): the last jump that way (and whether one went the
+	 * other way since), how many valid lines in a row ended with one (when the first began, the last ended), and the
+	 * last valid line not yet used */
+	struct {
+		int have, crossed;
+		cf_learn_jump at;
+		int chain;
+		double chain_t0, line_t;
+		int have_line;
+		cf_learn_line line;
+		int have_prev;
+		cf_learn_line prev; /* the last valid line (for the level check between two lines) */
+	} way[2];
+	/* The reading spell: the way its returns go (-1, +1; 0: none), a count of spells, when it began, when its
+	 * last line ended and how many returns it has had */
+	int spell;
+	unsigned spell_id;
+	double spell_t0, spell_t1;
+	int spell_returns;
+	/* The estimate: the lines it rests on, oldest first, at most LEARN_MEMORY seconds of them in all */
+	cf_learn_line line[CF_LEARN_LINES];
+	int lines;
+	cf_learnt_notes est;   /* the current estimate (has: any lines) */
+	cf_learnt_notes pub;   /* the last one handed out, or the learnt notes from the params (has_pub) */
+	int has_pub;
+	double pub_t;
+	int no_seed;           /* forgotten: not seeded again until the params stop carrying learnt notes */
+} cf_notes_learner;
 
 typedef struct {
 	cf_one_euro cx[2], cy[2], rx[2], ry[2], eye_h[2];
@@ -416,6 +502,7 @@ typedef struct {
 	int st_reading;
 	cf_learnt_notes learnt;     /* the current estimate */
 	unsigned learnt_taken;      /* the serial last handed out by cf_gaze_take_learnt_notes() */
+	cf_notes_learner learn;     /* the notes learner's own state */
 } cf_gaze;
 
 void cf_gaze_init(cf_gaze *g);
@@ -451,7 +538,8 @@ int cf_gaze_take_calibration(cf_gaze *g, cf_calib_result *out);
 void cf_gaze_cancel_calibration(cf_gaze *g);
 
 /* Returns 1 (copying them to out) when the learnt notes (see cf_learnt_notes) changed enough to be saved since
- * the last call, else 0. Rare by design: at most every few seconds while learning, and only on a real change. */
+ * the last call, else 0. Rare by design: the first time after three lines (8 s) of reading or so, then at most
+ * every 18 s, and only on a real change. Learnt notes the model started from (the params) count as taken. */
 int cf_gaze_take_learnt_notes(cf_gaze *g, cf_learnt_notes *out);
 /* Forgets what was learnt (the notes are learnt afresh). The caller also stops passing the old ones. */
 void cf_gaze_forget_learnt_notes(cf_gaze *g);
