@@ -35,9 +35,14 @@
  *   --model PATH       the model for --engine model (default ~/Library/Application Support/cam-flip/
  *                      eye-model.mlpackage)
  *   --ml-compute U     where the model runs: all (default), cpu, gpu (CPU + GPU), ane (CPU + Neural Engine)
- *   --ml-target T      where the model puts the iris: lens (default, if the model learnt it): where your
- *                      iris sits looking into the lens, so the sideways sweep and line returns don't show;
+ *   --ml-target T      where the model puts the iris. steady (default): where you are looking, held
+ *                      still, for notes laid over the other person's face: the iris stays on the middle of
+ *                      what you read (drifting there slowly) and only follows a real look elsewhere, so
+ *                      you look like you're watching them, with no reading sweep or line returns;
+ *                      lens: where your iris sits looking into the lens (if the model learnt it);
  *                      follow: the tracked pupil plus the classic warp's shift (keeps the sweep)
+ *   --steady-band X,Y  steady: how far the pupil may move from the held point, in eye-patch px (eye
+ *                      width 80), before it counts as a look elsewhere (default 8,4)
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
  *   --ml-alpha F       scale the model's effect (default 1)
  *   --learn            print the notes learnt from the reading as they are handed out (and the final
@@ -348,7 +353,10 @@ int main(int argc, char **argv)
 	const char *model_path = NULL;
 	enum cf_ml_compute ml_compute = CF_ML_ALL;
 	double ml_ms = 0, ml_ms_max = 0;
-	int ml_runs = 0, ml_follow = 0, ml_res = 1;
+	int ml_runs = 0, ml_follow = 0, ml_res = 1, ml_steady = 1;
+	float steady_band[2] = {8.0f, 4.0f}, steady_hold[2][2] = {{0}}, steady_tau = 3.0f;
+	int steady_has[2] = {0, 0};
+	double steady_t[2] = {0, 0};
 	float ml_alpha = 1.0f;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
@@ -384,7 +392,8 @@ int main(int argc, char **argv)
 				   : !strcmp(v, "ane") ? CF_ML_CPU_ANE : CF_ML_ALL;
 			i++;
 		}
-		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); i++; }
+		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
+		else if (!strcmp(a, "--steady-band")) { sscanf(v, "%f,%f", &steady_band[0], &steady_band[1]); i++; }
 		else if (!strcmp(a, "--ml-res")) { ml_res = atoi(v); i++; }
 		else if (!strcmp(a, "--ml-alpha")) { ml_alpha = (float)atof(v); i++; }
 		else if (!strcmp(a, "--learn")) learn = 1;
@@ -406,12 +415,13 @@ int main(int argc, char **argv)
 		probe[0].aperture_count = 2;
 		probe[0].aperture[1][0] = 10;
 		float pt[2];
-		if (!ml_follow && !cf_ml_lens_target(ml, probe, 1, 0, pt)) {
+		if (!ml_follow && !ml_steady && !cf_ml_lens_target(ml, probe, 1, 0, pt)) {
 			printf("this model doesn't carry the lens look (retrain it): following the pupil instead\n");
 			ml_follow = 1;
 		}
 		printf("engine: personal eye model %s, iris %s\n", mp,
-		       ml_follow ? "follows the pupil plus the classic shift" : "held on the lens look");
+		       ml_steady ? "held steady where you look (no reading sweep or line returns)"
+		       : ml_follow ? "follows the pupil plus the classic shift" : "held on the lens look");
 	}
 	if (lag < 0)
 		lag = 0;
@@ -746,7 +756,7 @@ int main(int argc, char **argv)
 							/* Off while the gaze model says the lids are shut or closing: the model never saw a
 							 * blink and smudges it, and the lids hide the eye anyway. */
 							alpha[e] = st.blinking ? 0.0f : ml_alpha * fminf(1.0f, st.factor / 0.3f);
-							if (!ml_follow && cf_ml_lens_target(ml, eyes, n, e, tgt[e]))
+							if (!ml_follow && !ml_steady && cf_ml_lens_target(ml, eyes, n, e, tgt[e]))
 								continue;
 							const cf_pt c0 = centroid_of(fed.left_eye, fed.left_count),
 								    c1 = centroid_of(fed.right_eye, fed.right_count);
@@ -756,6 +766,30 @@ int main(int argc, char **argv)
 							const cf_pt c = right ? c1 : c0, pu = right ? fed.right_pupil : fed.left_pupil;
 							tgt[e][0] = pu.x + (eyes[e].cx - c.x) + eyes[e].sx;
 							tgt[e][1] = pu.y + (eyes[e].cy - c.y) + eyes[e].sy;
+							cf_ml_frame fr;
+							const int flip = n == 2 && eyes[e].cx > eyes[1 - e].cx;
+							if (ml_steady && cf_ml_eye_frame(&eyes[e], flip, &fr)) {
+								/* Steady: the pupil (no classic shift) in eye-patch px, so head moves
+								 * don't count. Within the band it is reading along a line or down the
+								 * notes: hold, drifting slowly to the middle of it. Outside, a real look
+								 * elsewhere: go there at once. Held through blinks. */
+								float px, py;
+								cf_ml_to_patch(&fr, pu.x + (eyes[e].cx - c.x), pu.y + (eyes[e].cy - c.y), &px, &py);
+								float *hd = steady_hold[flip];
+								const float dt = steady_has[flip] ? (float)fmax(0.0, t - steady_t[flip]) : 0.0f;
+								if (!steady_has[flip] || fabsf(px - hd[0]) > steady_band[0] ||
+								    fabsf(py - hd[1]) > steady_band[1]) {
+									hd[0] = px;
+									hd[1] = py;
+									steady_has[flip] = 1;
+								} else if (!st.blinking) {
+									const float k = fminf(1.0f, dt / steady_tau);
+									hd[0] += (px - hd[0]) * k;
+									hd[1] += (py - hd[1]) * k;
+								}
+								steady_t[flip] = t;
+								cf_ml_to_image(&fr, hd[0], hd[1], &tgt[e][0], &tgt[e][1]);
+							}
 						}
 						double ms = 0;
 						if (cf_ml_correct(ml, &ch[0], ch, cc, ml_res ? cf_ml_residual_channels(CF_FMT_NV12) : 0u, eyes, n,
