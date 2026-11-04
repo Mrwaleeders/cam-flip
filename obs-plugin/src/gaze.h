@@ -202,6 +202,16 @@ typedef struct {
 	int have_shown;
 	int gliding;      /* shown is gliding (an S-curve) from glide_from, started at glide_t0, to the accepted value */
 	double glide_from, glide_t0;
+	/* Vision's frame-to-frame noise tail (see VIS_TAIL_P); a saccade Vision's point backs alone, waiting a
+	 * frame (its sign); and the last jump's landing: its readings so far (the first is where it landed) and
+	 * when it was taken */
+	float v_tail;
+	int vwait;
+	float land_buf[8];
+	int land_k;
+	double land_t;
+	int land_mode;    /* (how its landing is shown: like the jump, gate()'s return) */
+	int rel_s, rel_n; /* frames running both readings have been off the accepted value, and which way */
 } cf_robust;
 
 typedef struct {

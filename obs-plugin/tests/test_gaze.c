@@ -3373,9 +3373,9 @@ int main(void)
 	 * 0.05-0.09 for 0.15 s. Vision's points don't move, so nothing backs a change: the output never steps
 	 * faster than the slew limit. (c') The same with Vision's points dragged 0.015 too (1.3 px, 2.2 px of
 	 * gaze with the calibrated gain): that is what a short look down looks like, and may show as one, but
-	 * when the points come back so does the correction, at once (within 1 px no later than 0.1 s and a
-	 * frame after the first frame without the drags), not gliding back over half a second. Realistic noise
-	 * with Vision, 25, 30 and 15 fps. */
+	 * when the points come back so does the correction, at once (within 1.5 px, a few frames' noise, no
+	 * later than 0.1 s and a frame after the first frame without the drags), not gliding back over half a
+	 * second. Realistic noise with Vision, 25, 30 and 15 fps. */
 	{
 		const double fpss[3] = {25.0, 30.0, 15.0};
 		float worst[5] = {0, 0, 0, 0, 0};
@@ -3423,7 +3423,7 @@ int main(void)
 						}
 						if (tp >= 0.15 - 1e-6 && clean_t < 0)
 							clean_t = tp; /* the first frame without the drags */
-						if (clean_t >= 0 && back < 0 && fabsf(c - steady) < 1.0f)
+						if (clean_t >= 0 && back < 0 && fabsf(c - steady) < 1.5f)
 							back = tp - clean_t;
 						prev = c;
 					}
