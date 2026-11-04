@@ -88,6 +88,7 @@ class EyeNet(nn.Module):
         d2 = self.d2(torch.cat([F.interpolate(d3, size=e2.shape[2:], mode="nearest"), e2], 1))
         d1 = self.d1(torch.cat([F.interpolate(d2, size=e1.shape[2:], mode="nearest"), e1], 1))
         o = self.head(d1)
+        self.logits = o  # for the training loss that keeps the outputs out of saturation
         flow = torch.tanh(o[:, 0:2]) * MAX_FLOW
         res = torch.tanh(o[:, 2:3]) * MAX_RES
         mask = torch.sigmoid(o[:, 3:4] + 2.0)
@@ -172,6 +173,8 @@ class Session:
         settle = np.where(self.kind == "read", 0.12, 0.3)
         ok = np.isin(self.kind, ["lens", "dot", "read"]) & (self.since >= settle) & (self.until >= 0.03)
         ok &= np.isfinite(self.px) & np.isfinite(self.py)
+        # A pupil reading outside the eye (tracking slip) would ask the model for an impossible move.
+        ok &= (self.px > CORNER_L - 8) & (self.px < CORNER_R + 8) & (self.py > CORNER_Y - 24) & (self.py < CORNER_Y + 16)
         for e in (0, 1):  # blinks: much less open than usual at the lens
             sel = (self.flip == e) & (self.kind == "lens") & ok
             med = np.median(self.open[sel]) if sel.any() else np.median(self.open[self.flip == e])
@@ -337,7 +340,12 @@ def losses(model, src, dst, tgt, grid, wmap, edge):
     l_tv = torch.abs(gx(flow)).mean() + torch.abs(gy(flow)).mean()
     l_res = torch.abs(mask * res).mean()
     l_edge = ((torch.abs(flow).sum(1, keepdim=True) / MAX_FLOW + torch.abs(mask * res) / MAX_RES) * edge).mean()
-    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + 0.05 * l_res + 0.5 * l_edge
+    # Keep the outputs out of tanh / sigmoid saturation. Saturated, they pass no gradient, and the
+    # smoothness term then drags neighbouring pixels along: on real eyes the whole flow ended up pinned at
+    # MAX_FLOW (every sample off the patch) and training froze. This term still pulls back from there.
+    o = model.logits
+    l_sat = (F.relu(o[:, 0:3].abs() - 2.0) ** 2).mean() + (F.relu((o[:, 3:4] + 2.0).abs() - 5.0) ** 2).mean()
+    total = l_pix + 2.0 * l_coarse + 0.5 * l_grad + 0.02 * l_tv + 0.05 * l_res + 0.5 * l_edge + 0.1 * l_sat
     return total, out, l_pix
 
 
@@ -426,7 +434,7 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=48)
-    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--resume", action="store_true", help="start from eye-model.pt in --out")
     ap.add_argument("--no-export", action="store_true")
@@ -443,6 +451,7 @@ def main():
         # start, where the model hasn't found the iris yet.
         a.steps = min(a.steps, 1200)
         a.batch = min(a.batch, 24)
+        a.lr = 2e-3
         out_dir = None
     else:
         if not a.sessions:
@@ -492,7 +501,8 @@ def main():
             continue
         opt.step()
         sched.step()
-        if step % max(1, a.steps // 10) == 0 or step == a.steps:
+        early = not a.selftest and step in (100, 250, 500, 1000)  # catch a blow-up early
+        if early or step % max(1, a.steps // 10) == 0 or step == a.steps:
             if not all(torch.isfinite(p_).all() for p_ in model.parameters()):
                 sys.exit(f"step {step}: the model's weights are no longer numbers: stopping")
             lm, lc, em, ec = evaluate(model, val, grid, wmap, edge, dev, batches=5 if a.selftest else 20)
@@ -501,6 +511,8 @@ def main():
             print(f"step {step}/{a.steps} ({time.time() - t0:.0f} s): held-out difference to the real look "
                   f"{lm:.4f} (uncorrected {lc:.4f}); iris off by {em:.2f} px (uncorrected {ec:.2f}); "
                   f"flow {f_.abs().mean().item():.2f} px avg, {f_.abs().max().item():.1f} max, mask {m_.mean().item():.2f}")
+            if f_.abs().mean().item() > 0.75 * MAX_FLOW:
+                sys.exit("the flow is pinned at its limit (training blew up): stopping. Try a lower --lr")
             if best is None or lm < best[0]:  # keep the best model seen on held-out frames
                 best = (lm, copy.deepcopy(model.state_dict()))
 
