@@ -1017,6 +1017,95 @@ static void run_lens_look(struct camflip *f, obs_data_t *restore)
 	camflip_update(f, restore);
 }
 
+/* Two camera looks running that are not above the learnt reading: it is the learnt notes that are off (from
+ * before a new seat or camera), so the second look is taken and the notes are forgotten, to be learnt again. */
+static void run_lens_look_second_try(struct camflip *f, obs_data_t *restore)
+{
+	obs_data_t *s = set_up_settings();
+	obs_data_set_double(s, S_BASELINE, 0.01); /* the previous camera look */
+	camflip_update(f, s);
+	pthread_mutex_lock(&f->lock);
+	f->look_low_prev = false;
+	pthread_mutex_unlock(&f->lock);
+
+	cf_learnt_notes reading;
+	memset(&reading, 0, sizeof(reading));
+	reading.has = 1;
+	reading.offset = -0.05f;
+	reading.open = 0.25f;
+	reading.seconds = 30.0f;
+	reading.serial = 1;
+	obs_data_t *learnt = take_learnt_notes(f, &reading);
+	check(learnt != NULL, "(notes learnt for the second-try check)");
+	if (learnt)
+		obs_data_release(learnt);
+
+	cf_calib_result low;
+	memset(&low, 0, sizeof(low));
+	low.target = CF_CALIB_LENS;
+	low.offset = -0.045f; /* level with the reading */
+	low.openness = 0.31f;
+	low.head = (cf_head_ref){.ok = 1, .side = 0.01f, .vert = 0.5f, .eyes = 0.0f, .tilt = 0.1f};
+	low.upper = 0.2f;
+	low.lower = 0.1f;
+	obs_data_t *changes = NULL;
+	begin_step(f, CALIB_LENS);
+	finish_step(f, 1, &low, &changes);
+	check(!changes && cue_is(f, CUE_FAILED), "(the first look level with the reading is turned down)");
+	if (changes)
+		obs_data_release(changes);
+
+	begin_step(f, CALIB_LENS);
+	const bool taken = finish_step(f, 1, &low, &changes);
+	pthread_mutex_lock(&f->lock);
+	const bool used = fabsf(f->baseline + 0.045f) < 1e-6f && f->look_bad == CF_LOOK_OK && f->lens_done && !f->learnt.has;
+	pthread_mutex_unlock(&f->lock);
+	check(taken && used && changes && fabs(obs_data_get_double(changes, S_BASELINE) + 0.045) < 1e-6 &&
+		      obs_data_has_user_value(changes, S_LEARNT) && !obs_data_get_bool(changes, S_LEARNT) &&
+		      cue_is(f, CUE_DONE),
+	      "a second camera look running level with the reading is taken, and the learnt notes are forgotten");
+	if (changes)
+		obs_data_release(changes);
+
+	/* A look turned down for another reason in between starts the count again. (The forget is passed on to
+	 * the gaze model as the tracking thread does before its next frame, and notes are learnt again.) */
+	pthread_mutex_lock(&f->lock);
+	const bool forget = f->forget_learnt;
+	f->forget_learnt = false;
+	pthread_mutex_unlock(&f->lock);
+	pthread_mutex_lock(&f->gaze_lock);
+	if (forget)
+		cf_gaze_forget_learnt_notes(&f->gaze);
+	pthread_mutex_unlock(&f->gaze_lock);
+	learnt = take_learnt_notes(f, &reading);
+	if (learnt)
+		obs_data_release(learnt);
+	begin_step(f, CALIB_LENS);
+	finish_step(f, 1, &low, &changes);
+	if (changes)
+		obs_data_release(changes);
+	cf_calib_result moved = low;
+	moved.spread = 0.5f;
+	moved.drift = 0.5f;
+	begin_step(f, CALIB_LENS);
+	finish_step(f, 1, &moved, &changes);
+	if (changes)
+		obs_data_release(changes);
+	begin_step(f, CALIB_LENS);
+	finish_step(f, 1, &low, &changes);
+	pthread_mutex_lock(&f->lock);
+	const bool again = f->look_bad == CF_LOOK_LOW && f->learnt.has;
+	pthread_mutex_unlock(&f->lock);
+	check(!changes && again && cue_is(f, CUE_FAILED),
+	      "only two looks running level with the reading count: an unsteady one in between starts it again");
+	if (changes)
+		obs_data_release(changes);
+
+	clear_step_state(f);
+	obs_data_release(s);
+	camflip_update(f, restore);
+}
+
 /* Notes learnt from the reading that are not below the camera look: the look was off (most likely at
  * the screen), so the panel asks for it again. */
 static void run_look_seems_off(struct camflip *f, obs_data_t *restore)
@@ -1381,6 +1470,7 @@ int main(void)
 	run_advanced_visibility(f, settings);
 	run_learnt_notes(f, settings);
 	run_lens_look(f, settings);
+	run_lens_look_second_try(f, settings);
 	run_look_seems_off(f, settings);
 	run_hotkey_names();
 

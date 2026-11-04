@@ -174,6 +174,8 @@ struct camflip {
 	int calib_failed;  /* CALIB_IDLE or the step that gave up */
 	bool calib_notes_bad; /* last notes calibration was not below the camera: rejected */
 	int look_bad;         /* last camera look turned down: CF_LOOK_UNSTEADY / CF_LOOK_LOW, else CF_LOOK_OK */
+	bool look_low_prev;   /* ... and the one before was turned down as CF_LOOK_LOW (see apply_calibration_locked) */
+	bool look_relearn;    /* the last camera look was taken on such a second try, and the learnt notes forgotten */
 	bool calib_no_frames; /* last calibration gave up: no camera frames arrived */
 	bool frames_flipped;  /* the camera sends upside-down frames (frame->flip): not tracked */
 	bool calib_cancel;    /* worker: drop the calibration the gaze model may still be running */
@@ -903,6 +905,13 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 			return NULL;
 	} else {
 		f->look_bad = cf_gaze_check_lens_look(res, f->learnt.has ? &f->learnt : NULL);
+		/* Two looks running not above where the user reads: it is the learnt notes that are off, not the
+		 * looks (they are from before a new seat or camera, until the learner catches up). The user is
+		 * trusted: this look is taken, and the notes are learnt afresh from their reading. */
+		f->look_relearn = f->look_bad == CF_LOOK_LOW && f->look_low_prev;
+		f->look_low_prev = f->look_bad == CF_LOOK_LOW && !f->look_relearn;
+		if (f->look_relearn)
+			f->look_bad = CF_LOOK_OK;
 		if (f->look_bad != CF_LOOK_OK)
 			return NULL;
 	}
@@ -917,6 +926,17 @@ static obs_data_t *apply_calibration_locked(struct camflip *f, const cf_calib_re
 		obs_data_set_double(changes, S_NOTES_OPEN, res->openness);
 		obs_data_set_bool(changes, S_HAS_NOTES, true);
 	} else {
+		if (f->look_relearn) {
+			memset(&f->learnt, 0, sizeof(f->learnt));
+			f->forget_learnt = true; /* (passed on to the gaze model before the next frame, see process_frame) */
+			obs_data_set_bool(changes, S_LEARNT, false);
+			obs_data_set_double(changes, S_LEARNT_OFFSET, 0.0);
+			obs_data_set_double(changes, S_LEARNT_SIDE, 0.0);
+			obs_data_set_double(changes, S_LEARNT_OPEN, 0.0);
+			obs_data_set_bool(changes, S_LEARNT_HAS_VIS, false);
+			obs_data_set_double(changes, S_LEARNT_VIS, 0.0);
+			obs_data_set_double(changes, S_LEARNT_SECONDS, 0.0);
+		}
 		f->baseline = res->offset;
 		f->baseline_open = res->openness;
 		f->lens_done = true;
@@ -979,6 +999,7 @@ static bool finish_step(struct camflip *f, int calibrated, const cf_calib_result
 	else
 		f->calib_failed = step;
 	const int look = f->look_bad;
+	const bool relearn = calibrated > 0 && res->target == CF_CALIB_LENS && f->look_relearn;
 	const bool notes_bad = f->calib_notes_bad, became_stale = f->notes_stale && !was_stale;
 	pthread_mutex_unlock(&f->lock);
 
@@ -1016,6 +1037,10 @@ static bool finish_step(struct camflip *f, int calibrated, const cf_calib_result
 		if (became_stale)
 			blog(LOG_WARNING, "[cam-flip] the notes step is no longer below the new camera look and is not "
 					  "used: do \"Look at your notes\" again, or \"Forget my notes\"");
+		if (relearn)
+			blog(LOG_INFO, "[cam-flip] camera look taken on the second try although it is not above where "
+				       "you read (%.3f eye widths): the learnt notes are forgotten and learnt again",
+			     reading);
 	}
 	return true;
 }
