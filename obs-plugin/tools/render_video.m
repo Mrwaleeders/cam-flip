@@ -40,6 +40,9 @@
  *                      follow: the tracked pupil plus the classic warp's shift (keeps the sweep)
  *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
  *   --ml-alpha F       scale the model's effect (default 1)
+ *   --learn            print the notes learnt from the reading as they are handed out (and the final
+ *                      estimate) and, unless the notes are given (--notes, --notes-offset), pass them back
+ *                      in the params the way the plugin saves them (as tools/replay.c --learn)
  *
  * Nothing leaves this Mac. tools/render.sh builds and runs it.
  */
@@ -337,10 +340,10 @@ int main(int argc, char **argv)
 				"[--baseline-open O] [--notes-offset N] [--notes-side S] [--notes-open P] [--head-side S] "
 				"[--head-vert V] [--head-eyes E] [--head-tilt K] [--baseline-upper U] [--baseline-lower L] "
 				"[--vis-baseline A] [--vis-notes B] [--lens a-b] [--notes a-b] [--strength S] [--scan-damp D] "
-				"[--measure] [--zoom Z]\n");
+				"[--measure] [--zoom Z] [--learn] [--notes-learnt]\n");
 		return 2;
 	}
-	int lag = 1, measure = 0, zoom = 3;
+	int lag = 1, measure = 0, zoom = 3, learn = 0;
 	int engine_model = 0;
 	const char *model_path = NULL;
 	enum cf_ml_compute ml_compute = CF_ML_ALL;
@@ -384,6 +387,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); i++; }
 		else if (!strcmp(a, "--ml-res")) { ml_res = atoi(v); i++; }
 		else if (!strcmp(a, "--ml-alpha")) { ml_alpha = (float)atof(v); i++; }
+		else if (!strcmp(a, "--learn")) learn = 1;
+		else if (!strcmp(a, "--notes-learnt")) p.notes_learnt = 1; /* the --notes-* given were learnt from reading */
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
 	}
 	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
@@ -410,6 +415,8 @@ int main(int argc, char **argv)
 	}
 	if (lag < 0)
 		lag = 0;
+	/* Learnt notes are passed back unless notes were given (--notes-offset, --notes). */
+	const int learn_feed = learn && !p.has_notes && !(notes_r[1] > notes_r[0]);
 
 	@autoreleasepool {
 		NSString *dir = [NSString stringWithUTF8String:argv[2]];
@@ -694,6 +701,23 @@ int main(int argc, char **argv)
 					cf_eye tmp[2];
 					cf_gaze_update(&gaze, &q[0], &p, qt[0], tmp);
 					fed = q[0];
+					cf_learnt_notes ln;
+					if (learn && cf_gaze_take_learnt_notes(&gaze, &ln)) {
+						printf("learn: notes handed out at %.1f s: offset %.4f side %.4f open %.4f vis %.4f (%s), "
+						       "%.4f below the baseline %.4f (%.0f s of reading)\n",
+						       qt[0], ln.offset, ln.side, ln.open, ln.vis_offset, ln.has_vis ? "given" : "none",
+						       p.baseline - ln.offset, p.baseline, ln.seconds);
+						if (learn_feed) { /* as the plugin saves them */
+							p.has_notes = 1;
+							p.notes_offset = ln.offset;
+							p.notes_side = ln.side;
+							p.notes_open = ln.open;
+							p.notes_learnt = 1;
+							p.notes_seconds = ln.seconds;
+							p.vis_notes = ln.vis_offset;
+							p.has_vis_calib = ln.has_vis && ((vis_cal & 1) || (vis_opt & 1));
+						}
+					}
 					memmove(q, q + 1, sizeof(q[0]) * (QMAX - 1));
 					memmove(qt, qt + 1, sizeof(qt[0]) * (QMAX - 1));
 					qn--;
@@ -946,6 +970,16 @@ int main(int argc, char **argv)
 			       knows ? "" : " (this model doesn't know your lens-look openness: retrain it)");
 		}
 		cf_ml_free(ml);
+		if (learn) {
+			const cf_learnt_notes *e = &gaze.learn.est;
+			if (e->has)
+				printf("learn: final estimate offset %.4f side %.4f open %.4f vis %.4f (%s), %.4f below the "
+				       "baseline (%.0f s of reading)\n",
+				       e->offset, e->side, e->open, e->vis_offset, e->has_vis ? "given" : "none",
+				       p.baseline - e->offset, e->seconds);
+			else
+				printf("learn: nothing learnt\n");
+		}
 		printf("wrote %s/{corrected.mov,compare.mov,frames.csv}\n", argv[2]);
 		camflip_destroy(f);
 		if (f_out)
