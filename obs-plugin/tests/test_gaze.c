@@ -2588,6 +2588,51 @@ static void test_learn_notes(void)
 		      worst_pubs, worst_grew, sec_min, gap_min);
 		printf("ok: L14 the saved notes' reading time grows to a minute (handed out again unmoved, rarely)\n");
 	}
+
+	/* L15. Notes learnt from reading just under the camera (0.014 below the lens look) engage the sideways damping
+	 * and the lids while reading at least as much as a notes step at that height does. (The far limit is widened to
+	 * max_glance for learnt notes; while the engage ramp went by it too, reading there was a quarter engaged with
+	 * learnt notes against half with the notes step: the lids restored half as much.) */
+	{
+		const float SMALL = 0.014f;
+		double e_learnt = 0, e_step = 0;
+		int learnt = 0;
+		for (unsigned k = 0; k < 4; k++) {
+			for (int step = 0; step <= 1; step++) {
+				cf_calib_result nc;
+				cf_gaze_params p = rd_params(W, SMALL, &nc);
+				if (step) {
+					p.has_notes = 1;
+					p.notes_offset = nc.offset;
+					p.notes_side = nc.side;
+					p.notes_open = nc.openness;
+					p.vis_notes = nc.vis_offset;
+					p.has_vis_calib = 1;
+				}
+				cf_gaze g;
+				cf_gaze_init(&g);
+				rng_seed(161 + k);
+				rd_sim s;
+				rd_init(&s, W, RD_READ, SMALL, 100.0);
+				rd_log lg = {0};
+				rd_run(&g, &p, &s, 90.0, !step, &lg); /* (learnt and fed back, as the plugin does) */
+				learnt += !step && p.notes_learnt;
+				double sum = 0;
+				int n = 0;
+				for (int i = 0; i < 60 * 30; i++) {
+					rd_run(&g, &p, &s, 1.0 / 30.0, !step, &lg);
+					sum += g.engage_f;
+					n++;
+				}
+				*(step ? &e_step : &e_learnt) += sum / n / 4.0;
+			}
+		}
+		printf("    reading %.3f below the lens: engaged %.2f with learnt notes (%d of 4 learnt), %.2f with a notes step\n",
+		       SMALL, e_learnt, learnt, e_step);
+		CHECK(learnt == 4 && e_learnt >= e_step - 0.02 && e_learnt >= 0.4,
+		      "learnt notes engage reading just under the camera %.2f, a notes step %.2f", e_learnt, e_step);
+		printf("ok: L15 learnt notes engage the sideways damping and the lids as a notes step does\n");
+	}
 }
 
 int main(void)

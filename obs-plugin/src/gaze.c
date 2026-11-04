@@ -2985,6 +2985,8 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float notes_glance = p->baseline - p->notes_offset;
 	float limit = notes ? fmaxf(1.4f * notes_glance, notes_glance + fmaxf(FAR_MARGIN, FAR_NOISE_K * g->noise_slow))
 			    : p->max_glance;
+	/* (where the sideways damping and the lids engage goes by where the user reads: this limit, not widened below) */
+	const float engage_limit = limit;
 	/* Notes learnt from reading only ever widen it: they are where the user reads most, not the edge of
 	 * everything they look at below the camera (the screen further down stays corrected). */
 	if (notes && p->notes_learnt)
@@ -3159,9 +3161,11 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	 * down, the eyes on the lens), d is the head's tilt less that turn, about 0 at the lens give or take two
 	 * measures that do not cancel exactly (noise, and the head and the glance settling at their own pace
 	 * after a look), so there it starts past a margin; and it moves at once only with a look (not with the
-	 * eyes catching up with the head), else at ENGAGE_SLEW. */
+	 * eyes catching up with the head), else at ENGAGE_SLEW. It goes by the notes' own limit: with notes learnt
+	 * from reading the far limit is widened to max_glance, which for notes just under the lens (a glance of
+	 * 0.014 on the user's clip) left it a quarter engaged while reading. */
 	const float e0 = fminf(-fminf(g->up_lock, 0.0f), ENGAGE_UP_MARGIN);
-	const float engage_t = smoothstepf(e0, e0 + fmaxf(0.35f * limit, 0.01f), d);
+	const float engage_t = smoothstepf(e0, e0 + fmaxf(0.35f * engage_limit, 0.01f), d);
 	if (!g->have_engage || (sacc && !catching_up)) {
 		g->engage_f = engage_t;
 	} else {
