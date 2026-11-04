@@ -167,6 +167,7 @@ struct camflip {
 	 * the gaze model before its next update (see camflip_forget_notes_clicked). */
 	cf_learnt_notes learnt;
 	bool forget_learnt;
+	bool learnt_saved; /* the settings camflip_update last read had learnt notes (S_LEARNT): see there */
 
 	/* calibration requests (from the panel) and progress (from the worker) */
 	int calib_request; /* 0 none, else CALIB_LENS / CALIB_NOTES */
@@ -1074,9 +1075,8 @@ static obs_data_t *take_learnt_notes(struct camflip *f, const cf_learnt_notes *l
 	obs_data_set_double(changes, S_LEARNT_VIS, l->vis_offset);
 	obs_data_set_double(changes, S_LEARNT_SECONDS, l->seconds);
 	obs_data_set_int(changes, S_SETUP_VERSION, SETUP_VERSION); /* (see apply_calibration_locked) */
-	blog(LOG_INFO,
-	     "[cam-flip] notes learnt from %.0f s of reading (offset %.3f, side %.3f eye widths, openness %.3f)",
-	     l->seconds, l->offset, l->side, l->open);
+	blog(LOG_INFO, "[cam-flip] notes %s from %.0f s of reading (offset %.3f, side %.3f eye widths, openness %.3f)",
+	     l->moved ? "learnt" : "confirmed", l->seconds, l->offset, l->side, l->open);
 	return changes;
 }
 
@@ -1354,8 +1354,17 @@ static void camflip_update(void *data, obs_data_t *settings)
 	f->head_ref.tilt = (float)obs_data_get_double(settings, S_HEAD_TILT);
 	f->baseline_upper = (float)obs_data_get_double(settings, S_BASELINE_UPPER);
 	f->baseline_lower = (float)obs_data_get_double(settings, S_BASELINE_LOWER);
+	/* Learnt notes the settings had and no longer have: they were cleared outside this filter's own
+	 * "Forget my notes" (OBS's Defaults button, undo). The gaze model is told to forget them too, before its next
+	 * update; else it would take them as handed out already and never hand the same notes out again. (A
+	 * forget of our own passes through here too: forgetting again changes nothing. Notes the tracking thread took
+	 * whose save hasn't landed yet were never in these settings, so they don't count.) */
+	const bool saved = obs_data_get_bool(settings, S_LEARNT);
+	if (f->learnt_saved && !saved)
+		f->forget_learnt = true;
+	f->learnt_saved = saved;
 	memset(&f->learnt, 0, sizeof(f->learnt));
-	if (obs_data_get_bool(settings, S_LEARNT)) {
+	if (saved) {
 		f->learnt.has = 1;
 		f->learnt.offset = (float)obs_data_get_double(settings, S_LEARNT_OFFSET);
 		f->learnt.side = (float)obs_data_get_double(settings, S_LEARNT_SIDE);
@@ -1366,6 +1375,10 @@ static void camflip_update(void *data, obs_data_t *settings)
 	}
 	check_notes_locked(f);
 	pthread_mutex_unlock(&f->lock);
+	/* Settings this version has seen never need migrate_setup again, also after OBS's Defaults button cleared
+	 * the stamp: else the next start would reset what was set since (strength, ...) once more. */
+	if (!obs_data_has_user_value(settings, S_SETUP_VERSION))
+		obs_data_set_int(settings, S_SETUP_VERSION, SETUP_VERSION);
 }
 
 /* Calibrations saved by older versions use other units: drop them (once); the panel then asks for

@@ -176,6 +176,8 @@ typedef struct {
 	float vis_offset; /* ... and its offset then (like cf_calib_result.vis_offset) */
 	float seconds;    /* how much reading the estimate rests on (s) */
 	unsigned serial;  /* changes each time the estimate moved enough to be worth saving */
+	int moved;        /* 1: new or moved notes; 0: the same notes, handed out again because the reading behind them
+			   * grew (seconds), so the saved copy says so too (CF_LOOK_LOW and the weight after a restart) */
 } cf_learnt_notes;
 
 /* Checks a finished lens calibration ("look at the camera") before it is used. reading: the learnt notes, or
@@ -507,6 +509,7 @@ typedef struct {
 	/* ---- Status reasons (cf_gaze_status.too_far / turned) and the notes learnt from reading. The learner's
 	 * own state goes here too (see "Notes learnt from reading" in gaze.c). */
 	float st_size_f, st_turn_f; /* this frame's face-size fade and head-turn fade (f_size, f_yaw x f_pitch) */
+	int st_far, st_turn;        /* ... said as too far / turned away, with hysteresis (see cf_gaze_get_status) */
 	int st_reading;
 	cf_learnt_notes learnt;     /* the current estimate */
 	unsigned learnt_taken;      /* the serial last handed out by cf_gaze_take_learnt_notes() */

@@ -1712,7 +1712,7 @@ static void test_vision_tail(void)
 	       100.0 * n_vis / (n_vis_all ? n_vis_all : 1), w_a, w_b, w_c, w_co, n_cb, w_cb, w_d, 100.0f * w_e, w_lid);
 }
 
-/* ---- Notes learnt from reading (checks L1-L13)
+/* ---- Notes learnt from reading (checks L1-L14)
  *
  * Synthetic reading, shaped on the summary statistics of the user's clips (~0.5 m from a MacBook camera, eyes 75-88
  * px wide; units eye widths): at rest the refined points' sideways reading changes ~0.005 a frame (robust SD over
@@ -1969,11 +1969,12 @@ static cf_face rd_face(rd_sim *s, double dt)
 /* What a run saw: the learnt notes taken (how many, the first and the last, when, the shortest time between two),
  * and the frames the status said reading (from when). */
 typedef struct {
-	int pubs;
+	int pubs, grew;
 	cf_learnt_notes first, last;
 	double t_first, t_last, gap;
 	int reading;
 	double t_reading;
+	float seconds; /* the reading the last notes handed out rest on */
 } rd_log;
 
 /* Passes learnt notes back in the params, as the plugin does (the lens step here had Vision's point). */
@@ -2000,7 +2001,9 @@ static void rd_run(cf_gaze *g, cf_gaze_params *p, rd_sim *s, double secs, int fe
 		cf_gaze_update(g, &f, p, s->t, out);
 		cf_learnt_notes ln;
 		if (cf_gaze_take_learnt_notes(g, &ln)) {
-			if (lg->pubs == 0) {
+			/* (pubs counts new or moved notes; the same notes handed out again with more reading behind them
+			 * are counted in grew, and also fed back, as the plugin saves them too) */
+			if (lg->pubs + lg->grew == 0) {
 				lg->first = ln;
 				lg->t_first = s->t;
 				lg->gap = 1e9;
@@ -2009,7 +2012,11 @@ static void rd_run(cf_gaze *g, cf_gaze_params *p, rd_sim *s, double secs, int fe
 			}
 			lg->last = ln;
 			lg->t_last = s->t;
-			lg->pubs++;
+			if (ln.moved)
+				lg->pubs++;
+			else
+				lg->grew++;
+			lg->seconds = ln.seconds;
 			if (feed)
 				rd_feed(p, &ln);
 		}
@@ -2543,6 +2550,43 @@ static void test_learn_notes(void)
 		CHECK(learnt >= 7 && e_off <= 0.008f, "reading just under the camera: learnt in %d of 8, off by %.4f", learnt,
 		      e_off);
 		printf("ok: L13 reading just under the camera (0.014 below the lens look) is learnt\n");
+	}
+
+	/* L14. The reading behind the notes handed out grows with them: the same notes are handed out again (moved 0)
+	 * once they rest on CF_LOOK_READING_MIN, then on twice as much each time up to LEARN_MEMORY, at most every 18 s.
+	 * The caller only learns the seconds from a hand-out, and goes by them: a camera look is only turned down against
+	 * notes resting on CF_LOOK_READING_MIN, and they are the notes' weight after a restart. (Handed out only when
+	 * they moved, the saved copy said 8-10 s forever on short lines, so a look at the screen was never turned
+	 * down.) */
+	{
+		int ok = 1, worst_pubs = 0, worst_grew = 0;
+		float sec_min = 1e9f;
+		double gap_min = 1e9;
+		for (unsigned k = 0; k < 6; k++) {
+			cf_gaze_params p = p0;
+			cf_gaze g;
+			cf_gaze_init(&g);
+			rng_seed(151 + k);
+			rd_sim s;
+			rd_init(&s, W, RD_READ, LEVEL, 100.0);
+			if (k & 1) { /* short lines, as on the user's shortest */
+				s.dur_lo = 1.6;
+				s.dur_hi = 4.0;
+			}
+			rd_log lg = {0};
+			rd_run(&g, &p, &s, 600.0, 1, &lg);
+			ok &= lg.pubs == 1 && lg.grew >= 1 && lg.grew <= 4 && lg.seconds >= 59.0f && p.notes_seconds >= 59.0f;
+			worst_pubs = lg.pubs > worst_pubs ? lg.pubs : worst_pubs;
+			worst_grew = lg.grew > worst_grew ? lg.grew : worst_grew;
+			sec_min = fminf(sec_min, lg.seconds);
+			gap_min = fmin(gap_min, lg.gap);
+		}
+		printf("    10 min of steady reading: moved notes handed out %d time(s) at most, the same notes again %d at most, "
+		       "the last resting on %.0f s at least, at least %.1f s apart\n",
+		       worst_pubs, worst_grew, sec_min, gap_min);
+		CHECK(ok && gap_min >= 17.9, "the reading behind the notes did not reach the caller (%d, %d, %.0f s, %.1f s)",
+		      worst_pubs, worst_grew, sec_min, gap_min);
+		printf("ok: L14 the saved notes' reading time grows to a minute (handed out again unmoved, rarely)\n");
 	}
 }
 

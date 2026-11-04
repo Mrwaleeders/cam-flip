@@ -1106,6 +1106,49 @@ static void run_lens_look_second_try(struct camflip *f, obs_data_t *restore)
 	camflip_update(f, restore);
 }
 
+/* OBS's Defaults button (or undo) clearing learnt notes from the settings: the gaze model is told to forget them
+ * too (else it takes them as handed out already and never hands the same notes out again). And the setup stamp
+ * is put back, so the next start doesn't simplify the settings once more. */
+static void run_learnt_defaults(struct camflip *f, obs_data_t *restore)
+{
+	obs_data_t *s = set_up_settings();
+	obs_data_set_bool(s, S_LEARNT, true);
+	obs_data_set_double(s, S_LEARNT_OFFSET, -0.05);
+	obs_data_set_double(s, S_LEARNT_SIDE, 0.0);
+	obs_data_set_double(s, S_LEARNT_OPEN, 0.25);
+	obs_data_set_double(s, S_LEARNT_SECONDS, 30.0);
+	camflip_update(f, s);
+	pthread_mutex_lock(&f->lock);
+	f->forget_learnt = false;
+	const bool had = f->learnt.has != 0;
+	pthread_mutex_unlock(&f->lock);
+
+	obs_data_t *d = obs_data_create(); /* what Defaults leaves: the defaults only */
+	camflip_defaults(d);
+	camflip_update(f, d);
+	pthread_mutex_lock(&f->lock);
+	const bool forgot = !f->learnt.has && f->forget_learnt;
+	f->forget_learnt = false;
+	pthread_mutex_unlock(&f->lock);
+	check(had && forgot, "Defaults clearing the learnt notes makes the gaze model forget them too");
+	check(obs_data_has_user_value(d, S_SETUP_VERSION) && obs_data_get_int(d, S_SETUP_VERSION) == SETUP_VERSION,
+	      "settings this version has read keep its setup stamp, also after Defaults");
+
+	/* Settings that never had them (notes the tracking thread took, their save not landed yet) are no forget. */
+	camflip_update(f, d);
+	pthread_mutex_lock(&f->lock);
+	const bool calm = !f->forget_learnt;
+	pthread_mutex_unlock(&f->lock);
+	check(calm, "settings without learnt notes, after settings without them, don't make the model forget");
+
+	obs_data_release(d);
+	obs_data_release(s);
+	camflip_update(f, restore);
+	pthread_mutex_lock(&f->lock);
+	f->forget_learnt = false;
+	pthread_mutex_unlock(&f->lock);
+}
+
 /* Notes learnt from the reading that are not below the camera look: the look was off (most likely at
  * the screen), so the panel asks for it again. */
 static void run_look_seems_off(struct camflip *f, obs_data_t *restore)
@@ -1471,6 +1514,7 @@ int main(void)
 	run_learnt_notes(f, settings);
 	run_lens_look(f, settings);
 	run_lens_look_second_try(f, settings);
+	run_learnt_defaults(f, settings);
 	run_look_seems_off(f, settings);
 	run_hotkey_names();
 

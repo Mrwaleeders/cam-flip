@@ -215,6 +215,8 @@
 				 * squint) */
 #define LEARN_GLANCE_MAX 0.20f  /* eye widths below the lens (with a lens calibration): further down is the keyboard */
 #define LEARN_ABOVE_MAX 0.03f   /* eye widths above the lens: further up is not reading notes under the camera */
+#define ST_ON 0.4f              /* the panel says "too far" / "turned away" once that fade is below this, ... */
+#define ST_OFF 0.6f             /* ... and stops once it is back above this */
 #define LEARN_SIGMA_INIT 0.006f /* eye widths: the sideways noise assumed until it is measured ... */
 #define LEARN_BLOCK 1.0         /* s: ... as the robust SD over blocks this long, the 25th percentile of the last
 				 * CF_LEARN_BLOCKS of them (quiet ones: not those holding a return) */
@@ -1980,7 +1982,7 @@ static void learn_publish(cf_gaze *g, const cf_gaze_params *p, double t)
 	const cf_learnt_notes *e = &L->est, *q = &L->pub;
 	if (!e->has)
 		return;
-	int go;
+	int go, grew = 0;
 	if (!L->has_pub) {
 		go = e->seconds >= LEARN_FIRST && L->lines >= LEARN_FIRST_LINES;
 	} else {
@@ -1989,14 +1991,22 @@ static void learn_publish(cf_gaze *g, const cf_gaze_params *p, double t)
 		     (fabsf(e->offset - q->offset) > fmaxf(LEARN_MOVE_MIN, LEARN_MOVE_FRAC * glance) ||
 		      fabsf(e->side - q->side) > LEARN_SIDE_MOVE || fabsf(e->open - q->open) > LEARN_OPEN_MOVE ||
 		      e->has_vis != q->has_vis || (e->has_vis && fabsf(e->vis_offset - q->vis_offset) > LEARN_VIS_MOVE));
+		/* Unmoved, but resting on twice the reading they were handed out with (CF_LOOK_READING_MIN first, at most
+		 * LEARN_MEMORY): handed out again, so the saved copy's seconds grow too. The caller goes by them: a camera
+		 * look is only turned down against notes resting on CF_LOOK_READING_MIN, and they are the weight the notes
+		 * start with after a restart. */
+		const float next = q->seconds < CF_LOOK_READING_MIN ? CF_LOOK_READING_MIN
+								  : fminf(2.0f * q->seconds, LEARN_MEMORY);
+		grew = !go && t - L->pub_t >= LEARN_REPUB && q->seconds < LEARN_MEMORY && e->seconds >= next;
 	}
-	if (!go && !L->has_pub)
+	if (!go && !grew && !L->has_pub)
 		return;
-	const unsigned serial = g->learnt.serial + (go ? 1u : 0u);
+	const unsigned serial = g->learnt.serial + (go || grew ? 1u : 0u);
 	g->learnt = *e;
 	g->learnt.has = 1;
 	g->learnt.serial = serial;
-	if (go) {
+	g->learnt.moved = go;
+	if (go || grew) {
 		L->pub = g->learnt;
 		L->has_pub = 1;
 		L->pub_t = t;
@@ -3033,6 +3043,10 @@ int cf_gaze_update(cf_gaze *g, const cf_face *face, const cf_gaze_params *p_in, 
 	const float target = f_yaw * f_pitch * f_size;
 	g->st_size_f = f_size; /* (plain-word reasons for the panel, see cf_gaze_status) */
 	g->st_turn_f = f_yaw * f_pitch;
+	/* With hysteresis: a head held where a fade is about half way (OBS on a second screen) would otherwise flip
+	 * the panel's message with every bit of pose noise, and each flip rebuilds an open panel. */
+	g->st_far = g->st_far ? f_size < ST_OFF : f_size < ST_ON;
+	g->st_turn = g->st_turn ? g->st_turn_f < ST_OFF : g->st_turn_f < ST_ON;
 	if (hold) {
 		/* Blink: hold the correction steady (the gaze terms are held too). Only head-based fades
 		 * (reliable while the eyes are closed) may lower it; eyes closed for long fade out. */
@@ -3255,8 +3269,8 @@ void cf_gaze_get_status(const cf_gaze *g, cf_gaze_status *out)
 	 * shift is 0 there anyway, and a factor that dropped to 0 whenever the glance read <= 0 looked like
 	 * fades switching on and off in logs. */
 	out->factor = g->factor * g->lock_f;
-	out->too_far = g->face_found && g->st_size_f < 0.5f;
-	out->turned = g->face_found && !out->too_far && g->st_turn_f < 0.5f;
+	out->too_far = g->face_found && g->st_far;
+	out->turned = g->face_found && !out->too_far && g->st_turn;
 	out->reading = g->face_found && g->st_reading;
 }
 
