@@ -1,5 +1,5 @@
 # For tools/model/train.py (tools/model/train.sh installs these into build/venv)
 numpy>=1.26
-torch>=2.5,<2.8
+torch>=2.5  # newer than coremltools has tested still converts this model (checked with 2.15)
 coremltools>=8.2
 pillow
