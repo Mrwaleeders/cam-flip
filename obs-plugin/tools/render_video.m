@@ -38,6 +38,8 @@
  *   --ml-target T      where the model puts the iris: lens (default, if the model learnt it): where your
  *                      iris sits looking into the lens, so the sideways sweep and line returns don't show;
  *                      follow: the tracked pupil plus the classic warp's shift (keeps the sweep)
+ *   --ml-res 0|1       apply the model's brightness residual (default 1); 0 = moving pixels only
+ *   --ml-alpha F       scale the model's effect (default 1)
  *
  * Nothing leaves this Mac. tools/render.sh builds and runs it.
  */
@@ -343,7 +345,8 @@ int main(int argc, char **argv)
 	const char *model_path = NULL;
 	enum cf_ml_compute ml_compute = CF_ML_ALL;
 	double ml_ms = 0, ml_ms_max = 0;
-	int ml_runs = 0, ml_follow = 0;
+	int ml_runs = 0, ml_follow = 0, ml_res = 1;
+	float ml_alpha = 1.0f;
 	double dedupe = -1, lens[2] = {0, 0}, notes_r[2] = {0, 0};
 	cf_gaze_params p = {.strength = 1.0f, .max_glance = 0.15f};
 	int vis_opt = 0; /* --vis-baseline (1) and --vis-notes (2) given */
@@ -379,6 +382,8 @@ int main(int argc, char **argv)
 			i++;
 		}
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); i++; }
+		else if (!strcmp(a, "--ml-res")) { ml_res = atoi(v); i++; }
+		else if (!strcmp(a, "--ml-alpha")) { ml_alpha = (float)atof(v); i++; }
 		else { fprintf(stderr, "unknown option %s\n", a); return 2; }
 	}
 	p.has_vis_calib = vis_opt == 3 && p.has_notes; /* as plugin.m: both steps taken with Vision's point */
@@ -714,7 +719,7 @@ int main(int argc, char **argv)
 						 * either way, so it handles jumps since the last tracking. */
 						float tgt[2][2], alpha[2];
 						for (int e = 0; e < n; e++) {
-							alpha[e] = fminf(1.0f, st.factor / 0.3f);
+							alpha[e] = ml_alpha * fminf(1.0f, st.factor / 0.3f);
 							if (!ml_follow && cf_ml_lens_target(ml, eyes, n, e, tgt[e]))
 								continue;
 							const cf_pt c0 = centroid_of(fed.left_eye, fed.left_count),
@@ -727,7 +732,7 @@ int main(int argc, char **argv)
 							tgt[e][1] = pu.y + (eyes[e].cy - c.y) + eyes[e].sy;
 						}
 						double ms = 0;
-						if (cf_ml_correct(ml, &ch[0], ch, cc, cf_ml_residual_channels(CF_FMT_NV12), eyes, n,
+						if (cf_ml_correct(ml, &ch[0], ch, cc, ml_res ? cf_ml_residual_channels(CF_FMT_NV12) : 0u, eyes, n,
 								  (const float(*)[2])tgt, alpha, &ms)) {
 							ml_ms += ms;
 							ml_ms_max = fmax(ml_ms_max, ms);
@@ -932,6 +937,12 @@ int main(int argc, char **argv)
 			       shake5(buf[2], okw, nn), shake5(buf[3], okw, nn), shake5(buf[8], okw, nn), shake5(buf[0], okw, nn));
 		if (ml_runs)
 			printf("eye model: %.2f ms avg, %.2f ms max over %d frames\n", ml_ms / ml_runs, ml_ms_max, ml_runs);
+		if (ml) {
+			int seen, faded, knows;
+			cf_ml_stats(ml, &seen, &faded, &knows);
+			printf("eye model: faded out for a closing eye on %d of %d eyes%s\n", faded, seen,
+			       knows ? "" : " (this model doesn't know your lens-look openness: retrain it)");
+		}
 		cf_ml_free(ml);
 		printf("wrote %s/{corrected.mov,compare.mov,frames.csv}\n", argv[2]);
 		camflip_destroy(f);

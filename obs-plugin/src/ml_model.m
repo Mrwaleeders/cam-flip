@@ -15,6 +15,7 @@ struct cf_ml_model {
 	void *in_target;
 	int has_lens;
 	float open[2]; /* outline height / width looking into the lens (0: unknown) */
+	int eyes_seen, eyes_faded; /* for cf_ml_stats */
 	float lens[2][2]; /* iris looking into the lens, patch px: eye left in the image, mirrored eye */
 	float flow_x[2][PN], flow_y[2][PN], res[2][PN], mask[2][PN];
 };
@@ -200,6 +201,13 @@ static int mirrored(const cf_eye *eyes, int n, int e)
 	return n == 2 && eyes[e].cx > eyes[1 - e].cx;
 }
 
+void cf_ml_stats(const cf_ml_model *m, int *eyes, int *faded, int *knows_open)
+{
+	*eyes = m ? m->eyes_seen : 0;
+	*faded = m ? m->eyes_faded : 0;
+	*knows_open = m && m->open[0] > 0;
+}
+
 int cf_ml_lens_target(const cf_ml_model *m, const cf_eye *eyes, int n, int e, float out[2])
 {
 	if (!m || !m->has_lens || e < 0 || e >= n || n > 2)
@@ -250,7 +258,10 @@ int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *chan
 		if (!cf_ml_eye_frame(&eyes[e], flip, &fr[k]))
 			continue;
 		use[k] = eyes[e];
-		a[k] = alpha[e] * open_weight(m, &eyes[e], flip, &fr[k]);
+		const float ow = open_weight(m, &eyes[e], flip, &fr[k]);
+		m->eyes_seen++;
+		m->eyes_faded += ow < 0.99f;
+		a[k] = alpha[e] * ow;
 		cf_ml_crop(luma, &fr[k], patches[k]);
 		float px, py;
 		cf_ml_to_patch(&fr[k], target_img[e][0], target_img[e][1], &px, &py);

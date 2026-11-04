@@ -58,6 +58,10 @@ int cf_ml_correct(cf_ml_model *m, const cf_channel *luma, const cf_channel *chan
  */
 int cf_ml_lens_target(const cf_ml_model *m, const cf_eye *eyes, int n, int e, float out[2]);
 
+/* How many eyes cf_ml_correct has seen, how many it faded out because the eye was closing (a blink), and
+ * whether the model knows the lens-look openness at all (models trained before it was stored don't). */
+void cf_ml_stats(const cf_ml_model *m, int *eyes, int *faded, int *knows_open);
+
 #ifdef __cplusplus
 }
 #endif
