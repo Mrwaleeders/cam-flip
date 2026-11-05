@@ -19,10 +19,10 @@ esac
 
 clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O2 -fobjc-arc \
   -I"build/obs-studio-$OBS_VERSION/libobs" -Ibuild/simde -Ibuild/include -Isrc \
-  tools/render_video.m src/gaze.c src/warp.c src/pose.c \
+  tools/render_video.m src/gaze.c src/warp.c src/pose.c src/ml_eye.c src/ml_model.m \
   -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
   -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
-  -framework AVFoundation -framework CoreMedia \
+  -framework AVFoundation -framework CoreMedia -framework CoreML \
   -o build/render_video
 
 CAL=()

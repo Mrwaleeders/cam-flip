@@ -22,10 +22,13 @@ clang -arch "$(uname -m)" -mmacosx-version-min=13.0 \
 ./build/test_load "$PWD/build/cam-flip.plugin/Contents/MacOS/cam-flip"
 
 # The diagnostics tools (tools/*.m) must keep compiling against the plugin internals.
+# (render_video also carries the personal eye model engine.)
 for tool in diag_video render_video; do
+  extra=()
+  [ "$tool" = render_video ] && extra=(src/ml_eye.c src/ml_model.m -framework CoreML)
   clang -arch "$(uname -m)" -mmacosx-version-min=13.0 -O1 -fobjc-arc -Wall -Werror \
     -I"$OBS_SRC/libobs" -Ibuild/simde -Ibuild/include -Isrc \
-    "tools/$tool.m" src/gaze.c src/warp.c src/pose.c \
+    "tools/$tool.m" src/gaze.c src/warp.c src/pose.c "${extra[@]+"${extra[@]}"}" \
     -F"$FW" -framework libobs -Wl,-rpath,"$FW" \
     -framework Foundation -framework Vision -framework CoreVideo -framework CoreGraphics -framework ImageIO \
     -framework AVFoundation -framework CoreMedia \

@@ -7,3 +7,13 @@ standalone-app/Config/Local.xcconfig
 obs-plugin/build_test_*
 .claude/
 *.orig
+# Personal eye model: captures, patches and trained models are someone's face. Never commit them.
+*.mlpackage
+*.mlmodelc
+eye-model.pt
+patches.u8
+eyes.csv
+targets.csv
+captures/
+camflip-diag/
+__pycache__/

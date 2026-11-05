@@ -117,6 +117,18 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 * **Your settings changed after updating:** this version sets itself up. The first time it starts, **Strength**, **Hide reading along a line** and **Correct glances up to** go back to their defaults, and a saved notes step is dropped, because your notes are now learnt as you read. Your camera look is kept. (A camera look from a much older version measured your eyes differently: that one is reset, and the status says **Almost ready**.)
 * **Others see you un-mirrored:** check the filter is on the camera source, and the call app uses **OBS Virtual Camera**.
 
+## Personal eye model (experimental, not in the plugin yet)
+
+A small learned model, trained only on **your own face**, that may replace the hand-built eye warp. It moves the iris and both lids together, so the lowered lower lid and the side-to-side scan while reading no longer show. For now it runs in the render tool for side-by-side comparisons, not in OBS. Everything it uses or makes is your face, so it stays on your Mac: the repo only holds the code, and `.gitignore` blocks captures and models.
+
+1. **Record** (about 4 minutes, head still, eyes follow a dot): `obs-plugin/tools/model/capture.sh --distance 60`. Use your real distance in cm. Do one session at your call distance and one at your desk distance.
+2. **Cut out the eyes:** `obs-plugin/tools/model/extract.sh ~/Downloads/camflip-diag/captures/<session>` (for each session).
+3. **Train** (about 30 to 60 minutes on Apple Silicon): `obs-plugin/tools/model/train.sh <session> <session>`. This writes `~/Library/Application Support/cam-flip/eye-model.mlpackage`, plus a preview of held-out frames showing your eye, the model's correction, and the real look into the lens.
+4. **Compare:** `obs-plugin/tools/render.sh <clip.mov> <out-dir> --engine model`, against the same command without `--engine model`. The tool prints the model's time per frame. `--ml-compute cpu|gpu|ane` picks where it runs. By default the model holds your iris still where you are looking, for notes laid over the other person's face in the call: it stays on the middle of what you read and only follows a real look elsewhere, so you look like you're watching them, without the sideways sweep along a line or the jump back to the next line. `--ml-target lens` instead holds it on your look into the lens (learnt from the recording), and `--ml-target follow` follows the tracked pupil plus the classic shift.
+5. **Try a training change in one go:** `obs-plugin/tools/model/round.sh <name> [train options]` cuts any missing patches, trains into `~/Downloads/camflip-diag/<name>/` (the installed model is left alone) and renders a test clip (`CLIP=<clip.mov>`, calibration in `RENDER="..."`) into `~/Downloads/camflip-diag/renders/model-ab/<name>/`. For quick trials use `--steps 6000` (about a third of the time); train the winner with the full 20000. Training lines up every frame once per session and keeps it in `align-corners.npy` next to the patches, so later rounds skip that step.
+
+The model covers anything within about 20 cm around your notes: the whole screen width and down to the bottom of the screen. It's trained for 0.5 to 1.5 m, and anything further out fades out like the classic warp. The research and plan are in the [design doc](https://claude.ai/artifact/CTFrxG6jB1H3EasJs5kSW1).
+
 ## Repo layout
 
 | Path | What |
@@ -125,6 +137,8 @@ To have it ready every time, add OBS to **System Settings › General › Login 
 | `obs-plugin/src/gaze.c` | Eye-contact logic: smoothing, fading, calibration |
 | `obs-plugin/src/pose.c` | Head turn and tilt from the face landmarks, for the fade |
 | `obs-plugin/src/warp.c` | Mirror and eye warp, working directly on the camera's own pixel formats |
+| `obs-plugin/src/ml_eye.c`, `ml_model.m` | Personal eye model: eye patches, full-resolution compositing, Core ML |
+| `obs-plugin/tools/model/` | Record, extract and train the personal eye model (on your Mac only) |
 | `obs-plugin/tests/` | Behaviour, quality and OBS integration tests, which run on every push |
 | `obs-plugin/build.sh` | Builds the plugin. It only needs clang, and GitHub runs it for you |
 | `standalone-app/` | An earlier design: a standalone virtual camera app. It needs a paid Apple Developer account, so it's parked |
