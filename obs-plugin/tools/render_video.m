@@ -53,6 +53,8 @@
  *                      under-asks and part of the sweep stays)
  *   --steady-iris-scale C  steady-iris true: ask the model for C times the true move back to the held
  *                      point (default 0.86: the model moves the iris about 1.16 px per px asked)
+ *   --steady-axes A    steady: xy (default) holds both ways; x holds only the sideways sweep and passes
+ *                      vertical through as tracked (to run on a video another tool already corrected up/down)
  *   --steady-max-ask P steady: never ask the model to move the iris more than P eye-patch px (0 = no cap)
  *   --steady-dwell N   steady: frames a look must stay outside the band before it is followed (default 2;
  *                      1 follows a frame sooner but trips more easily on a noisy pupil)
@@ -461,6 +463,7 @@ int main(int argc, char **argv)
 	int steady_dwell = 2, ml_passes = 1;
 	float steady_gain = 1.0f, steady_max_ask = 0.0f;
 	int steady_iris = 0;               /* --steady-iris true */
+	int steady_x_only = 0;             /* --steady-axes x */
 	float steady_iris_scale = 0.86f;
 	float tracker_x[2][3] = {{0}};     /* last three tracked pupil x per eye (patch px), for its median */
 	int tracker_n[2] = {0, 0};
@@ -506,6 +509,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--ml-target")) { ml_follow = !strcmp(v, "follow"); ml_steady = !strcmp(v, "steady"); i++; }
 		else if (!strcmp(a, "--ml-passes")) { ml_passes = atoi(v) < 1 ? 1 : atoi(v) > 4 ? 4 : atoi(v); i++; }
 		else if (!strcmp(a, "--steady-max-ask")) { steady_max_ask = (float)atof(v); i++; }
+		else if (!strcmp(a, "--steady-axes")) { steady_x_only = !strcmp(v, "x"); i++; }
 		else if (!strcmp(a, "--steady-iris")) { steady_iris = !strcmp(v, "true"); i++; }
 		else if (!strcmp(a, "--steady-iris-scale")) { steady_iris_scale = (float)atof(v); i++; }
 		else if (!strcmp(a, "--steady-gain")) { steady_gain = (float)atof(v); i++; }
@@ -928,6 +932,8 @@ int main(int argc, char **argv)
 										se->med[1] + g * (hd[1] - se->med[1])};
 								if (steady_iris)
 									ask[0] = tmed + g * steady_iris_scale * (hd[0] - se->med[0]);
+								if (steady_x_only)
+									ask[1] = se->med[1];
 								/* Big asks (right after a long line return) leave a thin dark rim at the
 								 * iris edge for a few frames: --steady-max-ask caps how far the iris is
 								 * asked to move from where it is, letting the rest of the jump through. */
